@@ -132,6 +132,11 @@ fn spec() -> AppSpec<State> {
                 ];
                 s.accounts.set_typing(&matrix_core::AccountId::new(demo::ADA), demo::DEMO_THREAD.0.into(), people);
             }),
+            ("demo-edit", |s| {
+                demo::seed(s);
+                s.select_room(demo::DEMO_THREAD.0);
+                s.composer.start_edit("$demo-edit", "Friday works for me, let's tag it then.", None);
+            }),
             ("demo-thread", |s| {
                 demo::seed(s);
                 s.select_room(demo::DEMO_THREAD.0);
@@ -545,6 +550,28 @@ mod tests {
         });
         assert!(rt.find("call-card-join-$newer").is_some());
         assert!(rt.find("call-card-join-$demo-@kai:example.org-0").is_none());
+    }
+
+    #[test]
+    fn only_the_users_own_messages_should_have_a_more_menu() {
+        let rt = runtime(|s| {
+            demo::seed(s);
+            s.select_room("!dm-grace:example.org");
+        });
+        assert!(rt.find("more-$demo-@ada:example.org-0").is_some());
+        assert!(rt.find("more-$demo-@grace:example.org-1").is_none());
+    }
+
+    #[test]
+    fn the_more_menu_of_a_call_card_should_offer_delete_but_not_edit() {
+        let rt = runtime(|s| {
+            demo::seed(s);
+            s.select_room("!dm-grace:example.org");
+            let key = matrix_core::TimelineKey::room("!dm-grace:example.org");
+            s.toggle_popover(Popover::MessageMenu { key, event_id: "$demo-@ada:example.org-0".into() });
+        });
+        assert!(rt.find("message-delete").is_some());
+        assert!(rt.find("message-edit").is_none());
     }
 
     #[test]
