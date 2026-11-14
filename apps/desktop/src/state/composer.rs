@@ -273,21 +273,25 @@ impl Composer {
         self.link = None;
     }
 
+    /// The edit under way, as the user left it, taken out of the field: the draft comes back.
+    pub fn set_aside_edit(&mut self) -> Option<Edit> {
+        let editing = self.editing.as_ref()?;
+        let edit = Edit {
+            target: editing.target.clone(),
+            body: self.edit.text.trim().to_owned(),
+            html: html_of(&self.edit),
+            field: self.edit.clone(),
+            original: editing.original.clone(),
+        };
+        self.cancel_edit();
+        Some(edit)
+    }
+
     /// The edit to send, if one is under way and changed the message; the draft comes back
     /// either way. An emptied message isn't sent: it stays as it was.
     pub fn take_edit(&mut self) -> Option<Edit> {
-        let editing = self.editing.as_ref()?;
-        let (body, html) = (self.edit.text.trim().to_owned(), html_of(&self.edit));
-        let changed = !body.is_empty() && (&body, &html) != (&editing.original.0, &editing.original.1);
-        let edit = changed.then(|| Edit {
-            target: editing.target.clone(),
-            body,
-            html,
-            field: self.edit.clone(),
-            original: editing.original.clone(),
-        });
-        self.cancel_edit();
-        edit
+        self.set_aside_edit()
+            .filter(|edit| !edit.body.is_empty() && (&edit.body, &edit.html) != (&edit.original.0, &edit.original.1))
     }
 
     /// Takes an edit that failed back into the field, as the user left it, to try again.

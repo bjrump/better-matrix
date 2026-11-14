@@ -569,7 +569,6 @@ fn work() -> Fixture {
                     call: matrix_core::RoomCall {
                         via: Some(matrix_core::CallVia::Rtc),
                         participants: vec![KAI.into()],
-                        started_ms: None,
                     },
                     ..dm("!dm-kai:example.org", KAI, "Kai", 1)
                 },

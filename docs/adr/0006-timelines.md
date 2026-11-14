@@ -67,12 +67,13 @@ see who is typing there.
   emotes, notices and files keep what they are). The composer then holds the message
   (`Composer::editing`: the account, timeline and event, so the edit goes where it began) under
   an "Editing your message" bar; the draft, its reply and attachments are set aside and come
-  back when the edit is sent or dropped. Escape stops it, as do replying and the timeline
-  leaving the screen. While editing, attachments, voice memos and polls are off, and no edit
+  back when the edit is sent or dropped. Escape stops it, as does replying. While editing, attachments, voice memos and polls are off, and no edit
   starts while a voice memo records or on a message still sending. An emptied or unchanged
-  edit isn't sent, and one the server refuses comes back into the field (`Purpose::Edit`), at
-  once, or when its timeline shows again with nothing else being edited
-  (`State::failed_edits`). A failed delete has its own notice.
+  edit isn't sent. An edit left by navigating away, or refused by the server (`Purpose::Edit`),
+  is set aside (`State::set_aside`, one per message) and comes back into its composer, as the
+  user left it, once its timeline is on screen and the composer is free (no other edit, no
+  memo); sending an edit of the same message drops the kept one, as does removing its account.
+  A failed delete has its own notice.
 - **Reactions, replies, threads:**
   - `Command::React` toggles the user's reaction (`toggle_reaction`). Messages carry each
     reaction's count and whether the user is among them. The picker offers quick reactions,
@@ -97,14 +98,16 @@ see who is typing there.
   notification (`m.rtc.notification`, and the unstable `org.matrix.msc4075.rtc.notification`
   Element Call sends, which ruma reads as the same event) and one-to-one invites (video when the
   offer sends video, read from the raw event). Whether a call is under way isn't the card's:
-  only the newest card shows it, a MatrixRTC call by the room's members (`RoomSummary::call`,
-  with the number in it) when the card isn't older than the call (`RoomCall::started_ms`, its
-  oldest membership, less two minutes for clocks; so a deleted card doesn't hand the call to an
-  older one), a one-to-one call by this app's own one-to-one call and rings ("Ringing…").
+  only the newest card shows it, as matrix-sdk-ui has it: a MatrixRTC call by the room's
+  members (`RoomSummary::call`, with the number in it), a one-to-one call by this app's own
+  one-to-one call and rings ("Ringing…"). Deleting a call's card while it runs hands the call
+  to an older card; that is accepted, as tying cards to sessions would need the session's start,
+  which the membership events lose when its first member leaves.
   Join shows where the header would offer it: the room allows calls (`RoomCall::via`) and the
   user isn't in its call here (`State::call_here`); in it, the card says so. Older cards read
   as ended, or declined in a direct chat. Call cards take no reactions, and a reply quotes the
-  call's kind (`Quote::call`). Call memberships stay hidden.
+  call's kind (`Quote::call`; a one-to-one call is just "Call" there, its offer not embedded).
+  Call memberships stay hidden.
 - **Stickers** show as images (`convert::sticker`).
 - **Room events:** `EntryKind::RoomEvent` holds the sender (a `Person`) and a `RoomChange`,
   converted from matrix-sdk-ui's membership, profile and state items.

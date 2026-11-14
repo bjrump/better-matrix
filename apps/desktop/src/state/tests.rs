@@ -2345,15 +2345,18 @@ fn deleting_a_message_should_ask_first_then_delete_it() {
 }
 
 #[test]
-fn an_edit_should_stop_when_its_room_leaves_the_screen() {
+fn an_edit_left_by_navigating_should_come_back_with_its_room() {
     let (mut s, _) = state();
     let id = with_own_message(&mut s);
     with_rooms(&mut s, &id, &["!one:x", "!two:x"], Vec::new());
     s.composer.edit.insert("draft");
     s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.composer.edit.insert("!");
     s.select_room("!two:x");
     assert!(s.composer.editing.is_none());
     assert_eq!(s.composer.edit.text, "draft");
+    s.select_room("!one:x");
+    assert_eq!((s.composer.editing.is_some(), s.composer.edit.text.as_str()), (true, "helo!"));
 }
 
 #[test]
@@ -2427,4 +2430,22 @@ fn editing_should_wait_for_a_voice_memo_being_recorded() {
     assert!(s.composer.voice.is_some());
     s.edit_last(ComposerTarget::Room, &mut Tx::default());
     assert!(s.composer.editing.is_none());
+}
+
+#[test]
+fn a_failed_edit_should_come_back_once_the_composer_is_free() {
+    let (mut s, mut commands) = state();
+    with_own_message(&mut s);
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.composer.edit.insert("!");
+    drain(&mut commands);
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let Some((request, _)) = drain(&mut commands).into_iter().find(|(_, c)| matches!(c, Command::Edit { .. })) else {
+        panic!("expected an edit");
+    };
+    s.start_voice_memo(ComposerTarget::Room);
+    apply(&mut s, Event::Finished { request, result: Err("offline".into()) });
+    assert!(s.composer.editing.is_none());
+    s.cancel_voice_memo(ComposerTarget::Room);
+    assert_eq!((s.composer.editing.is_some(), s.composer.edit.text.as_str()), (true, "helo!"));
 }

@@ -551,9 +551,9 @@ pub struct State {
     pub emoji_search: TextEdit,
     /// The poll being written, while [`Modal::Poll`] shows.
     pub poll_form: PollForm,
-    /// Edits the server refused while their composer was busy or elsewhere: each comes back
-    /// into the field when its timeline shows again with nothing else being edited.
-    failed_edits: Vec<composer::Edit>,
+    /// Edits set aside: refused by the server, or left by navigating away. Each comes back into
+    /// its composer once its timeline shows with the composer free (no other edit, no memo).
+    set_aside: Vec<composer::Edit>,
     /// The panel beside the open room.
     pub side: Option<SidePanel>,
     /// The room and panel the side panel's list was last asked for.
@@ -630,7 +630,7 @@ impl State {
             modal: None,
             emoji_search: TextEdit::default(),
             poll_form: PollForm::default(),
-            failed_edits: Vec::new(),
+            set_aside: Vec::new(),
             side: None,
             side_loaded: None,
             member_search: TextEdit::default(),
@@ -820,6 +820,7 @@ impl State {
                 self.accounts.upsert(summary);
                 if again {
                     self.open_timelines.retain(|(account, _)| *account != id);
+                    self.set_aside.retain(|edit| edit.target.account != id);
                     self.sync_timeline();
                 }
                 self.request_avatars();
@@ -1291,7 +1292,9 @@ impl State {
             Purpose::Send => self.notice = Some(tf!("notice.not_sent", error = error)),
             Purpose::Edit(edit) => {
                 self.notice = Some(tf!("notice.not_changed", error = error));
-                self.edit_failed(*edit);
+                // It comes back as the user left it: now, or once its timeline and composer are free.
+                self.set_edit_aside(*edit);
+                self.resume_edits();
             }
             Purpose::Delete => self.notice = Some(tf!("notice.not_deleted", error = error)),
             Purpose::Logout => self.notice = Some(tf!("notice.sign_out", error = error)),
@@ -1401,17 +1404,19 @@ impl State {
         }
         // A memo recording for a timeline no longer shown would go on unseen, the microphone
         // open: closing the thread, another room and the overview all drop it. An edit of a
-        // message there stops too, its draft back.
+        // message there is set aside, its draft back, and returns when the timeline does.
         for target in [ComposerTarget::Room, ComposerTarget::Thread] {
             if self.composer(target).voice.as_ref().is_some_and(|memo| !shown.contains(&memo.2)) {
                 self.cancel_voice_memo(target);
             }
             let editing = self.composer(target).editing.as_ref().map(|editing| &editing.target);
-            if editing.is_some_and(|edited| !shown.iter().any(|(a, k)| *a == edited.account && *k == edited.key)) {
-                self.composer_mut(target).cancel_edit();
+            if editing.is_some_and(|edited| !shown.iter().any(|(a, k)| *a == edited.account && *k == edited.key))
+                && let Some(edit) = self.composer_mut(target).set_aside_edit()
+            {
+                self.set_edit_aside(edit);
             }
         }
-        self.resume_failed_edits();
+        self.resume_edits();
         let (gone, kept): (Vec<_>, Vec<_>) = self.open_timelines.drain(..).partition(|open| !shown.contains(open));
         for (account, key) in gone {
             if key.thread.is_none() {
@@ -3118,23 +3123,25 @@ impl State {
         tx.focus(composer_field(target), false);
     }
 
-    /// An edit the server refused comes back into its composer as the user left it: now, when
-    /// its timeline shows and nothing else is being edited there, else once that is so.
-    fn edit_failed(&mut self, edit: composer::Edit) {
-        self.failed_edits.retain(|failed| failed.target != edit.target);
-        self.failed_edits.push(edit);
-        self.resume_failed_edits();
+    /// Keeps an edit for later, in place of any earlier one of the same message.
+    fn set_edit_aside(&mut self, edit: composer::Edit) {
+        self.set_aside.retain(|kept| kept.target != edit.target);
+        self.set_aside.push(edit);
     }
 
-    fn resume_failed_edits(&mut self) {
+    /// Edits set aside come back into the composers of the timelines on screen that are free.
+    fn resume_edits(&mut self) {
+        if self.screen() != Screen::Chat {
+            return;
+        }
         for target in [ComposerTarget::Room, ComposerTarget::Thread] {
             let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { continue };
             let composer = self.composer(target);
             if composer.editing.is_some() || composer.voice.is_some() {
                 continue;
             }
-            let at = self.failed_edits.iter().position(|edit| edit.target.account == account && edit.target.key == key);
-            if let Some(edit) = at.map(|at| self.failed_edits.remove(at)) {
+            let at = self.set_aside.iter().position(|edit| edit.target.account == account && edit.target.key == key);
+            if let Some(edit) = at.map(|at| self.set_aside.remove(at)) {
                 self.composer_mut(target).resume_edit(edit);
             }
         }
@@ -3156,6 +3163,7 @@ impl State {
 
     pub fn cancel_edit(&mut self, target: ComposerTarget) {
         self.composer_mut(target).cancel_edit();
+        self.resume_edits();
     }
 
     /// Asks before deleting one of the user's messages.
@@ -3227,10 +3235,13 @@ impl State {
         if self.composer(target).editing.is_some() {
             // Unchanged, nothing is sent; either way the draft comes back.
             if let Some(edit) = self.composer_mut(target).take_edit() {
+                // This edit supersedes one of the same message kept from before.
+                self.set_aside.retain(|kept| kept.target != edit.target);
                 let composer::EditTarget { account, key, event_id } = edit.target.clone();
                 let (body, html) = (edit.body.clone(), edit.html.clone());
                 self.dispatch(Command::Edit { account, key, event_id, body, html }, Purpose::Edit(Box::new(edit)));
             }
+            self.resume_edits();
             return;
         }
         let (reply_to, messages) = self.composer_mut(target).take_outgoing();
@@ -3272,6 +3283,7 @@ impl State {
         if let Some(memo) = self.composer_mut(target).voice.take() {
             memo.0.cancel();
         }
+        self.resume_edits();
     }
 
     /// Stops recording and sends the memo as a voice message, to the room or thread it was
@@ -3284,6 +3296,7 @@ impl State {
         if let Some(result) = self.shell.finish_recording(memo.0, memo_for.clone()) {
             self.voice_memo_recorded(memo_for, result, tx);
         }
+        self.resume_edits();
     }
 
     /// A voice memo's file is written: it goes where it was recorded for.

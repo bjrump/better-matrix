@@ -18,12 +18,13 @@ Date: 2026-11-14
 
 ## Decision
 
-- **Media engine:** `livekit` (default features off; `tokio`, rustls, `glib-main-loop` for
-  Wayland screen sharing) in `matrix-core`. Its build downloads a prebuilt libwebrtc. Cameras
-  come from `nokhwa`. LiveKit's TLS and the SDK's ask rustls for different crypto providers, so
+- **Media engine:** `livekit` (default features off; `tokio`, rustls, `glib-main-loop` for Wayland
+  screen sharing) in `matrix-core`. Its build downloads a prebuilt libwebrtc. Cameras come from
+  `nokhwa`. LiveKit's TLS and the SDK's ask rustls for different crypto providers, so
   `Engine::start` installs one (aws-lc-rs, the SDK's) before anything connects; without it rustls
-  won't choose and the first call's connection panics. No other part of the app touches either: the desktop sees calls only as
-  `Command`s and `Event`s, and video only through a `VideoSink` it hands the engine.
+  won't choose and the first call's connection panics. No other part of the app touches either: the
+  desktop sees calls only as `Command`s and `Event`s, and video only through a `VideoSink` it hands
+  the engine.
 - **One call at a time,** across accounts, run by one engine task (`calls::task`). Starting another
   hangs up the first and waits (up to 10 s) for it to leave before setting up, so the two never hold
   the devices or the membership at once; a call just hung up counts too. The engine keeps every
@@ -37,26 +38,25 @@ Date: 2026-11-14
   still works. Quitting hangs up and waits up to 3 s for the call to leave (`EngineStopped::wait`).
   Calling a person goes through the direct chat with them alone: never a group chat they're in, nor
   one a third person joined, which would ring them too.
-- **The call task's shape:** setting up races a hang-up, and everything the call holds sits in
-  one owner (`session::Session`) that closes it on every path: each LiveKit connection is
-  closed explicitly (a dropped one stays connected), devices stop, the membership leaves.
-  Network work (connecting to services, sending keys, keeping the membership, looking up
-  names, one-to-one candidates) runs as tasks beside the call's loop and reports back. What
-  must happen in order (publishing a camera or screen, switching cameras, answering a
-  one-to-one call) runs inside the loop but races a hang-up, and device work (opening and
-  closing a camera, a screen capture) runs on blocking threads. A connection that finishes as
-  the call ends is closed with the rest. The call reports itself after every change, and not
-  when nothing changed. Its end is reported as soon as its loop ends, before leaving, so the
-  app closes the call at once; leaving then takes at most a few seconds (each request 5 s, not
-  retried: offline, the delayed leave goes out on its own). Timers that fall behind (a slow
-  publish) catch up with one tick; candidates that failed to send wait a second. Each step of
-  joining (the token, the connection, publishing the microphone, the camera, the membership,
-  the ring) has a time limit, so a stall ends the call naming the step
-  (`CallError::Stalled`) rather than leaving it connecting; a panic in the call task ends the
-  call with an error too, and a MatrixRTC session still closes what it holds after one: the
-  loop's work stops and a connection that came in meanwhile closes (`Live::finish`), then the
-  session's connections, devices and membership (`Session::close`). The steps log through `tracing`, which the desktop prints when
-  `RUST_LOG` is set (`RUST_LOG=matrix_core=debug,livekit=debug`).
+- **The call task's shape:** setting up races a hang-up, and everything the call holds sits in one
+  owner (`session::Session`) that closes it on every path: each LiveKit connection is closed
+  explicitly (a dropped one stays connected), devices stop, the membership leaves. Network work
+  (connecting to services, sending keys, keeping the membership, looking up names, one-to-one
+  candidates) runs as tasks beside the call's loop and reports back. What must happen in order
+  (publishing a camera or screen, switching cameras, answering a one-to-one call) runs inside the
+  loop but races a hang-up, and device work (opening and closing a camera, a screen capture) runs on
+  blocking threads. A connection that finishes as the call ends is closed with the rest. The call
+  reports itself after every change, and not when nothing changed. Its end is reported as soon as
+  its loop ends, before leaving, so the app closes the call at once; leaving then takes at most a
+  few seconds (each request 5 s, not retried: offline, the delayed leave goes out on its own).
+  Timers that fall behind (a slow publish) catch up with one tick; candidates that failed to send
+  wait a second. Each step of joining (the token, the connection, publishing the microphone, the
+  camera, the membership, the ring) has a time limit, so a stall ends the call naming the step
+  (`CallError::Stalled`) rather than leaving it connecting; a panic in the call task ends the call
+  with an error too, and a MatrixRTC session still closes what it holds after one: the loop's work
+  stops and a connection that came in meanwhile closes (`Live::finish`), then the session's
+  connections, devices and membership (`Session::close`). The steps log through `tracing`, which the
+  desktop prints when `RUST_LOG` is set (`RUST_LOG=matrix_core=debug,livekit=debug`).
 - **Which standard:** MatrixRTC where the account's homeserver names a LiveKit transport
   (`Client::rtc_transports`, cached per account) and the user may send call memberships in the
   room (power level for `org.matrix.msc3401.call.member`). Otherwise the one-to-one standard in

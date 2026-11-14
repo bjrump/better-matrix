@@ -86,9 +86,10 @@ pub(crate) async fn room_call(room: &Room, kind: RoomKind, rtc_service: bool) ->
     let may_call =
         power.as_ref().is_some_and(|power| power.user_can_send_message(me, MessageLikeEventType::CallInvite));
     let one_to_one = kind == RoomKind::Direct && room.active_members_count() == 2 && may_call;
-    let participants: Vec<String> = room.active_room_call_participants().iter().map(ToString::to_string).collect();
-    let started_ms = if participants.is_empty() { None } else { crate::calls::started(room).await };
-    crate::calls::RoomCall { via: crate::calls::via(rtc_service, may_join, one_to_one), participants, started_ms }
+    crate::calls::RoomCall {
+        via: crate::calls::via(rtc_service, may_join, one_to_one),
+        participants: room.active_room_call_participants().iter().map(ToString::to_string).collect(),
+    }
 }
 
 pub(crate) async fn space_summary(room: &Room) -> SpaceSummary {

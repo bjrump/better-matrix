@@ -724,11 +724,7 @@ pub fn message_menu(s: &State, key: &TimelineKey, event_id: &str, p: &Palette) -
 /// The message a reply answers: who wrote it and an excerpt, behind a bar.
 fn quote_block(quote: &Quote, p: &Palette) -> El {
     let sender = quote.sender_name.clone().unwrap_or_default();
-    let body = match (&quote.body, &quote.call) {
-        (Some(body), _) => body.clone(),
-        (None, Some(card)) => crate::state::call_title(card).to_owned(),
-        (None, None) => t!("quote.unavailable").to_owned(),
-    };
+    let body = quote_text(quote);
     row().max_w(560.0).gap(8.0).child(el().w(3.0).h_full().min_h(32.0).radius(2.0).fill(p.text_muted.alpha(0.5))).child(
         col()
             .grow(1.0)
@@ -737,6 +733,16 @@ fn quote_block(quote: &Quote, p: &Palette) -> El {
             .child(text(sender).font(font::META.family(rune::Family::Sans)).color(p.text))
             .child(text(body).font(font::META).color(p.text_muted).max_lines(2).truncate()),
     )
+}
+
+/// What a quote says of the answered message: its text, the kind of call it was, or that it
+/// isn't loaded.
+fn quote_text(quote: &Quote) -> String {
+    match (&quote.body, &quote.call) {
+        (Some(body), _) => body.clone(),
+        (None, Some(card)) => crate::state::call_title(card).to_owned(),
+        (None, None) => t!("quote.unavailable").to_owned(),
+    }
 }
 
 /// Reaction chips: emoji and count, outlined when the user's own; each toggles the user's.
@@ -840,25 +846,18 @@ fn message_body(item: &TimelineItem, cx: &Context<'_>, latest_call: bool, p: &Pa
             let own = item.message.sender_id == cx.account.as_str();
             super::poll::card(poll, &item.message.event_id, own, cx.key, p)
         }
-        (MessageContent::Call(card), _) => call_card(cx, &item.message, card, latest_call, p),
+        (MessageContent::Call(card), _) => call_card(cx, &item.message.event_id, card, latest_call, p),
     }
 }
 
 /// A call's card: what kind it is and how it stands. The newest card in the room shows whether
 /// the room's call is under way, with the way in; older ones have ended.
-fn call_card(cx: &Context<'_>, message: &Message, card: &CallCard, latest_call: bool, p: &Palette) -> El {
-    /// How much earlier than the call's oldest membership its card may be sent: their clocks
-    /// differ.
-    const SKEW_MS: u64 = 2 * 60_000;
-    let event_id = &message.event_id;
-    let call = &cx.room.call;
-    let people = &call.participants;
-    // Only the newest card speaks for the call now: a one-to-one call by this app's own state
-    // (ringing, or in it), MatrixRTC's by the room's members, when the card isn't older than
-    // the call (an older call's card, its own deleted, doesn't light up).
-    let current = call.started_ms.is_none_or(|started| message.timestamp_ms + SKEW_MS >= started);
+fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: bool, p: &Palette) -> El {
+    let people = &cx.room.call.participants;
+    // Only the newest card speaks for the call now, as matrix-sdk-ui has it: a one-to-one call by
+    // this app's own one-to-one call and rings, MatrixRTC's by the room's members.
     let ongoing = latest_call
-        && if card.direct { cx.call_here == Some(matrix_core::CallVia::Direct) } else { !people.is_empty() && current };
+        && if card.direct { cx.call_here == Some(matrix_core::CallVia::Direct) } else { !people.is_empty() };
     let declined = !card.declined_by.is_empty() && cx.room.kind == matrix_core::RoomKind::Direct;
     let status = match () {
         () if ongoing && card.direct => t!("call.card.ongoing").to_owned(),
@@ -1116,6 +1115,13 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_to_a_call_should_quote_the_kind_of_call() {
+        let card = matrix_core::CallCard { video: Some(true), ..matrix_core::CallCard::default() };
+        let quote = Quote { event_id: "$call".into(), sender_name: None, body: None, call: Some(card) };
+        assert_eq!(quote_text(&quote), t!("call.card.video"));
+    }
 
     #[test]
     fn preview_size_should_fit_a_wide_image_to_the_box_width() {
