@@ -408,7 +408,7 @@ fn room(id: &str, name: &str, topic: Option<&str>, unread: u64, mentions: u64) -
         notifications: NotificationMode::AllMessages,
         custom_notifications: false,
         // The demo's homeserver names a call service.
-        call: matrix_core::RoomCall { via: Some(matrix_core::CallVia::Rtc), participants: Vec::new() },
+        call: matrix_core::RoomCall { via: Some(matrix_core::CallVia::Rtc), ..matrix_core::RoomCall::default() },
         activity_ms: None,
     }
 }
@@ -443,7 +443,7 @@ fn html(body: &str, html: &str) -> MessageContent {
 }
 
 /// The demo's day: 12 November 2026, UTC.
-const DEMO_DAY_MS: u64 = 20_769 * 86_400_000;
+pub const DEMO_DAY_MS: u64 = 20_769 * 86_400_000;
 
 /// Messages `gap` minutes after the one before, from 09:12 UTC on the demo's day.
 fn messages(lines: Vec<(&str, &str, MessageContent, u64)>) -> Vec<Message> {
@@ -507,6 +507,7 @@ fn work() -> Fixture {
         event_id: general[2].event_id.clone(),
         sender_name: Some("Alan Turing".into()),
         body: Some(general[2].content.plain().replace('\n', " ")),
+        call: None,
     });
     // A thread on the cross-signing report.
     general[5].thread = Some(ThreadSummary {
@@ -568,6 +569,7 @@ fn work() -> Fixture {
                     call: matrix_core::RoomCall {
                         via: Some(matrix_core::CallVia::Rtc),
                         participants: vec![KAI.into()],
+                        started_ms: None,
                     },
                     ..dm("!dm-kai:example.org", KAI, "Kai", 1)
                 },

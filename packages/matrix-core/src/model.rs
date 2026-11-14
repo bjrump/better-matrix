@@ -401,6 +401,8 @@ pub struct Quote {
     pub sender_name: Option<String>,
     /// A plain-text excerpt, once known.
     pub body: Option<String>,
+    /// The call it answers, when it is a call's card: the app names it.
+    pub call: Option<CallCard>,
 }
 
 /// The replies in a thread, as its root message shows them.

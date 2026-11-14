@@ -551,6 +551,9 @@ pub struct State {
     pub emoji_search: TextEdit,
     /// The poll being written, while [`Modal::Poll`] shows.
     pub poll_form: PollForm,
+    /// Edits the server refused while their composer was busy or elsewhere: each comes back
+    /// into the field when its timeline shows again with nothing else being edited.
+    failed_edits: Vec<composer::Edit>,
     /// The panel beside the open room.
     pub side: Option<SidePanel>,
     /// The room and panel the side panel's list was last asked for.
@@ -627,6 +630,7 @@ impl State {
             modal: None,
             emoji_search: TextEdit::default(),
             poll_form: PollForm::default(),
+            failed_edits: Vec::new(),
             side: None,
             side_loaded: None,
             member_search: TextEdit::default(),
@@ -1407,6 +1411,7 @@ impl State {
                 self.composer_mut(target).cancel_edit();
             }
         }
+        self.resume_failed_edits();
         let (gone, kept): (Vec<_>, Vec<_>) = self.open_timelines.drain(..).partition(|open| !shown.contains(open));
         for (account, key) in gone {
             if key.thread.is_none() {
@@ -3102,6 +3107,10 @@ impl State {
     /// Starts editing one of the user's text messages in a composer.
     pub fn start_edit(&mut self, target: ComposerTarget, message: &Message, tx: &mut Tx) {
         let (MessageContent::Text { body, html }, true) = (&message.content, message.editable) else { return };
+        // A voice memo recording has the composer: it is sent or dropped first.
+        if message.pending || self.composer(target).voice.is_some() {
+            return;
+        }
         let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { return };
         self.popover = None;
         let edited = composer::EditTarget { account, key, event_id: message.event_id.clone() };
@@ -3109,14 +3118,25 @@ impl State {
         tx.focus(composer_field(target), false);
     }
 
-    /// An edit the server refused comes back into its composer as the user left it, when its
-    /// timeline is still shown and nothing else is being edited there.
+    /// An edit the server refused comes back into its composer as the user left it: now, when
+    /// its timeline shows and nothing else is being edited there, else once that is so.
     fn edit_failed(&mut self, edit: composer::Edit) {
-        let target = if edit.target.key.thread.is_some() { ComposerTarget::Thread } else { ComposerTarget::Room };
-        let shown = self.nav.account.as_ref() == Some(&edit.target.account)
-            && self.composer_key(target).as_ref() == Some(&edit.target.key);
-        if shown && self.composer(target).editing.is_none() {
-            self.composer_mut(target).resume_edit(edit);
+        self.failed_edits.retain(|failed| failed.target != edit.target);
+        self.failed_edits.push(edit);
+        self.resume_failed_edits();
+    }
+
+    fn resume_failed_edits(&mut self) {
+        for target in [ComposerTarget::Room, ComposerTarget::Thread] {
+            let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { continue };
+            let composer = self.composer(target);
+            if composer.editing.is_some() || composer.voice.is_some() {
+                continue;
+            }
+            let at = self.failed_edits.iter().position(|edit| edit.target.account == account && edit.target.key == key);
+            if let Some(edit) = at.map(|at| self.failed_edits.remove(at)) {
+                self.composer_mut(target).resume_edit(edit);
+            }
         }
     }
 
@@ -3414,10 +3434,6 @@ impl State {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
-/// The element key of a composer's text field.
 /// The name of a kind of call: video, voice, or just a call when the caller didn't say.
 pub fn call_title(card: &matrix_core::CallCard) -> &'static str {
     match card.video {
@@ -3427,6 +3443,10 @@ pub fn call_title(card: &matrix_core::CallCard) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
+/// The element key of a composer's text field.
 pub fn composer_field(target: ComposerTarget) -> &'static str {
     match target {
         ComposerTarget::Room => "composer",

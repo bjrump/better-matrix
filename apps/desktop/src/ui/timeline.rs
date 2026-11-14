@@ -43,8 +43,8 @@ pub struct Context<'a> {
     pub link_previews: Option<&'a LinkPreviews>,
     /// The message whose reaction picker is open, if any.
     pub picking: Option<&'a str>,
-    /// The user is in this room's call, here.
-    pub call_here: bool,
+    /// The standard of the call the user is in, here in this room.
+    pub call_here: Option<matrix_core::CallVia>,
     /// A one-to-one call rings in this room.
     pub ringing: bool,
     /// The audio playing, if any.
@@ -63,7 +63,7 @@ impl<'a> Context<'a> {
             show_gifs: s.settings.show_link_gifs,
             link_previews: s.settings.show_link_previews.then_some(&s.link_previews),
             picking: super::room::picking(s, key),
-            call_here: s.call_here().is_some_and(|call| call.info.room_id == key.room_id),
+            call_here: s.call_here().filter(|call| call.info.room_id == key.room_id).map(|call| call.info.via),
             ringing: s.rings.iter().any(|ring| ring.account == data.summary.id && ring.room_id == key.room_id),
             audio: s.audio.as_ref(),
         }
@@ -704,7 +704,7 @@ pub fn message_menu(s: &State, key: &TimelineKey, event_id: &str, p: &Palette) -
         Some(_) => (ComposerTarget::Thread, "thread-"),
     };
     let mut panel = popover_panel(p).key("message-menu").w(200.0);
-    if message.editable {
+    if message.editable && !message.pending {
         panel = panel.child(
             menu_action(&icons::PENCIL, t!("actions.edit"), Tone::Normal, p)
                 .key("message-edit")
@@ -724,7 +724,11 @@ pub fn message_menu(s: &State, key: &TimelineKey, event_id: &str, p: &Palette) -
 /// The message a reply answers: who wrote it and an excerpt, behind a bar.
 fn quote_block(quote: &Quote, p: &Palette) -> El {
     let sender = quote.sender_name.clone().unwrap_or_default();
-    let body = quote.body.clone().unwrap_or_else(|| t!("quote.unavailable").to_owned());
+    let body = match (&quote.body, &quote.call) {
+        (Some(body), _) => body.clone(),
+        (None, Some(card)) => crate::state::call_title(card).to_owned(),
+        (None, None) => t!("quote.unavailable").to_owned(),
+    };
     row().max_w(560.0).gap(8.0).child(el().w(3.0).h_full().min_h(32.0).radius(2.0).fill(p.text_muted.alpha(0.5))).child(
         col()
             .grow(1.0)
@@ -836,17 +840,25 @@ fn message_body(item: &TimelineItem, cx: &Context<'_>, latest_call: bool, p: &Pa
             let own = item.message.sender_id == cx.account.as_str();
             super::poll::card(poll, &item.message.event_id, own, cx.key, p)
         }
-        (MessageContent::Call(card), _) => call_card(cx, &item.message.event_id, card, latest_call, p),
+        (MessageContent::Call(card), _) => call_card(cx, &item.message, card, latest_call, p),
     }
 }
 
 /// A call's card: what kind it is and how it stands. The newest card in the room shows whether
 /// the room's call is under way, with the way in; older ones have ended.
-fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: bool, p: &Palette) -> El {
-    let people = &cx.room.call.participants;
+fn call_card(cx: &Context<'_>, message: &Message, card: &CallCard, latest_call: bool, p: &Palette) -> El {
+    /// How much earlier than the call's oldest membership its card may be sent: their clocks
+    /// differ.
+    const SKEW_MS: u64 = 2 * 60_000;
+    let event_id = &message.event_id;
+    let call = &cx.room.call;
+    let people = &call.participants;
     // Only the newest card speaks for the call now: a one-to-one call by this app's own state
-    // (ringing, or in it), MatrixRTC's by the room's members.
-    let ongoing = latest_call && if card.direct { cx.call_here } else { !people.is_empty() };
+    // (ringing, or in it), MatrixRTC's by the room's members, when the card isn't older than
+    // the call (an older call's card, its own deleted, doesn't light up).
+    let current = call.started_ms.is_none_or(|started| message.timestamp_ms + SKEW_MS >= started);
+    let ongoing = latest_call
+        && if card.direct { cx.call_here == Some(matrix_core::CallVia::Direct) } else { !people.is_empty() && current };
     let declined = !card.declined_by.is_empty() && cx.room.kind == matrix_core::RoomKind::Direct;
     let status = match () {
         () if ongoing && card.direct => t!("call.card.ongoing").to_owned(),
@@ -881,7 +893,7 @@ fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: boo
         .child(tile)
         .child(words);
     // Join as the header offers it: where the room allows calls, and not when already in it here.
-    if cx.call_here && ongoing {
+    if cx.call_here.is_some() && ongoing {
         entry = entry.child(text(t!("call.card.joined")).font(font::META).color(p.text_muted));
     } else if ongoing && !card.direct && cx.room.call.via.is_some() {
         let video = card.video == Some(true);

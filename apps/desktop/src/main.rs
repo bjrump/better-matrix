@@ -548,6 +548,23 @@ mod tests {
     }
 
     #[test]
+    fn a_call_card_older_than_the_call_under_way_should_read_as_ended() {
+        let rt = runtime(|s| {
+            demo::seed(s);
+            s.select_room("!dm-kai:example.org");
+            let account = matrix_core::AccountId::new(demo::ADA);
+            let Some(data) = s.accounts.get(&account) else { return };
+            let (mut rooms, spaces) = (data.rooms.clone(), data.spaces.clone());
+            for room in rooms.iter_mut().filter(|room| room.room_id == "!dm-kai:example.org") {
+                // The call began a day after Kai's card.
+                room.call.started_ms = Some(demo::DEMO_DAY_MS + 2 * 86_400_000);
+            }
+            s.accounts.set_room_list(&account, matrix_core::RoomList { rooms, spaces });
+        });
+        assert!(rt.find("call-card-join-$demo-@kai:example.org-0").is_none());
+    }
+
+    #[test]
     fn only_the_newest_call_card_should_offer_to_join() {
         let rt = runtime(|s| {
             demo::seed(s);

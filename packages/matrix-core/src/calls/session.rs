@@ -108,6 +108,7 @@ pub(super) async fn run(
         events,
     };
     let mut session = Session::default();
+    let mut live = None;
     let (sinks, ended) = Sinks::new();
     let work = async {
         let ready = tokio::select! {
@@ -119,7 +120,7 @@ pub(super) async fn run(
             None => Ok(CallEnd::HungUp),
             Some(Err(error)) => Err(error),
             Some(Ok(setup)) => {
-                let live = Live::new(&cx, call, sinks, devices, setup);
+                let live = live.insert(Live::new(&cx, call, sinks, devices, setup));
                 Ok(live.run(&mut session, &mut controls, &mut info, live_events, ended).await)
             }
         }
@@ -128,6 +129,9 @@ pub(super) async fn run(
     // room stays connected, and the membership would linger.
     let end = std::panic::AssertUnwindSafe(work).catch_unwind().await.unwrap_or_else(|panic| Err(panicked(&*panic)));
     call.end(&end);
+    if let Some(live) = live {
+        live.finish().await;
+    }
     session.close(&cx).await;
     end
 }
@@ -542,7 +546,7 @@ impl<'a, 'c> Live<'a, 'c> {
     }
 
     async fn run(
-        mut self,
+        &mut self,
         session: &mut Session,
         controls: &mut Controls,
         info: &mut CallInfo,
@@ -567,7 +571,7 @@ impl<'a, 'c> Live<'a, 'c> {
         for timer in [&mut restart, &mut levels, &mut retry, &mut renew] {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         }
-        let end = loop {
+        loop {
             tokio::select! {
                 event = live_events.recv() => {
                     let Some((service, event)) = event else { break CallEnd::Left };
@@ -665,8 +669,12 @@ impl<'a, 'c> Live<'a, 'c> {
             }
             info.participants = self.others.participants();
             self.report(info);
-        };
-        // A connection that came in as the call ended is closed with the rest.
+        }
+    }
+
+    /// Lets go of what the loop leaves, however it ended (a panic too): work still running
+    /// stops, a connection that came in as the call ended closes, and the videos stop.
+    async fn finish(mut self) {
         self.work.abort_all();
         while let Some(done) = self.work.join_next().await {
             if let Ok(Work::Connected(_, Ok(link))) = done {
@@ -676,7 +684,6 @@ impl<'a, 'c> Live<'a, 'c> {
         for (_, video) in self.others.videos.drain() {
             video.task.abort();
         }
-        end
     }
 
     /// Reports the call, unless nothing changed since the last report.

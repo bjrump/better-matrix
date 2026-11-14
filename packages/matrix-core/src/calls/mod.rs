@@ -20,6 +20,7 @@ use crate::model::{AccountId, Person};
 
 pub(crate) use direct::{has_video, reject};
 pub(crate) use media::list_devices;
+pub(crate) use rtc::started;
 pub(crate) use signals::{DirectEvent, Signal, listen};
 pub use support::via;
 pub(crate) use task::{CallHandle, Control, Invite, Leaving, RingHeard, Start, hear_ringing, person, start};
@@ -41,6 +42,8 @@ pub struct RoomCall {
     pub via: Option<CallVia>,
     /// Who is in the room's call now, by user ID; empty when no call is under way.
     pub participants: Vec<String>,
+    /// When the call under way began (its oldest membership), in milliseconds since the epoch.
+    pub started_ms: Option<u64>,
 }
 
 /// A video track the app can watch: the user's camera or screen, or someone else's.

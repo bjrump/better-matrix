@@ -71,6 +71,11 @@ pub(crate) async fn members(room: &Room) -> Vec<Member> {
     members
 }
 
+/// When the room's call under way began: its oldest membership's join.
+pub(crate) async fn started(room: &Room) -> Option<u64> {
+    members(room).await.iter().map(|member| member.since).min()
+}
+
 /// The memberships one state event holds: one (session format), or a list (the oldest format).
 fn parse_members(event: &Value, now: u64) -> Vec<Member> {
     let sender = event["sender"].as_str().unwrap_or_default();

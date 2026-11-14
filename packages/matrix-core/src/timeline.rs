@@ -84,18 +84,24 @@ fn raw_content(event: &EventTimelineItem) -> serde_json::Value {
 }
 
 /// A call's card: MatrixRTC's ring (the stable type, and the unstable one Element Call sends,
-/// which ruma reads as the same event), or a one-to-one invite.
+/// which ruma reads as the same event), or a one-to-one invite, video when its offer sends video.
 fn call_card(event: &EventTimelineItem) -> Option<CallCard> {
-    match event.content() {
+    let card = card_of(event.content())?;
+    if !card.direct {
+        return Some(card);
+    }
+    Some(CallCard { video: raw_content(event)["offer"]["sdp"].as_str().map(crate::calls::has_video), ..card })
+}
+
+/// A call's card from a timeline item's content, as far as the content says.
+fn card_of(content: &TimelineItemContent) -> Option<CallCard> {
+    match content {
         TimelineItemContent::RtcNotification { call_intent, declined_by, .. } => Some(CallCard {
             video: call_intent.as_ref().map(|intent| intent.as_str() == "video"),
             direct: false,
             declined_by: declined_by.iter().map(ToString::to_string).collect(),
         }),
-        TimelineItemContent::CallInvite => {
-            let video = raw_content(event)["offer"]["sdp"].as_str().map(crate::calls::has_video);
-            Some(CallCard { video, direct: true, declined_by: Vec::new() })
-        }
+        TimelineItemContent::CallInvite => Some(CallCard { direct: true, ..CallCard::default() }),
         _ => None,
     }
 }
@@ -134,6 +140,7 @@ fn message(event: &EventTimelineItem, me: &UserId) -> Option<Message> {
             event_id: reply.event_id.to_string(),
             sender_name: embedded.map(|e| name(&e.sender, &e.sender_profile)),
             body: embedded.and_then(|e| embedded_body(e)),
+            call: embedded.and_then(|e| card_of(&e.content)),
         }
     });
     let thread = thread_summary.as_ref().map(|summary| {

@@ -2399,3 +2399,32 @@ fn an_address_pasted_in_a_code_block_should_paste_as_text() {
     let content = rune::clipboard::ClipboardContent::new("https://matrix.org");
     assert!(!s.paste_into_composer(ComposerTarget::Room, &content));
 }
+
+#[test]
+fn a_failed_edit_should_come_back_when_its_room_shows_again() {
+    let (mut s, mut commands) = state();
+    let id = with_own_message(&mut s);
+    with_rooms(&mut s, &id, &["!one:x", "!two:x"], Vec::new());
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.composer.edit.insert("!");
+    drain(&mut commands);
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let Some((request, _)) = drain(&mut commands).into_iter().find(|(_, c)| matches!(c, Command::Edit { .. })) else {
+        panic!("expected an edit");
+    };
+    s.select_room("!two:x");
+    apply(&mut s, Event::Finished { request, result: Err("offline".into()) });
+    assert!(s.composer.editing.is_none());
+    s.select_room("!one:x");
+    assert_eq!((s.composer.editing.is_some(), s.composer.edit.text.as_str()), (true, "helo!"));
+}
+
+#[test]
+fn editing_should_wait_for_a_voice_memo_being_recorded() {
+    let (mut s, _) = state();
+    with_own_message(&mut s);
+    s.start_voice_memo(ComposerTarget::Room);
+    assert!(s.composer.voice.is_some());
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    assert!(s.composer.editing.is_none());
+}

@@ -53,8 +53,9 @@ Date: 2026-11-14
   joining (the token, the connection, publishing the microphone, the camera, the membership,
   the ring) has a time limit, so a stall ends the call naming the step
   (`CallError::Stalled`) rather than leaving it connecting; a panic in the call task ends the
-  call with an error too, and a MatrixRTC session still closes what it holds (connections,
-  devices, membership) after one. The steps log through `tracing`, which the desktop prints when
+  call with an error too, and a MatrixRTC session still closes what it holds after one: the
+  loop's work stops and a connection that came in meanwhile closes (`Live::finish`), then the
+  session's connections, devices and membership (`Session::close`). The steps log through `tracing`, which the desktop prints when
   `RUST_LOG` is set (`RUST_LOG=matrix_core=debug,livekit=debug`).
 - **Which standard:** MatrixRTC where the account's homeserver names a LiveKit transport
   (`Client::rtc_transports`, cached per account) and the user may send call memberships in the
