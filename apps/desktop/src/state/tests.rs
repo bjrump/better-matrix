@@ -2449,3 +2449,40 @@ fn a_failed_edit_should_come_back_once_the_composer_is_free() {
     s.cancel_voice_memo(ComposerTarget::Room);
     assert_eq!((s.composer.editing.is_some(), s.composer.edit.text.as_str()), (true, "helo!"));
 }
+
+#[test]
+fn removing_an_account_should_drop_its_kept_edits() {
+    let (mut s, _) = state();
+    let id = with_own_message(&mut s);
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.composer.edit.insert("!");
+    apply(&mut s, Event::AccountRemoved(id));
+    with_own_message(&mut s);
+    assert!(s.composer.editing.is_none());
+}
+
+#[test]
+fn switching_threads_should_keep_the_threads_edit() {
+    let (mut s, _) = state();
+    let id = with_own_message(&mut s);
+    s.open_thread("$mine");
+    let reply = matrix_core::TimelineEntry {
+        id: "$reply".into(),
+        kind: matrix_core::EntryKind::Message(Box::new(Message {
+            event_id: "$reply".into(),
+            sender_id: "@a:example.org".into(),
+            content: MessageContent::Text { body: "in thread".into(), html: None },
+            editable: true,
+            ..Message::default()
+        })),
+    };
+    let key = TimelineKey::thread("!one:x", "$mine");
+    let diffs = vec![matrix_core::TimelineDiff::Reset(vec![reply])];
+    apply(&mut s, Event::TimelineChanged { account: id, key, diffs });
+    assert!(s.edit_last(ComposerTarget::Thread, &mut Tx::default()));
+    s.thread_composer.edit.insert("!");
+    s.open_thread("$theirs");
+    assert!(s.thread_composer.editing.is_none());
+    s.open_thread("$mine");
+    assert_eq!((s.thread_composer.editing.is_some(), s.thread_composer.edit.text.as_str()), (true, "in thread!"));
+}

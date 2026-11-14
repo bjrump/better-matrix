@@ -820,7 +820,6 @@ impl State {
                 self.accounts.upsert(summary);
                 if again {
                     self.open_timelines.retain(|(account, _)| *account != id);
-                    self.set_aside.retain(|edit| edit.target.account != id);
                     self.sync_timeline();
                 }
                 self.request_avatars();
@@ -840,6 +839,8 @@ impl State {
                 }
                 self.open_timelines.retain(|(account, _)| *account != id);
                 self.sync_timeline();
+                // After the sync, which sets an edit of its timelines aside: they all go with it.
+                self.set_aside.retain(|edit| edit.target.account != id);
             }
             Event::RoomsUpdated { account, list } => {
                 self.accounts.set_room_list(&account, list);
@@ -1292,9 +1293,12 @@ impl State {
             Purpose::Send => self.notice = Some(tf!("notice.not_sent", error = error)),
             Purpose::Edit(edit) => {
                 self.notice = Some(tf!("notice.not_changed", error = error));
-                // It comes back as the user left it: now, or once its timeline and composer are free.
-                self.set_edit_aside(*edit);
-                self.resume_edits();
+                // It comes back as the user left it: now, or once its timeline and composer are
+                // free. Not for an account that has gone meanwhile.
+                if self.accounts.get(&edit.target.account).is_some() {
+                    self.set_edit_aside(*edit);
+                    self.resume_edits();
+                }
             }
             Purpose::Delete => self.notice = Some(tf!("notice.not_deleted", error = error)),
             Purpose::Logout => self.notice = Some(tf!("notice.sign_out", error = error)),
@@ -3067,8 +3071,14 @@ impl State {
     pub fn open_thread(&mut self, root_event_id: &str) {
         let Some(account) = self.nav.account.clone() else { return };
         if self.nav.threads.get(&account).map(String::as_str) != Some(root_event_id) {
-            // A memo recording in the thread being left goes with it, its file removed.
-            self.cancel_voice_memo(ComposerTarget::Thread);
+            // A memo recording in the thread being left goes with it, its file removed; an edit
+            // there is set aside, to come back with its thread.
+            if let Some(memo) = self.thread_composer.voice.take() {
+                memo.0.cancel();
+            }
+            if let Some(edit) = self.thread_composer.set_aside_edit() {
+                self.set_edit_aside(edit);
+            }
             self.thread_composer = Composer::default();
         }
         let key = self.active_room_id().map(|room_id| TimelineKey::thread(room_id, root_event_id));
@@ -3119,6 +3129,8 @@ impl State {
         let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { return };
         self.popover = None;
         let edited = composer::EditTarget { account, key, event_id: message.event_id.clone() };
+        // Editing it afresh drops what was kept of an earlier edit of it.
+        self.set_aside.retain(|kept| kept.target != edited);
         self.composer_mut(target).start_edit(edited, body, html.as_deref());
         tx.focus(composer_field(target), false);
     }

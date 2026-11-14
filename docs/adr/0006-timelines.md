@@ -59,21 +59,21 @@ see who is typing there.
 - **Sending:** `Command::Send { key, reply_to, .. }` goes through the open timeline, which sets
   reply and thread relations and shows a pending message at once. The room's send queue
   persists it, retries offline and resumes after a restart.
-- **Editing and deleting:** the user's own text messages can be edited (`Command::Edit`, through
-  the timeline's `edit`) and any of their messages deleted (`Command::Redact`), from the menu
-  under the hover toolbar's ⋮ (`Popover::MessageMenu`), which only the user's own messages
-  have; deleting asks first (`Confirm::DeleteMessage`). Up in an empty composer edits the
-  user's newest plain text message there (`Message::editable`: the user's own `m.text`;
-  emotes, notices and files keep what they are). The composer then holds the message
-  (`Composer::editing`: the account, timeline and event, so the edit goes where it began) under
-  an "Editing your message" bar; the draft, its reply and attachments are set aside and come
-  back when the edit is sent or dropped. Escape stops it, as does replying. While editing, attachments, voice memos and polls are off, and no edit
-  starts while a voice memo records or on a message still sending. An emptied or unchanged
-  edit isn't sent. An edit left by navigating away, or refused by the server (`Purpose::Edit`),
-  is set aside (`State::set_aside`, one per message) and comes back into its composer, as the
-  user left it, once its timeline is on screen and the composer is free (no other edit, no
-  memo); sending an edit of the same message drops the kept one, as does removing its account.
-  A failed delete has its own notice.
+- **Editing and deleting:** the user's own text messages can be edited (`Command::Edit`, through the
+  timeline's `edit`) and any of their messages deleted (`Command::Redact`), from the menu under the
+  hover toolbar's ⋮ (`Popover::MessageMenu`), which only the user's own messages have; deleting asks
+  first (`Confirm::DeleteMessage`). Up in an empty composer edits the user's newest plain text
+  message there (`Message::editable`: the user's own `m.text`; emotes, notices and files keep what
+  they are). The composer then holds the message (`Composer::editing`: the account, timeline and
+  event, so the edit goes where it began) under an "Editing your message" bar; the draft, its reply
+  and attachments are set aside and come back when the edit is sent or dropped. Escape stops it, as
+  does replying. While editing, attachments, voice memos and polls are off, and no edit starts while
+  a voice memo records or on a message still sending. An emptied or unchanged edit isn't sent. An
+  edit left by navigating away, or refused by the server (`Purpose::Edit`), is set aside
+  (`State::set_aside`, one per message) and comes back into its composer, as the user left it, once
+  its timeline is on screen and the composer is free (no other edit, no memo); sending an edit of
+  the same message drops the kept one, as does removing its account. A failed delete has its own
+  notice.
 - **Reactions, replies, threads:**
   - `Command::React` toggles the user's reaction (`toggle_reaction`). Messages carry each
     reaction's count and whether the user is among them. The picker offers quick reactions,
