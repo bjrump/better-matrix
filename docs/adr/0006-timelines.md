@@ -72,8 +72,10 @@ see who is typing there.
   edit left by navigating away, or refused by the server (`Purpose::Edit`), is set aside
   (`State::set_aside`, one per message) and comes back into its composer, as the user left it, once
   its timeline is on screen and the composer is free (no other edit, no memo); sending an edit of
-  the same message drops the kept one, as does removing its account. A failed delete has its own
-  notice.
+  the same message, from any timeline, drops the kept one, as does removing its account (an edit
+  still on its way then doesn't come back either); starting one brings the kept edit back when it
+  was made in the same timeline, and sets an edit of another message aside. A failed delete has its
+  own notice.
 - **Reactions, replies, threads:**
   - `Command::React` toggles the user's reaction (`toggle_reaction`). Messages carry each
     reaction's count and whether the user is among them. The picker offers quick reactions,

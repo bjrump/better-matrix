@@ -147,6 +147,14 @@ pub struct EditTarget {
     pub event_id: String,
 }
 
+impl EditTarget {
+    /// Whether both edit the same message, from whichever timeline (a thread's root shows in
+    /// the room too).
+    pub fn same_message(&self, other: &EditTarget) -> bool {
+        self.account == other.account && self.key.room_id == other.key.room_id && self.event_id == other.event_id
+    }
+}
+
 /// One of the user's messages being edited in a composer.
 #[derive(Debug)]
 pub struct Editing {

@@ -839,8 +839,10 @@ impl State {
                 }
                 self.open_timelines.retain(|(account, _)| *account != id);
                 self.sync_timeline();
-                // After the sync, which sets an edit of its timelines aside: they all go with it.
+                // After the sync, which sets an edit of its timelines aside: they all go with it,
+                // and an edit still on its way doesn't come back if the account signs in again.
                 self.set_aside.retain(|edit| edit.target.account != id);
+                self.pending.retain(|_, purpose| !matches!(purpose, Purpose::Edit(edit) if edit.target.account == id));
             }
             Event::RoomsUpdated { account, list } => {
                 self.accounts.set_room_list(&account, list);
@@ -3129,15 +3131,24 @@ impl State {
         let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { return };
         self.popover = None;
         let edited = composer::EditTarget { account, key, event_id: message.event_id.clone() };
-        // Editing it afresh drops what was kept of an earlier edit of it.
-        self.set_aside.retain(|kept| kept.target != edited);
-        self.composer_mut(target).start_edit(edited, body, html.as_deref());
+        // An edit of another message under way is kept, to come back after this one.
+        if let Some(other) = self.composer_mut(target).set_aside_edit() {
+            self.set_edit_aside(other);
+        }
+        // What was kept of an earlier edit of this message comes back as the user left it, when
+        // it was made here; from another timeline, it is dropped for a fresh edit.
+        let kept = self.set_aside.iter().position(|kept| kept.target == edited).map(|at| self.set_aside.remove(at));
+        self.set_aside.retain(|kept| !kept.target.same_message(&edited));
+        match kept {
+            Some(kept) => self.composer_mut(target).resume_edit(kept),
+            None => self.composer_mut(target).start_edit(edited, body, html.as_deref()),
+        }
         tx.focus(composer_field(target), false);
     }
 
     /// Keeps an edit for later, in place of any earlier one of the same message.
     fn set_edit_aside(&mut self, edit: composer::Edit) {
-        self.set_aside.retain(|kept| kept.target != edit.target);
+        self.set_aside.retain(|kept| !kept.target.same_message(&edit.target));
         self.set_aside.push(edit);
     }
 
@@ -3248,7 +3259,7 @@ impl State {
             // Unchanged, nothing is sent; either way the draft comes back.
             if let Some(edit) = self.composer_mut(target).take_edit() {
                 // This edit supersedes one of the same message kept from before.
-                self.set_aside.retain(|kept| kept.target != edit.target);
+                self.set_aside.retain(|kept| !kept.target.same_message(&edit.target));
                 let composer::EditTarget { account, key, event_id } = edit.target.clone();
                 let (body, html) = (edit.body.clone(), edit.html.clone());
                 self.dispatch(Command::Edit { account, key, event_id, body, html }, Purpose::Edit(Box::new(edit)));

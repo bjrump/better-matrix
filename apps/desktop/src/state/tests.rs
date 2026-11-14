@@ -2486,3 +2486,75 @@ fn switching_threads_should_keep_the_threads_edit() {
     s.open_thread("$mine");
     assert_eq!((s.thread_composer.editing.is_some(), s.thread_composer.edit.text.as_str()), (true, "in thread!"));
 }
+
+/// The user's own text message `event_id`, as the timeline holds it.
+fn own_entry(event_id: &str, body: &str) -> matrix_core::TimelineEntry {
+    let message = Message { event_id: event_id.into(), ..own_message(body) };
+    matrix_core::TimelineEntry { id: event_id.into(), kind: matrix_core::EntryKind::Message(Box::new(message)) }
+}
+
+/// Sends an edit of the user's last message, `!` added, and gives its request.
+fn send_edit(s: &mut State, commands: &mut DetachedCommands) -> RequestId {
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.composer.edit.insert("!");
+    drain(commands);
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    drain(commands).into_iter().find(|(_, c)| matches!(c, Command::Edit { .. })).map(|(request, _)| request).unwrap()
+}
+
+#[test]
+fn a_refused_edit_of_a_removed_account_should_not_come_back() {
+    let (mut s, mut commands) = state();
+    let id = with_own_message(&mut s);
+    let request = send_edit(&mut s, &mut commands);
+    apply(&mut s, Event::AccountRemoved(id));
+    with_own_message(&mut s);
+    apply(&mut s, Event::Finished { request, result: Err("gone".into()) });
+    assert!(s.composer.editing.is_none());
+}
+
+#[test]
+fn editing_a_message_with_a_kept_edit_should_bring_it_back() {
+    let (mut s, mut commands) = state();
+    let id = with_own_message(&mut s);
+    let diffs = vec![matrix_core::TimelineDiff::PushBack(own_entry("$later", "later"))];
+    apply(&mut s, Event::TimelineChanged { account: id, key: TimelineKey::room("!one:x"), diffs });
+    let mine = Message { event_id: "$mine".into(), ..own_message("helo") };
+    let later = Message { event_id: "$later".into(), ..own_message("later") };
+    s.start_edit(ComposerTarget::Room, &mine, &mut Tx::default());
+    s.composer.edit.insert("!");
+    drain(&mut commands);
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let request =
+        drain(&mut commands).into_iter().find(|(_, c)| matches!(c, Command::Edit { .. })).map(|(r, _)| r).unwrap();
+    s.start_edit(ComposerTarget::Room, &later, &mut Tx::default());
+    apply(&mut s, Event::Finished { request, result: Err("offline".into()) });
+    s.start_edit(ComposerTarget::Room, &mine, &mut Tx::default());
+    assert_eq!(s.composer.edit.text, "helo!");
+    assert_eq!(s.set_aside.len(), 1);
+}
+
+#[test]
+fn editing_a_message_from_another_timeline_should_drop_its_kept_edit() {
+    let (mut s, _) = state();
+    let id = with_own_message(&mut s);
+    s.open_thread("$mine");
+    let diffs = vec![matrix_core::TimelineDiff::Reset(vec![own_entry("$mine", "helo")])];
+    apply(&mut s, Event::TimelineChanged { account: id, key: TimelineKey::thread("!one:x", "$mine"), diffs });
+    s.edit_last(ComposerTarget::Thread, &mut Tx::default());
+    s.thread_composer.edit.insert("!");
+    s.open_thread("$theirs");
+    s.start_edit(ComposerTarget::Room, &own_message("helo"), &mut Tx::default());
+    assert_eq!(s.composer.edit.text, "helo");
+    assert!(s.set_aside.is_empty());
+}
+
+fn own_message(body: &str) -> Message {
+    Message {
+        event_id: "$mine".into(),
+        sender_id: "@a:example.org".into(),
+        content: MessageContent::Text { body: body.into(), html: None },
+        editable: true,
+        ..Message::default()
+    }
+}
