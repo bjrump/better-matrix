@@ -1296,11 +1296,9 @@ impl State {
             Purpose::Edit(edit) => {
                 self.notice = Some(tf!("notice.not_changed", error = error));
                 // It comes back as the user left it: now, or once its timeline and composer are
-                // free. Not for an account that has gone meanwhile.
-                if self.accounts.get(&edit.target.account).is_some() {
-                    self.set_edit_aside(*edit);
-                    self.resume_edits();
-                }
+                // free. (Removing an account forgets its edits on their way.)
+                self.set_edit_aside(*edit);
+                self.resume_edits();
             }
             Purpose::Delete => self.notice = Some(tf!("notice.not_deleted", error = error)),
             Purpose::Logout => self.notice = Some(tf!("notice.sign_out", error = error)),
@@ -3131,8 +3129,9 @@ impl State {
         let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { return };
         self.popover = None;
         let edited = composer::EditTarget { account, key, event_id: message.event_id.clone() };
-        // An edit of another message under way is kept, to come back after this one.
-        if let Some(other) = self.composer_mut(target).set_aside_edit() {
+        // An edit of another message under way is kept, to come back after this one, when it
+        // changed anything.
+        if let Some(other) = self.composer_mut(target).take_edit() {
             self.set_edit_aside(other);
         }
         // What was kept of an earlier edit of this message comes back as the user left it, when
@@ -3163,7 +3162,8 @@ impl State {
             if composer.editing.is_some() || composer.voice.is_some() {
                 continue;
             }
-            let at = self.set_aside.iter().position(|edit| edit.target.account == account && edit.target.key == key);
+            // The newest first: the edit left last comes back first.
+            let at = self.set_aside.iter().rposition(|edit| edit.target.account == account && edit.target.key == key);
             if let Some(edit) = at.map(|at| self.set_aside.remove(at)) {
                 self.composer_mut(target).resume_edit(edit);
             }
@@ -3258,8 +3258,16 @@ impl State {
         if self.composer(target).editing.is_some() {
             // Unchanged, nothing is sent; either way the draft comes back.
             if let Some(edit) = self.composer_mut(target).take_edit() {
-                // This edit supersedes one of the same message kept from before.
+                // This edit supersedes one of the same message kept from before, or under way in
+                // the other composer (a thread's root shows in both).
                 self.set_aside.retain(|kept| !kept.target.same_message(&edit.target));
+                let other = match target {
+                    ComposerTarget::Room => ComposerTarget::Thread,
+                    ComposerTarget::Thread => ComposerTarget::Room,
+                };
+                if self.composer(other).editing.as_ref().is_some_and(|live| live.target.same_message(&edit.target)) {
+                    self.composer_mut(other).cancel_edit();
+                }
                 let composer::EditTarget { account, key, event_id } = edit.target.clone();
                 let (body, html) = (edit.body.clone(), edit.html.clone());
                 self.dispatch(Command::Edit { account, key, event_id, body, html }, Purpose::Edit(Box::new(edit)));

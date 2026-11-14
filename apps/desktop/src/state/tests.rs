@@ -2531,7 +2531,8 @@ fn editing_a_message_with_a_kept_edit_should_bring_it_back() {
     apply(&mut s, Event::Finished { request, result: Err("offline".into()) });
     s.start_edit(ComposerTarget::Room, &mine, &mut Tx::default());
     assert_eq!(s.composer.edit.text, "helo!");
-    assert_eq!(s.set_aside.len(), 1);
+    // The edit of the later message changed nothing, so it isn't kept.
+    assert!(s.set_aside.is_empty());
 }
 
 #[test]
@@ -2557,4 +2558,37 @@ fn own_message(body: &str) -> Message {
         editable: true,
         ..Message::default()
     }
+}
+
+/// The room composer editing `$mine` ("helo?"), and the thread of `$mine` editing it too
+/// ("helo!") until the user switches to another thread, which keeps that edit.
+fn edits_in_room_and_thread(s: &mut State) {
+    let id = with_own_message(s);
+    with_rooms(s, &id, &["!one:x", "!two:x"], Vec::new());
+    s.start_edit(ComposerTarget::Room, &own_message("helo"), &mut Tx::default());
+    s.composer.edit.insert("?");
+    s.open_thread("$mine");
+    let diffs = vec![matrix_core::TimelineDiff::Reset(vec![own_entry("$mine", "helo")])];
+    apply(s, Event::TimelineChanged { account: id, key: TimelineKey::thread("!one:x", "$mine"), diffs });
+    s.edit_last(ComposerTarget::Thread, &mut Tx::default());
+    s.thread_composer.edit.insert("!");
+    s.open_thread("$theirs");
+}
+
+#[test]
+fn sending_an_edit_should_drop_an_edit_of_the_message_kept_from_its_thread() {
+    let (mut s, _) = state();
+    edits_in_room_and_thread(&mut s);
+    assert_eq!(s.set_aside.len(), 1);
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(s.set_aside.is_empty());
+}
+
+#[test]
+fn keeping_an_edit_should_replace_one_of_the_message_kept_from_its_thread() {
+    let (mut s, _) = state();
+    edits_in_room_and_thread(&mut s);
+    s.select_room("!two:x");
+    let kept: Vec<&str> = s.set_aside.iter().map(|edit| edit.body.as_str()).collect();
+    assert_eq!(kept, ["helo?"]);
 }

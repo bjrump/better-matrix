@@ -73,9 +73,10 @@ see who is typing there.
   (`State::set_aside`, one per message) and comes back into its composer, as the user left it, once
   its timeline is on screen and the composer is free (no other edit, no memo); sending an edit of
   the same message, from any timeline, drops the kept one, as does removing its account (an edit
-  still on its way then doesn't come back either); starting one brings the kept edit back when it
-  was made in the same timeline, and sets an edit of another message aside. A failed delete has its
-  own notice.
+  still on its way then doesn't come back either), and sending one ends an edit of the same message
+  under way in the other composer. Kept edits come back newest first. Starting an edit brings the
+  kept edit back when it was made in the same timeline, and keeps an edit of another message under
+  way when it changed anything. A failed delete has its own notice.
 - **Reactions, replies, threads:**
   - `Command::React` toggles the user's reaction (`toggle_reaction`). Messages carry each
     reaction's count and whether the user is among them. The picker offers quick reactions,
