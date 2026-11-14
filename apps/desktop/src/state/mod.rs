@@ -40,7 +40,7 @@ use rune::{TextEdit, Tx};
 
 pub use accounts::{AccountData, Accounts, EntryView, RoomTimeline, Scope, TimelineItem, now_ms, wants_attention};
 pub use call::Call;
-pub use composer::{Composer, Format, ReplyTarget, VoiceMemo};
+pub use composer::{Composer, EditTarget, Format, ReplyTarget, VoiceMemo};
 pub use gifs::GifCache;
 pub use link_previews::LinkPreviews;
 pub use media::MediaCache;
@@ -386,7 +386,7 @@ pub enum ResetStep {
 const MEMBER_PICTURES: usize = 60;
 
 /// Why a command was sent, so its [`Event::Finished`] lands in the right place.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Purpose {
     /// Starting, answering or steering a call.
     Call,
@@ -395,8 +395,10 @@ enum Purpose {
     Discover,
     SignIn,
     Send,
-    /// Editing or deleting one of the user's messages.
-    Edit,
+    /// Editing one of the user's messages: what was sent, back in the field if it fails.
+    Edit(Box<composer::Edit>),
+    /// Deleting one of the user's messages.
+    Delete,
     Logout,
     Media {
         media: MediaRef,
@@ -1283,7 +1285,11 @@ impl State {
                 self.schedule_retry();
             }
             Purpose::Send => self.notice = Some(tf!("notice.not_sent", error = error)),
-            Purpose::Edit => self.notice = Some(tf!("notice.not_changed", error = error)),
+            Purpose::Edit(edit) => {
+                self.notice = Some(tf!("notice.not_changed", error = error));
+                self.edit_failed(*edit);
+            }
+            Purpose::Delete => self.notice = Some(tf!("notice.not_deleted", error = error)),
             Purpose::Logout => self.notice = Some(tf!("notice.sign_out", error = error)),
             Purpose::NotificationMode => self.notice = Some(tf!("notice.notification_setting", error = error)),
             Purpose::Leave => self.notice = Some(tf!("notice.leave", error = error)),
@@ -1390,10 +1396,15 @@ impl State {
             }
         }
         // A memo recording for a timeline no longer shown would go on unseen, the microphone
-        // open: closing the thread, another room and the overview all drop it.
+        // open: closing the thread, another room and the overview all drop it. An edit of a
+        // message there stops too, its draft back.
         for target in [ComposerTarget::Room, ComposerTarget::Thread] {
             if self.composer(target).voice.as_ref().is_some_and(|memo| !shown.contains(&memo.2)) {
                 self.cancel_voice_memo(target);
+            }
+            let editing = self.composer(target).editing.as_ref().map(|editing| &editing.target);
+            if editing.is_some_and(|edited| !shown.iter().any(|(a, k)| *a == edited.account && *k == edited.key)) {
+                self.composer_mut(target).cancel_edit();
             }
         }
         let (gone, kept): (Vec<_>, Vec<_>) = self.open_timelines.drain(..).partition(|open| !shown.contains(open));
@@ -2508,7 +2519,7 @@ impl State {
                 (Command::EndPoll { account, key, poll_id }, Purpose::Poll)
             }
             Confirm::DeleteMessage { account, key, event_id } => {
-                (Command::Redact { account, key, event_id }, Purpose::Edit)
+                (Command::Redact { account, key, event_id }, Purpose::Delete)
             }
         };
         self.dispatch(command, purpose);
@@ -3072,8 +3083,14 @@ impl State {
 
     /// Starts a reply to `message` in the given composer.
     pub fn start_reply(&mut self, target: ComposerTarget, message: &Message, tx: &mut Tx) {
-        let excerpt: String = message.content.plain().chars().take(140).collect();
-        self.composer_mut(target).reply_to =
+        let excerpt: String = match &message.content {
+            MessageContent::Call(card) => call_title(card).to_owned(),
+            content => content.plain().chars().take(140).collect(),
+        };
+        // Replying ends an edit: its draft comes back, and the reply goes with that.
+        let composer = self.composer_mut(target);
+        composer.cancel_edit();
+        composer.reply_to =
             Some(ReplyTarget { event_id: message.event_id.clone(), sender_name: message.sender_name.clone(), excerpt });
         tx.focus(composer_field(target), false);
     }
@@ -3084,10 +3101,23 @@ impl State {
 
     /// Starts editing one of the user's text messages in a composer.
     pub fn start_edit(&mut self, target: ComposerTarget, message: &Message, tx: &mut Tx) {
-        let MessageContent::Text { body, html } = &message.content else { return };
+        let (MessageContent::Text { body, html }, true) = (&message.content, message.editable) else { return };
+        let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { return };
         self.popover = None;
-        self.composer_mut(target).start_edit(&message.event_id, body, html.as_deref());
+        let edited = composer::EditTarget { account, key, event_id: message.event_id.clone() };
+        self.composer_mut(target).start_edit(edited, body, html.as_deref());
         tx.focus(composer_field(target), false);
+    }
+
+    /// An edit the server refused comes back into its composer as the user left it, when its
+    /// timeline is still shown and nothing else is being edited there.
+    fn edit_failed(&mut self, edit: composer::Edit) {
+        let target = if edit.target.key.thread.is_some() { ComposerTarget::Thread } else { ComposerTarget::Room };
+        let shown = self.nav.account.as_ref() == Some(&edit.target.account)
+            && self.composer_key(target).as_ref() == Some(&edit.target.key);
+        if shown && self.composer(target).editing.is_none() {
+            self.composer_mut(target).resume_edit(edit);
+        }
     }
 
     /// Edits the user's newest text message in a composer's timeline: the Up arrow in an empty
@@ -3096,13 +3126,7 @@ impl State {
         let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { return false };
         let Some(timeline) = self.accounts.get(&account).and_then(|data| data.timeline(&key)) else { return false };
         let last = timeline.entries.iter().rev().find_map(|entry| match &entry.kind {
-            EntryView::Message(item)
-                if item.message.sender_id == account.as_str()
-                    && !item.message.pending
-                    && matches!(item.message.content, MessageContent::Text { .. }) =>
-            {
-                Some(item.message.clone())
-            }
+            EntryView::Message(item) if item.message.editable && !item.message.pending => Some(item.message.clone()),
             _ => None,
         });
         let Some(message) = last else { return false };
@@ -3181,9 +3205,11 @@ impl State {
 
     pub fn send_message(&mut self, target: ComposerTarget, tx: &mut Tx) {
         if self.composer(target).editing.is_some() {
-            let (Some(account), Some(key)) = (self.nav.account.clone(), self.composer_key(target)) else { return };
-            if let Some((event_id, body, html)) = self.composer_mut(target).take_edit() {
-                self.dispatch(Command::Edit { account, key, event_id, body, html }, Purpose::Edit);
+            // Unchanged, nothing is sent; either way the draft comes back.
+            if let Some(edit) = self.composer_mut(target).take_edit() {
+                let composer::EditTarget { account, key, event_id } = edit.target.clone();
+                let (body, html) = (edit.body.clone(), edit.html.clone());
+                self.dispatch(Command::Edit { account, key, event_id, body, html }, Purpose::Edit(Box::new(edit)));
             }
             return;
         }
@@ -3304,24 +3330,32 @@ impl State {
     /// A paste into a composer: an image or files become attachments, and a lone web address a
     /// link (true); anything else is left to the editor to paste (false).
     pub fn paste_into_composer(&mut self, target: ComposerTarget, content: &rune::clipboard::ClipboardContent) -> bool {
-        if let Some(image) = content.image() {
-            self.composer_mut(target).attach_pasted_image(image.png());
-            return true;
+        let composer = self.composer_mut(target);
+        // An edit changes the text only: nothing attaches to it.
+        if composer.editing.is_none() {
+            if let Some(image) = content.image() {
+                composer.attach_pasted_image(image.png());
+                return true;
+            }
+            if !content.files().is_empty() {
+                composer.attach(content.files().iter().cloned());
+                return true;
+            }
         }
-        if !content.files().is_empty() {
-            self.composer_mut(target).attach(content.files().iter().cloned());
-            return true;
-        }
-        if matrix_core::links::is_link(content.text()) {
-            self.composer_mut(target).paste_link(content.text().trim());
+        // In a code block links can't be, so the address pastes as text.
+        if matrix_core::links::is_link(content.text()) && composer.edit.active_block() != rune::Block::Code {
+            composer.paste_link(content.text().trim());
             return true;
         }
         false
     }
 
-    /// Attaches files to a composer: dropped onto its pane.
+    /// Attaches files to a composer: dropped onto its pane. Not to an edit.
     pub fn attach_files_to(&mut self, target: ComposerTarget, paths: &[PathBuf]) {
-        self.composer_mut(target).attach(paths.iter().cloned());
+        let composer = self.composer_mut(target);
+        if composer.editing.is_none() {
+            composer.attach(paths.iter().cloned());
+        }
         self.drop_hover = false;
     }
 
@@ -3384,6 +3418,15 @@ impl State {
 mod tests;
 
 /// The element key of a composer's text field.
+/// The name of a kind of call: video, voice, or just a call when the caller didn't say.
+pub fn call_title(card: &matrix_core::CallCard) -> &'static str {
+    match card.video {
+        Some(true) => t!("call.card.video"),
+        Some(false) => t!("call.card.voice"),
+        None => t!("call.card.call"),
+    }
+}
+
 pub fn composer_field(target: ComposerTarget) -> &'static str {
     match target {
         ComposerTarget::Room => "composer",

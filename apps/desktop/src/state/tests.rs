@@ -2294,6 +2294,7 @@ fn with_own_message(s: &mut State) -> AccountId {
             event_id: event_id.into(),
             sender_id: sender_id.into(),
             content: MessageContent::Text { body: body.into(), html: None },
+            editable: sender_id == "@a:example.org",
             ..Message::default()
         })),
     };
@@ -2308,7 +2309,8 @@ fn up_in_an_empty_composer_should_edit_the_users_last_message() {
     let (mut s, _) = state();
     with_own_message(&mut s);
     assert!(s.edit_last(ComposerTarget::Room, &mut Tx::default()));
-    assert_eq!((s.composer.editing.as_deref(), s.composer.edit.text.as_str()), (Some("$mine"), "helo"));
+    let editing = s.composer.editing.as_ref().map(|editing| editing.target.event_id.as_str());
+    assert_eq!((editing, s.composer.edit.text.as_str()), (Some("$mine"), "helo"));
 }
 
 #[test]
@@ -2340,4 +2342,60 @@ fn deleting_a_message_should_ask_first_then_delete_it() {
             .iter()
             .any(|c| matches!(c, Command::Redact { event_id, .. } if event_id == "$mine"))
     );
+}
+
+#[test]
+fn an_edit_should_stop_when_its_room_leaves_the_screen() {
+    let (mut s, _) = state();
+    let id = with_own_message(&mut s);
+    with_rooms(&mut s, &id, &["!one:x", "!two:x"], Vec::new());
+    s.composer.edit.insert("draft");
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.select_room("!two:x");
+    assert!(s.composer.editing.is_none());
+    assert_eq!(s.composer.edit.text, "draft");
+}
+
+#[test]
+fn replying_should_end_an_edit() {
+    let (mut s, _) = state();
+    with_own_message(&mut s);
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    let theirs = Message { event_id: "$theirs".into(), sender_name: "b".into(), ..Message::default() };
+    s.start_reply(ComposerTarget::Room, &theirs, &mut Tx::default());
+    assert!(s.composer.editing.is_none());
+    assert_eq!(s.composer.reply_to.as_ref().map(|reply| reply.event_id.as_str()), Some("$theirs"));
+}
+
+#[test]
+fn a_failed_edit_should_come_back_into_the_composer() {
+    let (mut s, mut commands) = state();
+    with_own_message(&mut s);
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.composer.edit.insert("!");
+    drain(&mut commands);
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let Some((request, _)) = drain(&mut commands).into_iter().find(|(_, c)| matches!(c, Command::Edit { .. })) else {
+        panic!("expected an edit");
+    };
+    apply(&mut s, Event::Finished { request, result: Err("gone".into()) });
+    assert_eq!((s.composer.editing.is_some(), s.composer.edit.text.as_str()), (true, "helo!"));
+    assert!(s.notice.is_some());
+}
+
+#[test]
+fn an_edit_should_take_no_attachments() {
+    let (mut s, _) = state();
+    with_own_message(&mut s);
+    s.edit_last(ComposerTarget::Room, &mut Tx::default());
+    s.attach_files_to(ComposerTarget::Room, &[PathBuf::from("/a.png")]);
+    assert!(s.composer.attachments.is_empty());
+}
+
+#[test]
+fn an_address_pasted_in_a_code_block_should_paste_as_text() {
+    let (mut s, _) = state();
+    s.composer.format(crate::state::Format::CodeBlock);
+    let content = rune::clipboard::ClipboardContent::new("https://matrix.org");
+    assert!(!s.paste_into_composer(ComposerTarget::Room, &content));
 }

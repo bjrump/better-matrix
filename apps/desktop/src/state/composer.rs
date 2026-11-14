@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use matrix_core::{Outgoing, Upload};
+use matrix_core::{AccountId, Outgoing, TimelineKey, Upload};
 use rune::{Block, Mark, TextEdit};
 
 /// Every formatting action the composer offers. The toolbar renders this list; shortcuts and
@@ -113,9 +113,9 @@ pub struct Composer {
     pub link: Option<TextEdit>,
     /// The message this draft answers, when replying.
     pub reply_to: Option<ReplyTarget>,
-    /// The user's own message being edited: its event ID. The field holds its text, and sending
-    /// changes it rather than sending a new message.
-    pub editing: Option<String>,
+    /// The user's own message being edited. The field holds its text, and sending changes it
+    /// rather than sending a new message.
+    pub editing: Option<Editing>,
 }
 
 impl Default for Composer {
@@ -131,6 +131,49 @@ impl Default for Composer {
             editing: None,
         }
     }
+}
+
+/// A field's text as Matrix HTML: only when it carries formatting.
+fn html_of(edit: &TextEdit) -> Option<String> {
+    let formatted = !edit.marks().is_empty() || edit.blocks().iter().any(|b| *b != Block::Paragraph);
+    formatted.then(|| edit.to_html())
+}
+
+/// Which message an edit changes: the account's message `event_id` in the timeline `key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditTarget {
+    pub account: AccountId,
+    pub key: TimelineKey,
+    pub event_id: String,
+}
+
+/// One of the user's messages being edited in a composer.
+#[derive(Debug)]
+pub struct Editing {
+    pub target: EditTarget,
+    /// The message as it read, text and HTML: an unchanged edit isn't sent.
+    original: (String, Option<String>),
+    /// The draft set aside while editing.
+    draft: Box<Draft>,
+}
+
+/// What a composer held before an edit took the field.
+#[derive(Debug)]
+struct Draft {
+    edit: TextEdit,
+    reply_to: Option<ReplyTarget>,
+    attachments: Vec<Upload>,
+}
+
+/// An edit on its way: the message, its new text and formatting, and the field as the user left
+/// it, which comes back if the edit fails.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Edit {
+    pub target: EditTarget,
+    pub body: String,
+    pub html: Option<String>,
+    field: TextEdit,
+    original: (String, Option<String>),
 }
 
 /// A rich field limited to what Matrix HTML carries (no underline).
@@ -192,40 +235,64 @@ impl Composer {
         });
     }
 
-    /// Starts editing the user's message `event_id`: the field takes its text and formatting,
-    /// in place of the draft.
-    pub fn start_edit(&mut self, event_id: &str, body: &str, html: Option<&str>) {
-        let mut edit = new_edit();
+    /// Starts editing the user's message `event_id` in `key`: the field takes its text and
+    /// formatting, and the draft (with its reply and attachments) is set aside until the edit
+    /// is sent or dropped.
+    pub fn start_edit(&mut self, target: EditTarget, body: &str, html: Option<&str>) {
+        let mut field = new_edit();
         match html {
             Some(html) => {
-                let _ = edit.paste_html(html, body);
+                let _ = field.paste_html(html, body);
             }
-            None => edit.insert(body),
+            None => field.insert(body),
         }
-        edit.clear_history();
-        edit.focused = true;
-        self.edit = edit;
-        self.editing = Some(event_id.to_owned());
-        self.reply_to = None;
-        self.link = None;
+        field.clear_history();
+        let original = (field.text.trim().to_owned(), html_of(&field));
+        self.edit_with(target, field, original);
     }
 
-    /// Stops editing, leaving an empty field.
+    fn edit_with(&mut self, target: EditTarget, mut field: TextEdit, original: (String, Option<String>)) {
+        self.cancel_edit();
+        field.focused = true;
+        let draft = Draft {
+            edit: std::mem::replace(&mut self.edit, field),
+            reply_to: self.reply_to.take(),
+            attachments: std::mem::take(&mut self.attachments),
+        };
+        self.link = None;
+        self.editing = Some(Editing { target, original, draft: Box::new(draft) });
+    }
+
+    /// Stops editing: the draft set aside comes back.
     pub fn cancel_edit(&mut self) {
-        if self.editing.take().is_some() {
-            self.edit = new_edit();
-            self.link = None;
-        }
+        let Some(editing) = self.editing.take() else { return };
+        let Draft { edit, reply_to, attachments } = *editing.draft;
+        self.edit = edit;
+        self.reply_to = reply_to;
+        self.attachments = attachments;
+        self.link = None;
     }
 
-    /// The edit to send, if one is under way: the message's event ID, its new text and its
-    /// formatting. Leaves an empty field. An emptied message isn't sent: it stays as it was.
-    pub fn take_edit(&mut self) -> Option<(String, String, Option<String>)> {
-        let event_id = self.editing.take()?;
-        let (body, html) = (self.edit.text.trim().to_owned(), self.html());
-        self.edit = new_edit();
-        self.link = None;
-        (!body.is_empty()).then_some((event_id, body, html))
+    /// The edit to send, if one is under way and changed the message; the draft comes back
+    /// either way. An emptied message isn't sent: it stays as it was.
+    pub fn take_edit(&mut self) -> Option<Edit> {
+        let editing = self.editing.as_ref()?;
+        let (body, html) = (self.edit.text.trim().to_owned(), html_of(&self.edit));
+        let changed = !body.is_empty() && (&body, &html) != (&editing.original.0, &editing.original.1);
+        let edit = changed.then(|| Edit {
+            target: editing.target.clone(),
+            body,
+            html,
+            field: self.edit.clone(),
+            original: editing.original.clone(),
+        });
+        self.cancel_edit();
+        edit
+    }
+
+    /// Takes an edit that failed back into the field, as the user left it, to try again.
+    pub fn resume_edit(&mut self, edit: Edit) {
+        self.edit_with(edit.target, edit.field, edit.original);
     }
 
     /// Before a key reaches the field: typing straight on from a freshly formatted selection
@@ -285,19 +352,13 @@ impl Composer {
         matches!(self.edit.active_block(), Block::Paragraph | Block::Quote)
     }
 
-    /// The draft as Matrix HTML: only when it carries formatting.
-    fn html(&self) -> Option<String> {
-        let formatted = !self.edit.marks().is_empty() || self.edit.blocks().iter().any(|b| *b != Block::Paragraph);
-        formatted.then(|| self.edit.to_html())
-    }
-
     /// Everything to send, text first, and a fresh composer. HTML is sent only when the text
     /// carries formatting. The reply target, if any, goes with the first message.
     pub fn take_outgoing(&mut self) -> (Option<ReplyTarget>, Vec<Outgoing>) {
         let mut outgoing = Vec::new();
         let body = self.edit.text.trim().to_owned();
         if !body.is_empty() {
-            outgoing.push(Outgoing::Text { body, html: self.html() });
+            outgoing.push(Outgoing::Text { body, html: html_of(&self.edit) });
         }
         outgoing.extend(self.attachments.drain(..).map(Outgoing::File));
         self.edit = new_edit();
@@ -433,30 +494,65 @@ mod tests {
         assert_eq!(c.edit.to_html(), "<p>the <a href=\"https://matrix.org/blog\">blog</a></p>");
     }
 
+    fn target() -> EditTarget {
+        EditTarget { account: AccountId::new("@a:x"), key: TimelineKey::room("!r:x"), event_id: "$1".into() }
+    }
+
     #[test]
     fn editing_should_put_the_message_in_the_field_and_send_it_back_changed() {
         let mut c = Composer::default();
-        c.start_edit("$1", "helo", None);
+        c.start_edit(target(), "helo", None);
         c.edit.insert("!");
-        assert_eq!(c.take_edit(), Some(("$1".to_owned(), "helo!".to_owned(), None)));
+        let edit = c.take_edit().map(|edit| (edit.target, edit.body, edit.html));
+        assert_eq!(edit, Some((target(), "helo!".to_owned(), None)));
         assert!(c.editing.is_none() && c.is_empty());
     }
 
     #[test]
     fn editing_a_formatted_message_should_keep_its_formatting() {
         let mut c = Composer::default();
-        c.start_edit("$1", "loud", Some("<strong>loud</strong>"));
-        let Some((_, _, Some(html))) = c.take_edit() else { panic!("expected formatted text") };
-        assert!(html.contains("<strong>loud</strong>"), "{html}");
+        c.start_edit(target(), "loud", Some("<strong>loud</strong>"));
+        c.edit.insert("er");
+        let html = c.take_edit().and_then(|edit| edit.html).unwrap_or_default();
+        assert!(html.contains("<strong>louder</strong>"), "{html}");
     }
 
     #[test]
     fn an_emptied_edit_should_not_be_sent() {
         let mut c = Composer::default();
-        c.start_edit("$1", "x", None);
+        c.start_edit(target(), "x", None);
         c.edit.set_selection(0, 1);
         c.edit.insert("");
-        assert_eq!(c.take_edit(), None);
+        assert!(c.take_edit().is_none());
+    }
+
+    #[test]
+    fn an_unchanged_edit_should_not_be_sent() {
+        let mut c = Composer::default();
+        c.start_edit(target(), "same", None);
+        assert!(c.take_edit().is_none());
+    }
+
+    #[test]
+    fn a_draft_should_come_back_after_editing() {
+        let mut c = composer("half a thought");
+        c.attach([PathBuf::from("/a.png")]);
+        c.start_edit(target(), "older", None);
+        assert!(c.attachments.is_empty());
+        c.cancel_edit();
+        assert_eq!((c.edit.text.as_str(), c.attachments.len()), ("half a thought", 1));
+    }
+
+    #[test]
+    fn a_failed_edit_should_come_back_as_the_user_left_it() {
+        let mut c = composer("draft");
+        c.start_edit(target(), "helo", None);
+        c.edit.insert("!");
+        let Some(edit) = c.take_edit() else { panic!("expected an edit") };
+        c.resume_edit(edit);
+        assert_eq!(c.edit.text, "helo!");
+        c.cancel_edit();
+        assert_eq!(c.edit.text, "draft");
     }
 
     #[test]

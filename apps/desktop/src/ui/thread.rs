@@ -7,7 +7,7 @@ use rune::{El, col, row, text};
 use super::components::icon_button;
 use super::composer::composer;
 use super::icons;
-use super::room::{inline_name, picking};
+use super::room::inline_name;
 use super::theme::{Palette, font};
 use super::timeline::{Context, timeline};
 use crate::i18n::t;
@@ -17,17 +17,7 @@ const WIDTH: f32 = 420.0;
 
 pub fn thread_panel(s: &State, account: &AccountData, room: &RoomSummary, root: &str, p: &Palette) -> El {
     let key = TimelineKey::thread(&room.room_id, root);
-    let cx = Context {
-        account: &account.summary.id,
-        key: &key,
-        room,
-        media: &s.media,
-        gifs: &s.gifs,
-        show_gifs: s.settings.show_link_gifs,
-        link_previews: s.settings.show_link_previews.then_some(&s.link_previews),
-        picking: picking(s, &key),
-        audio: s.audio.as_ref(),
-    };
+    let cx = Context::new(s, account, room, &key);
     let header = row()
         .key("thread-header")
         .w_full()

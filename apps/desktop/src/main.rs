@@ -135,7 +135,12 @@ fn spec() -> AppSpec<State> {
             ("demo-edit", |s| {
                 demo::seed(s);
                 s.select_room(demo::DEMO_THREAD.0);
-                s.composer.start_edit("$demo-edit", "Friday works for me, let's tag it then.", None);
+                let target = state::EditTarget {
+                    account: matrix_core::AccountId::new(demo::ADA),
+                    key: matrix_core::TimelineKey::room(demo::DEMO_THREAD.0),
+                    event_id: "$demo-edit".into(),
+                };
+                s.composer.start_edit(target, "Friday works for me, let's tag it then.", None);
             }),
             ("demo-thread", |s| {
                 demo::seed(s);
@@ -524,6 +529,22 @@ mod tests {
             s.select_room("!dm-kai:example.org");
         });
         assert!(rt.find("call-card-join-$demo-@kai:example.org-0").is_some());
+    }
+
+    #[test]
+    fn a_call_card_should_offer_no_join_where_the_room_allows_no_calls() {
+        let rt = runtime(|s| {
+            demo::seed(s);
+            s.select_room("!dm-kai:example.org");
+            let account = matrix_core::AccountId::new(demo::ADA);
+            let Some(data) = s.accounts.get(&account) else { return };
+            let (mut rooms, spaces) = (data.rooms.clone(), data.spaces.clone());
+            for room in rooms.iter_mut().filter(|room| room.room_id == "!dm-kai:example.org") {
+                room.call.via = None;
+            }
+            s.accounts.set_room_list(&account, matrix_core::RoomList { rooms, spaces });
+        });
+        assert!(rt.find("call-card-join-$demo-@kai:example.org-0").is_none());
     }
 
     #[test]

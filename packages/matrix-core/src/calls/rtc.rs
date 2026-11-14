@@ -295,10 +295,11 @@ pub(crate) async fn leave(room: &Room, user_id: OwnedUserId, device_id: &str, de
     let _ = tokio::time::timeout(QUICK, empty).await;
 }
 
-/// Rings the other members: Element's ring notification, for 30 seconds.
-pub(crate) async fn ring(room: &Room, video: bool) {
+/// Tells the other members a call started: Element's ring notification for 30 seconds when
+/// `ring`, else a plain notification.
+pub(crate) async fn ring(room: &Room, video: bool, ring: bool) {
     let content = serde_json::json!({
-        "notification_type": "ring",
+        "notification_type": if ring { "ring" } else { "notification" },
         "lifetime": 30_000,
         "sender_ts": MilliSecondsSinceUnixEpoch::now(),
         "m.mentions": { "room": true },

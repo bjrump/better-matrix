@@ -1554,16 +1554,10 @@ impl State {
             Command::Edit { account, key, event_id, body, html } => {
                 let timeline = self.open_timeline(&account, &key);
                 Box::pin(async move {
-                    use matrix_sdk::ruma::events::room::message::{
-                        MessageType, RoomMessageEventContentWithoutRelation as Content,
-                    };
                     let item = matrix_sdk_ui::timeline::TimelineEventItemId::EventId(matrix_sdk::ruma::EventId::parse(
                         &event_id,
                     )?);
-                    let content = Content::new(match html {
-                        Some(html) => MessageType::text_html(body, html),
-                        None => MessageType::text_plain(body),
-                    });
+                    let content = text_content(&body, html.as_deref());
                     timeline?.edit(&item, matrix_sdk::room::edit::EditedContent::RoomMessage(content)).await?;
                     Ok(Outcome::Done)
                 })
@@ -2424,6 +2418,18 @@ async fn typing_people(room: &matrix_sdk::Room, users: Vec<matrix_sdk::ruma::Own
     people
 }
 
+/// A text message's content: formatted when it has HTML.
+fn text_content(
+    body: &str,
+    html: Option<&str>,
+) -> matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation {
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation as Content;
+    match html {
+        Some(html) => Content::text_html(body, html),
+        None => Content::text_plain(body),
+    }
+}
+
 /// Sends through an open timeline: as a reply when `reply_to` is set, into the thread when the
 /// timeline is one.
 async fn send_in(
@@ -2431,13 +2437,9 @@ async fn send_in(
     reply_to: Option<String>,
     message: &Outgoing,
 ) -> Result<(), Error> {
-    use matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation as Content;
     match message {
         Outgoing::Text { body, html } => {
-            let content = match html {
-                Some(html) => Content::text_html(body, html),
-                None => Content::text_plain(body),
-            };
+            let content = text_content(body, html.as_deref());
             match reply_to {
                 Some(event_id) => {
                     timeline.send_reply(content, matrix_sdk::ruma::EventId::parse(&event_id)?).await?;

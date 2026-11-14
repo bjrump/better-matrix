@@ -227,15 +227,8 @@ pub(crate) fn start(
             };
             // A panic deep in the media stack ends the call with an error rather than leaving it
             // connecting forever.
-            let result = std::panic::AssertUnwindSafe(run).catch_unwind().await.unwrap_or_else(|panic| {
-                let reason = panic
-                    .downcast_ref::<&str>()
-                    .map(|text| (*text).to_owned())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_default();
-                tracing::error!("call: the call task panicked: {reason}");
-                Err(CallError::Media(format!("the call stopped unexpectedly: {reason}")))
-            });
+            let result =
+                std::panic::AssertUnwindSafe(run).catch_unwind().await.unwrap_or_else(|panic| Err(panicked(&*panic)));
             call.end(&result);
         })
     };
@@ -280,6 +273,17 @@ impl Call<'_> {
     pub fn stopped(&self, media: MediaToggle) {
         self.sink.emit(Event::CallMediaStopped(media));
     }
+}
+
+/// The error a call ends with when its task panicked, logged with the panic's message.
+pub(super) fn panicked(panic: &(dyn std::any::Any + Send)) -> CallError {
+    let reason = panic
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    tracing::error!("call: the call task panicked: {reason}");
+    CallError::Media(format!("the call stopped unexpectedly: {reason}"))
 }
 
 /// Which standard a new call in the room speaks, by the same rule its summary shows.
@@ -816,6 +820,12 @@ async fn direct_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicked_call_should_end_with_the_panics_message() {
+        let error = panicked(&String::from("no crypto provider"));
+        assert!(error.to_string().contains("no crypto provider"), "{error}");
+    }
 
     fn sides(callee: bool, peer: Option<&'static str>) -> Sides<'static> {
         Sides { me: "@me:x", other: "@them:x", party: "MINE", peer, callee }

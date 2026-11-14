@@ -18,17 +18,7 @@ pub fn room_pane(s: &State, account: &AccountData, p: &Palette) -> El {
         return super::overview::overview(s, account, p);
     };
     let key = TimelineKey::room(&room.room_id);
-    let cx = Context {
-        account: &account.summary.id,
-        key: &key,
-        room,
-        media: &s.media,
-        gifs: &s.gifs,
-        show_gifs: s.settings.show_link_gifs,
-        link_previews: s.settings.show_link_previews.then_some(&s.link_previews),
-        picking: picking(s, &key),
-        audio: s.audio.as_ref(),
-    };
+    let cx = Context::new(s, account, room, &key);
     let water = s
         .composer
         .voice

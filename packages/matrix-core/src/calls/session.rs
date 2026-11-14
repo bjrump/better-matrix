@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet};
 
 use std::time::Duration;
 
+use futures_util::FutureExt;
+
 use livekit::PlatformAudio;
 use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
 use livekit::e2ee::{E2eeOptions, EncryptionType};
@@ -37,7 +39,7 @@ use super::keys::{self, OwnKey};
 use super::media::{self, Capture, Sinks};
 use super::rtc::{self, Member};
 use super::signals::Signal;
-use super::task::{Call, Control, Controls, Shared, media_error, person, switch_camera};
+use super::task::{Call, Control, Controls, Shared, media_error, panicked, person, switch_camera};
 use super::{
     CallEnd, CallError, CallInfo, CallParticipant, CallPhase, CallVia, DeviceChoice, DeviceKind, MediaToggle, VideoId,
 };
@@ -107,19 +109,24 @@ pub(super) async fn run(
     };
     let mut session = Session::default();
     let (sinks, ended) = Sinks::new();
-    let ready = tokio::select! {
-        biased;
-        () = controls.hung_up() => None,
-        ready = set_up(&cx, call, &mut session, &devices, &sinks, &mut info) => Some(ready),
-    };
-    let end = match ready {
-        None => Ok(CallEnd::HungUp),
-        Some(Err(error)) => Err(error),
-        Some(Ok(setup)) => {
-            let live = Live::new(&cx, call, sinks, devices, setup);
-            Ok(live.run(&mut session, &mut controls, &mut info, live_events, ended).await)
+    let work = async {
+        let ready = tokio::select! {
+            biased;
+            () = controls.hung_up() => None,
+            ready = set_up(&cx, call, &mut session, &devices, &sinks, &mut info) => Some(ready),
+        };
+        match ready {
+            None => Ok(CallEnd::HungUp),
+            Some(Err(error)) => Err(error),
+            Some(Ok(setup)) => {
+                let live = Live::new(&cx, call, sinks, devices, setup);
+                Ok(live.run(&mut session, &mut controls, &mut info, live_events, ended).await)
+            }
         }
     };
+    // A panic deep in the media stack still lets go of what the call holds: a dropped LiveKit
+    // room stays connected, and the membership would linger.
+    let end = std::panic::AssertUnwindSafe(work).catch_unwind().await.unwrap_or_else(|panic| Err(panicked(&*panic)));
     call.end(&end);
     session.close(&cx).await;
     end
@@ -299,9 +306,11 @@ async fn set_up(
     session.joined = true;
     let join = rtc::join(&cx.room, cx.user_id.clone(), &cx.device_id, cx.membership(None));
     session.delay_id = step("joining the room's call", STEP_LIMIT, join).await?;
-    if members.is_empty() && cx.room.is_direct().await.unwrap_or(false) {
-        // Unrung, the call still runs: the other person sees it in the room.
-        let _ = tokio::time::timeout(STEP_LIMIT, rtc::ring(&cx.room, cx.video)).await;
+    if members.is_empty() {
+        // The first one in tells the room: a ring in a direct chat, a notification in a group
+        // (as Element Call does), so every call has its card. Untold, the call still runs.
+        let ring = cx.room.is_direct().await.unwrap_or(false);
+        let _ = tokio::time::timeout(STEP_LIMIT, rtc::ring(&cx.room, cx.video, ring)).await;
     }
     tracing::info!(members = members.len(), "call: joined");
     Ok(Setup { key, members })

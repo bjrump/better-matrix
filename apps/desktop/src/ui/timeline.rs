@@ -19,8 +19,8 @@ use super::room::{display_name, inline_name};
 use super::theme::{Palette, font};
 use crate::i18n::{I18N, t, tf, tp};
 use crate::state::{
-    AudioClip, ComposerTarget, EmojiFor, EntryView, GifCache, LinkPreviews, MediaCache, Popover, RoomTimeline, State,
-    TimelineItem, audio_supported,
+    AccountData, AudioClip, ComposerTarget, EmojiFor, EntryView, GifCache, LinkPreviews, MediaCache, Popover,
+    RoomTimeline, State, TimelineItem, audio_supported,
 };
 use matrix_core::links::LinkPreview;
 
@@ -43,11 +43,32 @@ pub struct Context<'a> {
     pub link_previews: Option<&'a LinkPreviews>,
     /// The message whose reaction picker is open, if any.
     pub picking: Option<&'a str>,
+    /// The user is in this room's call, here.
+    pub call_here: bool,
+    /// A one-to-one call rings in this room.
+    pub ringing: bool,
     /// The audio playing, if any.
     pub audio: Option<&'a AudioClip>,
 }
 
-impl Context<'_> {
+impl<'a> Context<'a> {
+    /// What the rows of `key`, in `room` of the account `data`, need from the state.
+    pub fn new(s: &'a State, data: &'a AccountData, room: &'a RoomSummary, key: &'a TimelineKey) -> Self {
+        Context {
+            account: &data.summary.id,
+            key,
+            room,
+            media: &s.media,
+            gifs: &s.gifs,
+            show_gifs: s.settings.show_link_gifs,
+            link_previews: s.settings.show_link_previews.then_some(&s.link_previews),
+            picking: super::room::picking(s, key),
+            call_here: s.call_here().is_some_and(|call| call.info.room_id == key.room_id),
+            ringing: s.rings.iter().any(|ring| ring.account == data.summary.id && ring.room_id == key.room_id),
+            audio: s.audio.as_ref(),
+        }
+    }
+
     fn in_thread(&self) -> bool {
         self.key.thread.is_some()
     }
@@ -303,18 +324,7 @@ fn plan(cx: &Context<'_>, timeline: Option<&RoomTimeline>) -> Vec<(String, Row)>
 /// What a row needs from the state, found again when the row is built.
 fn row_context<'a>(s: &'a State, account: &AccountId, key: &'a TimelineKey) -> Option<(Context<'a>, &'a RoomTimeline)> {
     let data = s.accounts.get(account)?;
-    let cx = Context {
-        account: &data.summary.id,
-        key,
-        room: data.room(&key.room_id)?,
-        media: &s.media,
-        gifs: &s.gifs,
-        show_gifs: s.settings.show_link_gifs,
-        link_previews: s.settings.show_link_previews.then_some(&s.link_previews),
-        picking: super::room::picking(s, key),
-        audio: s.audio.as_ref(),
-    };
-    Some((cx, data.timeline(key)?))
+    Some((Context::new(s, data, data.room(&key.room_id)?, key), data.timeline(key)?))
 }
 
 /// Builds one planned row.
@@ -648,13 +658,16 @@ fn toolbar(cx: &Context<'_>, message: &Message, p: &Palette) -> El {
         .fill(p.surface)
         .border(1.0, p.divider)
         .shadow(2.0, 8.0, Color::BLACK.alpha(0.2))
-        .group_opacity(if open { 1.0 } else { 0.0 }, 1.0)
-        .child(button(&icons::SMILE, t!("actions.react"), "react").on_press(move |s: &mut State| {
+        .group_opacity(if open { 1.0 } else { 0.0 }, 1.0);
+    // A call's card takes no reactions: the timeline keeps none on it.
+    if !matches!(message.content, MessageContent::Call(_)) {
+        bar = bar.child(button(&icons::SMILE, t!("actions.react"), "react").on_press(move |s: &mut State| {
             s.toggle_popover(Popover::Emoji(EmojiFor::Reaction {
                 key: key.clone(),
                 event_id: quoted.event_id.clone(),
             }));
         }));
+    }
     let reply = message.clone();
     bar = bar.child(
         button(&icons::REPLY, t!("actions.reply"), "reply")
@@ -691,7 +704,7 @@ pub fn message_menu(s: &State, key: &TimelineKey, event_id: &str, p: &Palette) -
         Some(_) => (ComposerTarget::Thread, "thread-"),
     };
     let mut panel = popover_panel(p).key("message-menu").w(200.0);
-    if matches!(message.content, MessageContent::Text { .. }) {
+    if message.editable {
         panel = panel.child(
             menu_action(&icons::PENCIL, t!("actions.edit"), Tone::Normal, p)
                 .key("message-edit")
@@ -827,26 +840,20 @@ fn message_body(item: &TimelineItem, cx: &Context<'_>, latest_call: bool, p: &Pa
     }
 }
 
-/// The name of a kind of call: video, voice, or just a call when the caller didn't say.
-pub fn call_title(card: &CallCard) -> &'static str {
-    match card.video {
-        Some(true) => t!("call.card.video"),
-        Some(false) => t!("call.card.voice"),
-        None => t!("call.card.call"),
-    }
-}
-
 /// A call's card: what kind it is and how it stands. The newest card in the room shows whether
 /// the room's call is under way, with the way in; older ones have ended.
 fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: bool, p: &Palette) -> El {
     let people = &cx.room.call.participants;
-    let ongoing = latest_call && !people.is_empty();
-    let status = if ongoing {
-        format!("{} · {}", t!("call.card.ongoing"), tf!("call.people", count = people.len()))
-    } else if card.declined_by.is_empty() {
-        t!("call.card.ended").to_owned()
-    } else {
-        t!("call.card.declined").to_owned()
+    // Only the newest card speaks for the call now: a one-to-one call by this app's own state
+    // (ringing, or in it), MatrixRTC's by the room's members.
+    let ongoing = latest_call && if card.direct { cx.call_here } else { !people.is_empty() };
+    let declined = !card.declined_by.is_empty() && cx.room.kind == matrix_core::RoomKind::Direct;
+    let status = match () {
+        () if ongoing && card.direct => t!("call.card.ongoing").to_owned(),
+        () if ongoing => format!("{} · {}", t!("call.card.ongoing"), tf!("call.people", count = people.len())),
+        () if latest_call && card.direct && cx.ringing => t!("call.card.ringing").to_owned(),
+        () if declined => t!("call.card.declined").to_owned(),
+        () => t!("call.card.ended").to_owned(),
     };
     let glyph = if card.video == Some(true) { &icons::VIDEO } else { &icons::CALL };
     let tile = el()
@@ -859,7 +866,7 @@ fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: boo
         .grow(1.0)
         .min_w(0.0)
         .gap(2.0)
-        .child(text(call_title(card)).font(font::BODY_STRONG).color(p.text).truncate())
+        .child(text(crate::state::call_title(card)).font(font::BODY_STRONG).color(p.text).truncate())
         .child(text(status).font(font::META).color(p.text_muted).truncate());
     let mut entry = row()
         .key(cx.key(&format!("call-card-{event_id}")))
@@ -873,15 +880,16 @@ fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: boo
         .border(1.0, if ongoing { p.success.alpha(0.6) } else { p.divider })
         .child(tile)
         .child(words);
-    if ongoing {
-        entry = entry.child(if people.iter().any(|person| person == cx.account.as_str()) {
-            text(t!("call.card.joined")).font(font::META).color(p.text_muted)
-        } else {
-            let video = card.video == Some(true);
+    // Join as the header offers it: where the room allows calls, and not when already in it here.
+    if cx.call_here && ongoing {
+        entry = entry.child(text(t!("call.card.joined")).font(font::META).color(p.text_muted));
+    } else if ongoing && !card.direct && cx.room.call.via.is_some() {
+        let video = card.video == Some(true);
+        entry = entry.child(
             super::call::pill(&icons::CALL, t!("call.join"), p.success, p)
                 .key(cx.key(&format!("call-card-join-{event_id}")))
-                .on_press(move |s: &mut State| s.start_call(video))
-        });
+                .on_press(move |s: &mut State| s.start_call(video)),
+        );
     }
     entry
 }

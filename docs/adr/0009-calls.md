@@ -53,7 +53,8 @@ Date: 2026-11-14
   joining (the token, the connection, publishing the microphone, the camera, the membership,
   the ring) has a time limit, so a stall ends the call naming the step
   (`CallError::Stalled`) rather than leaving it connecting; a panic in the call task ends the
-  call with an error too. The steps log through `tracing`, which the desktop prints when
+  call with an error too, and a MatrixRTC session still closes what it holds (connections,
+  devices, membership) after one. The steps log through `tracing`, which the desktop prints when
   `RUST_LOG` is set (`RUST_LOG=matrix_core=debug,livekit=debug`).
 - **Which standard:** MatrixRTC where the account's homeserver names a LiveKit transport
   (`Client::rtc_transports`, cached per account) and the user may send call memberships in the
@@ -116,6 +117,9 @@ Date: 2026-11-14
   lookup is short and unretried: without an answer, the call goes without TURN. A voice call's
   offer asks for no video, and an invite counts as a video call only when the caller sends
   video (a video section that only receives is a voice call).
+- **Telling the room:** the first one into a call sends `m.rtc.notification` (the unstable type,
+  as Element Call does): `ring` in a direct chat, `notification` in a group, so every call has its
+  card in the timeline and group calls don't ring.
 - **Ringing:** MatrixRTC ring notifications (`m.rtc.notification`) and one-to-one invites raise
   `Event::IncomingCall`; the desktop shows a card with answer and decline, a notification
   while the window is in the background, and rings a soft chime on the picked speaker

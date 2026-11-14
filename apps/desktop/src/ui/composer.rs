@@ -323,20 +323,26 @@ fn bottom_bar(s: &State, target: ComposerTarget, p: &Palette) -> El {
             .cursor(rune::Cursor::NotAllowed)
             .help(t!("composer.voice_unsupported"))
     };
-    row()
+    // An edit changes the text only: no attachments, voice memos or polls while one runs.
+    let editing = c.editing.is_some();
+    let mut bar = row()
         .key(key(target, "composer-bar"))
         .w_full()
         .px(8.0)
         .pb(8.0)
         .gap(2.0)
         .center_y()
-        .preserve_focus_on_press(true)
-        .child(
-            bar_button(&icons::PAPERCLIP, t!("composer.attach"), false, p)
-                .key(key(target, "attach"))
-                .on_press(move |s: &mut State| s.pick_attachments(target)),
-        )
-        .child(separator())
+        .preserve_focus_on_press(true);
+    if !editing {
+        bar = bar
+            .child(
+                bar_button(&icons::PAPERCLIP, t!("composer.attach"), false, p)
+                    .key(key(target, "attach"))
+                    .on_press(move |s: &mut State| s.pick_attachments(target)),
+            )
+            .child(separator());
+    }
+    bar = bar
         .child(
             bar_button(&icons::SMILE, t!("composer.emoji"), picking_emoji, p)
                 .key(emoji_button(target))
@@ -355,17 +361,16 @@ fn bottom_bar(s: &State, target: ComposerTarget, p: &Palette) -> El {
                 .checked(c.formatting)
                 .child(text("Aa").font(font::BODY_STRONG).color(if c.formatting { p.text } else { p.text_muted }))
                 .on_press(move |s: &mut State| s.composer_mut(target).toggle_formatting()),
-        )
-        .child(separator())
-        .child(voice)
-        .child(
+        );
+    if !editing {
+        bar = bar.child(separator()).child(voice).child(
             bar_button(&icons::POLL, t!("composer.poll"), false, p)
                 .key(key(target, "poll"))
                 .help(t!("composer.poll"))
                 .on_press(move |s: &mut State| s.open_poll_form(target)),
-        )
-        .child(el().grow(1.0))
-        .child(send)
+        );
+    }
+    bar.child(el().grow(1.0)).child(send)
 }
 
 /// Voice memos record on every desktop, through the app's own sound (`platform::sound`).

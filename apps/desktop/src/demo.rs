@@ -414,7 +414,7 @@ fn room(id: &str, name: &str, topic: Option<&str>, unread: u64, mentions: u64) -
 }
 
 fn call_card(video: Option<bool>) -> MessageContent {
-    MessageContent::Call(matrix_core::CallCard { video, declined_by: Vec::new() })
+    MessageContent::Call(matrix_core::CallCard { video, ..matrix_core::CallCard::default() })
 }
 
 fn dm(id: &str, with: &str, name: &str, unread: u64) -> RoomSummary {

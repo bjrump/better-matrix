@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use eyeball_im::VectorDiff;
 use matrix_sdk::ruma::UserId;
+use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk_ui::timeline::{
     EmbeddedEvent, EventTimelineItem, MsgLikeContent, MsgLikeKind, Profile, TimelineDetails, TimelineItem,
     TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
@@ -82,23 +83,18 @@ fn raw_content(event: &EventTimelineItem) -> serde_json::Value {
         .unwrap_or_default()
 }
 
-/// A call's card: the stable ring the SDK parses, the unstable one Element Call sends (which the
-/// timeline's filter lets through as a custom event), or a one-to-one invite.
+/// A call's card: MatrixRTC's ring (the stable type, and the unstable one Element Call sends,
+/// which ruma reads as the same event), or a one-to-one invite.
 fn call_card(event: &EventTimelineItem) -> Option<CallCard> {
     match event.content() {
         TimelineItemContent::RtcNotification { call_intent, declined_by, .. } => Some(CallCard {
             video: call_intent.as_ref().map(|intent| intent.as_str() == "video"),
+            direct: false,
             declined_by: declined_by.iter().map(ToString::to_string).collect(),
         }),
-        TimelineItemContent::MsgLike(MsgLikeContent { kind: MsgLikeKind::Other(other), .. })
-            if other.event_type().to_string() == crate::calls::RING_EVENT =>
-        {
-            let video = raw_content(event)["m.call.intent"].as_str().map(|intent| intent == "video");
-            Some(CallCard { video, ..CallCard::default() })
-        }
         TimelineItemContent::CallInvite => {
             let video = raw_content(event)["offer"]["sdp"].as_str().map(crate::calls::has_video);
-            Some(CallCard { video, ..CallCard::default() })
+            Some(CallCard { video, direct: true, declined_by: Vec::new() })
         }
         _ => None,
     }
@@ -158,7 +154,9 @@ fn message(event: &EventTimelineItem, me: &UserId) -> Option<Message> {
             latest_at: latest.map(|event| u64::from(event.timestamp.0)),
         }
     });
-    Some(Message { content, edited, reactions, reply_to, thread, ..base_message(event) })
+    let editable = event.is_own()
+        && matches!(kind, MsgLikeKind::Message(message) if matches!(message.msgtype(), MessageType::Text(_)));
+    Some(Message { content, edited, editable, reactions, reply_to, thread, ..base_message(event) })
 }
 
 /// What every message has: who sent it and when. Empty content, no reactions, no reply.
@@ -173,6 +171,7 @@ fn base_message(event: &EventTimelineItem) -> Message {
         },
         content: MessageContent::Redacted,
         edited: false,
+        editable: false,
         pending: event.is_local_echo(),
         timestamp_ms: u64::from(event.timestamp().0),
         reactions: Vec::new(),

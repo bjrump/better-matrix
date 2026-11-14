@@ -274,6 +274,9 @@ pub struct Message {
     pub content: MessageContent,
     /// Edited since it was sent.
     pub edited: bool,
+    /// The user's own plain text message, which they may edit (emotes, notices and files keep
+    /// what they are, so they aren't offered).
+    pub editable: bool,
     /// Still on its way: queued or sending (a local echo).
     pub pending: bool,
     /// Milliseconds since the Unix epoch, as the server reports `origin_server_ts`.
@@ -461,6 +464,8 @@ pub enum MessageContent {
 pub struct CallCard {
     /// Video or voice, when the caller said.
     pub video: Option<bool>,
+    /// A one-to-one call (`m.call.invite`) rather than MatrixRTC's.
+    pub direct: bool,
     /// Who declined it, by user ID.
     pub declined_by: Vec<String>,
 }
