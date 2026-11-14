@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Matrix questions and server problems
+    url: https://matrix.org/docs/
+    about: For questions about Matrix itself or a homeserver, rather than this app.

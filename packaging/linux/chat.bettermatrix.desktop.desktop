@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Better Matrix
+GenericName=Matrix Client
+Comment=Chat on Matrix with several accounts side by side
+Exec=better-matrix
+Icon=better-matrix
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=matrix;chat;messenger;
+StartupWMClass=chat.bettermatrix.desktop
+StartupNotify=true

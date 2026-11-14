@@ -1,0 +1,255 @@
+//! Everything that talks to the operating system on the app's behalf: picking files, posting
+//! notifications, and the keychain. State code calls [`Shell`]; it never touches the OS itself,
+//! so tests run it headless.
+
+mod files;
+mod notify;
+mod secrets;
+pub mod sound;
+
+use std::sync::{Arc, Mutex};
+
+use rune::AppHandle;
+use rune::prefs::Prefs;
+
+pub use notify::Toast;
+pub use secrets::system_secrets;
+
+use crate::i18n::Language;
+use crate::state::{Appearance, Settings, State, Zoom};
+
+/// The OS services the app uses, or inert stand-ins when headless.
+pub struct Shell {
+    app: Option<AppHandle<State>>,
+    notifier: Box<dyn notify::Notifier>,
+    prefs: Arc<Mutex<Prefs>>,
+    /// Counts document renders: a render keeps going while it is the latest and not stopped.
+    document: Arc<std::sync::atomic::AtomicU64>,
+    /// Counts settings saves: only the latest writes, so quick changes can't land out of order.
+    saves: Arc<std::sync::atomic::AtomicU64>,
+    /// Where files made for a moment go (audio to play, voice memos being recorded): private to
+    /// the user, and emptied at launch and exit.
+    scratch: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for Shell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shell").field("windowed", &self.app.is_some()).finish_non_exhaustive()
+    }
+}
+
+impl Shell {
+    /// The real services, delivering results to the app through `app`.
+    pub fn native(app: AppHandle<State>, prefs: Prefs, scratch: std::path::PathBuf) -> Self {
+        let notifier = notify::system(app.clone());
+        Self {
+            app: Some(app),
+            notifier,
+            prefs: Arc::new(Mutex::new(prefs)),
+            document: Arc::default(),
+            saves: Arc::default(),
+            scratch,
+        }
+    }
+
+    /// No OS at all: dialogs never answer, notifications go nowhere, settings stay in memory.
+    pub fn headless() -> Self {
+        Self {
+            app: None,
+            notifier: Box::new(notify::Silent),
+            prefs: Arc::new(Mutex::new(Prefs::memory())),
+            document: Arc::default(),
+            saves: Arc::default(),
+            scratch: std::env::temp_dir(),
+        }
+    }
+
+    /// Like [`Shell::headless`], but keeps every notification it is asked to show.
+    #[cfg(test)]
+    pub fn recording() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Toast>>>) {
+        let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prefs = Arc::new(Mutex::new(Prefs::memory()));
+        (
+            Self {
+                app: None,
+                notifier: Box::new(notify::Recording(posted.clone())),
+                prefs,
+                document: Arc::default(),
+                saves: Arc::default(),
+                scratch: std::env::temp_dir(),
+            },
+            posted,
+        )
+    }
+
+    /// Opens the system file dialog; its answer arrives through [`State::files_picked`].
+    pub fn pick_files(&self, picked_for: crate::state::PickFor) {
+        if let Some(app) = &self.app {
+            files::pick(app.clone(), picked_for);
+        }
+    }
+
+    /// Renders a PDF's pages on a worker; they arrive through [`State::document_page`], then
+    /// [`State::document_rendered`].
+    pub fn render_document(&self, media: matrix_core::MediaRef, bytes: std::sync::Arc<[u8]>) {
+        /// More pages than anyone reads in a preview; the file itself has them all.
+        const MAX_PAGES: usize = 60;
+        use std::sync::atomic::Ordering;
+        let render = self.document.fetch_add(1, Ordering::Relaxed) + 1;
+        let Some(app) = self.app.clone() else { return };
+        let latest = Arc::clone(&self.document);
+        let spawned = std::thread::Builder::new().name("pdf".into()).spawn(move || {
+            let keep_going = || latest.load(Ordering::Relaxed) == render;
+            let result = crate::state::render_document(&bytes, MAX_PAGES, keep_going, |page, size| {
+                let media = media.clone();
+                app.update(move |s: &mut State, _| s.document_page(&media, page, size));
+            });
+            app.update(move |s: &mut State, _| s.document_rendered(&media, result));
+        });
+        if let Err(error) = spawned {
+            eprintln!("better-matrix: could not render the document: {error}");
+        }
+    }
+
+    /// The folder for files made for a moment.
+    pub fn scratch(&self) -> &std::path::Path {
+        &self.scratch
+    }
+
+    /// Stops the document render under way, if any: its preview closed.
+    pub fn stop_document(&self) {
+        self.document.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Asks where to save a file named `name`; `chosen` runs with the path once picked.
+    pub fn pick_save_path(&self, name: &str, chosen: impl FnOnce(&mut State, std::path::PathBuf) + Send + 'static) {
+        if let Some(app) = &self.app {
+            files::save(app.clone(), name.to_owned(), chosen);
+        }
+    }
+
+    /// Saves this device's settings, off the UI thread (the prefs file is rewritten whole).
+    pub fn save_settings(&self, settings: Settings) {
+        use std::sync::atomic::Ordering;
+        let (prefs, saves) = (Arc::clone(&self.prefs), Arc::clone(&self.saves));
+        let save = saves.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = std::thread::Builder::new().name("save-settings".into()).spawn(move || {
+            let Ok(mut prefs) = prefs.lock() else { return };
+            // A newer save is on its way: it writes instead.
+            if saves.load(Ordering::Relaxed) != save {
+                return;
+            }
+            let saved = prefs
+                .set(LANGUAGE, &settings.language.id())
+                .and_then(|()| prefs.set(APPEARANCE, &settings.appearance.id()))
+                .and_then(|()| prefs.set(ZOOM, &settings.zoom.percent()))
+                .and_then(|()| prefs.set(LINK_GIFS, &settings.show_link_gifs))
+                .and_then(|()| prefs.set(LINK_PREVIEWS, &settings.show_link_previews))
+                .and_then(|()| prefs.set(RING_SOUND, &settings.ring_sound))
+                .and_then(|()| prefs.set(MICROPHONE, &settings.devices.microphone))
+                .and_then(|()| prefs.set(SPEAKER, &settings.devices.speaker))
+                .and_then(|()| prefs.set(CAMERA, &settings.devices.camera));
+            if let Err(error) = saved {
+                eprintln!("better-matrix: could not save settings: {error}");
+            }
+        });
+    }
+
+    /// A player for `media`'s file on the picked speaker; if it can't play, the app hears it
+    /// through [`State::audio_failed`]. Headless, Rune's player and its fake speaker.
+    pub fn player(
+        &self,
+        path: std::path::PathBuf,
+        speaker: Option<String>,
+        media: matrix_core::MediaRef,
+    ) -> sound::Player {
+        if let Some(app) = self.app.clone() {
+            let failed = move |error: String| app.update(move |s: &mut State, _| s.audio_failed(&media, error));
+            sound::Player::Native(sound::NativePlayer::open(path, speaker, failed))
+        } else {
+            sound::Player::Rune(rune::Player::audio(path))
+        }
+    }
+
+    /// A recording from the picked microphone; headless, Rune's recorder and its fake microphone.
+    pub fn recorder(&self, path: std::path::PathBuf, microphone: Option<String>) -> sound::Recorder {
+        if self.app.is_some() {
+            sound::Recorder::Native(sound::NativeRecorder::to_file(path, microphone))
+        } else {
+            sound::Recorder::Rune(rune::Recorder::to_file(path))
+        }
+    }
+
+    /// Stops a voice memo and writes its file: on a worker for the app's own recorder, whose
+    /// result arrives through [`State::voice_memo_recorded`] (`None` here), at once otherwise.
+    pub fn finish_recording(
+        &self,
+        recorder: sound::Recorder,
+        memo: crate::state::MemoFor,
+    ) -> Option<Result<sound::Recording, String>> {
+        match (recorder, &self.app) {
+            (sound::Recorder::Native(native), Some(app)) => {
+                let app = app.clone();
+                let spawned = std::thread::Builder::new().name("voice-memo".into()).spawn(move || {
+                    let result = native.stop();
+                    app.update(move |s: &mut State, tx| s.voice_memo_recorded(memo, result, tx));
+                });
+                spawned.err().map(|error| Err(error.to_string()))
+            }
+            (recorder, _) => Some(recorder.stop()),
+        }
+    }
+
+    /// The ring of an incoming call on the picked speaker, until dropped; none headless.
+    pub fn ring(&self, speaker: Option<String>) -> Option<sound::Ring> {
+        self.app.is_some().then(|| sound::Ring::start(speaker))
+    }
+
+    /// Shows a notification. A click opens its room.
+    pub fn notify(&self, toast: &Toast) {
+        self.notifier.post(toast);
+    }
+}
+
+const LANGUAGE: &str = "language";
+const APPEARANCE: &str = "appearance";
+const LINK_GIFS: &str = "link_gifs";
+const LINK_PREVIEWS: &str = "link_previews";
+const ZOOM: &str = "zoom";
+const RING_SOUND: &str = "ring_sound";
+const MICROPHONE: &str = "microphone";
+const SPEAKER: &str = "speaker";
+const CAMERA: &str = "camera";
+
+/// This device's saved settings, read at launch before the first frame (a small file).
+pub fn load_settings(prefs: &Prefs) -> Settings {
+    Settings {
+        language: prefs.get::<String>(LANGUAGE).map_or(Language::System, |id| Language::from_id(&id)),
+        appearance: prefs.get::<String>(APPEARANCE).map_or(Appearance::System, |id| Appearance::from_id(&id)),
+        zoom: prefs.get::<u16>(ZOOM).map_or_else(Zoom::default, Zoom::from_percent),
+        show_link_gifs: prefs.get::<bool>(LINK_GIFS).unwrap_or(true),
+        show_link_previews: prefs.get::<bool>(LINK_PREVIEWS).unwrap_or(true),
+        devices: matrix_core::DeviceChoice {
+            microphone: prefs.get::<Option<String>>(MICROPHONE).flatten(),
+            speaker: prefs.get::<Option<String>>(SPEAKER).flatten(),
+            camera: prefs.get::<Option<String>>(CAMERA).flatten(),
+        },
+        ring_sound: prefs.get::<bool>(RING_SOUND).unwrap_or(true),
+    }
+}
+
+/// Empties the scratch folder and makes it again, readable only by the user. Played audio from
+/// encrypted rooms lands there decrypted, so nothing in it outlives a run.
+pub fn reset_scratch(scratch: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(scratch);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Err(error) = builder.create(scratch) {
+        eprintln!("better-matrix: could not make the scratch folder {}: {error}", scratch.display());
+    }
+}

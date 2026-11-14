@@ -1,0 +1,8 @@
+{
+  "layers": ["app"],
+  "locales": [
+    { "id": "en", "tag": "en", "label": "English" },
+    { "id": "de", "tag": "de", "label": "Deutsch" },
+    { "id": "fr", "tag": "fr", "label": "Français" }
+  ]
+}

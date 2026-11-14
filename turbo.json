@@ -1,0 +1,42 @@
+{
+  "$schema": "https://turborepo.dev/schema.json",
+  "futureFlags": {
+    "experimentalCargoWorkspaces": true,
+    "experimentalTaskCommand": true
+  },
+  "ui": "stream",
+  "globalPassThroughEnv": [
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XAUTHORITY",
+    "XDG_*",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "LANG",
+    "LANGUAGE",
+    "LC_*",
+    "XCURSOR_*",
+    "HYPRCURSOR_*",
+    "GDK_*",
+    "QT_*",
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "CC",
+    "CXX",
+    "RUSTFLAGS",
+    "CARGO_*"
+  ],
+  "tasks": {
+    "better-matrix-cargo#lint": {
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Rust
+target/
+
+# Turborepo
+.turbo/
+
+# Local agent reference material (regenerate with `bun run agent-tools`)
+.agent-tools/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+/dist/

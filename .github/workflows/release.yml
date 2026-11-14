@@ -1,0 +1,259 @@
+# A release. Started by hand with the version to release (Actions → Release → Run workflow), or
+# by pushing a version tag (v1.2.3; v1.2.3-rc.1 makes a pre-release).
+#
+# By hand, it sets the version in Cargo.toml and Cargo.lock on main (a commit, when it changes);
+# the tag is only made when the release is published, so a run that fails leaves no tag behind
+# and can simply be started again. Then: tests (unless the commit already passed CI on main, a
+# version-only change counting as the same commit), builds for macOS (arm64), Windows (x86_64)
+# and Linux (x86_64, aarch64: .deb, .rpm, .pkg.tar.xz with a PKGBUILD, AppImage), and publishes
+# them with notes from the merged pull requests' labels (.github/release.yml).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, like 1.2.0 (1.2.0-rc.1 for a pre-release)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  prepare:
+    name: Set the version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.set.outputs.tag }}
+      sha: ${{ steps.set.outputs.sha }}
+      base: ${{ steps.set.outputs.base }}
+    steps:
+      - name: The version is a version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Semantic versioning as Cargo reads it: no leading zeros, no empty pre-release parts.
+          num='(0|[1-9][0-9]*)'
+          part='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          if ! [[ "$VERSION" =~ ^$num\.$num\.$num(-$part(\.$part)*)?$ ]]; then
+            echo "::error::\"$VERSION\" isn't a version like 1.2.0 or 1.2.0-rc.1"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+      - id: set
+        name: Set it on main
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::$tag exists already"
+            exit 1
+          fi
+          base=$(git rev-parse HEAD)
+          # Run again after a failure, main ends in this workflow's own version commit, which
+          # CI never saw: the commit before it is what was tested.
+          if [[ "$(git log -1 --format=%s)" == "Release v"* ]] && [ "$(git diff --name-only HEAD~1 HEAD | sort | tr '\n' ' ')" = "Cargo.lock Cargo.toml " ]; then
+            base=$(git rev-parse HEAD~1)
+          fi
+          # The workspace version, and the workspace crates' entries in the lockfile.
+          sed -i '/^\[workspace.package\]/,/^\[/s/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+          for crate in better-matrix-desktop matrix-core; do
+            sed -i '/^name = "'"$crate"'"$/{n;s/^version = ".*"/version = "'"$VERSION"'"/}' Cargo.lock
+          done
+          # Both files still parse and say the new version, before anything reaches main.
+          python3 - <<'PY'
+          import os, tomllib
+          version = os.environ["VERSION"]
+          manifest = tomllib.load(open("Cargo.toml", "rb"))
+          assert manifest["workspace"]["package"]["version"] == version, "Cargo.toml"
+          lock = {p["name"]: p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"]}
+          for crate in ("better-matrix-desktop", "matrix-core"):
+              assert lock[crate] == version, f"Cargo.lock: {crate}"
+          PY
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "Release $tag"
+            git push origin HEAD:main
+          fi
+          { echo "tag=$tag"; echo "sha=$(git rev-parse HEAD)"; echo "base=$base"; } >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Check version and earlier tests
+    needs: prepare
+    if: ${{ !cancelled() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      tested: ${{ steps.tested.outputs.tested }}
+    env:
+      # By hand: the commit set above (tagged on publishing); from a tag: the tag pushed.
+      TAG: ${{ needs.prepare.outputs.tag || github.ref_name }}
+      SHA: ${{ needs.prepare.outputs.sha || github.sha }}
+      # The commit whose CI counts: before the version change, when the run made one.
+      TESTED_SHA: ${{ needs.prepare.outputs.base || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+          sparse-checkout: Cargo.toml
+      - id: version
+        name: The tag matches the workspace version
+        run: |
+          version="${TAG#v}"
+          cargo=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "$version" != "$cargo" ]; then
+            echo "::error::Tag $TAG doesn't match the workspace version $cargo in Cargo.toml"
+            exit 1
+          fi
+          { echo "version=$version"; echo "tag=$TAG"; echo "sha=$SHA"; } >> "$GITHUB_OUTPUT"
+      - id: tested
+        name: Did this commit pass CI on main?
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Not knowing counts as not tested.
+          passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$TESTED_SHA&branch=main&event=push&status=success&per_page=1" --jq .total_count || echo 0)
+          echo "tested=$([ "${passed:-0}" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    needs: verify
+    # Spelled out: a skipped job before verify would otherwise skip this one too.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.verify.outputs.tested != 'true' }}
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.verify.outputs.sha }}
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: [verify, test]
+    # Tested here, or skipped because this commit already passed CI on main; nothing else.
+    if: >-
+      ${{ !cancelled() && needs.verify.result == 'success' && (needs.test.result == 'success'
+      || (needs.test.result == 'skipped' && needs.verify.outputs.tested == 'true')) }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux builds on Ubuntu 22.04: the packages need its glibc (2.35) or newer.
+          - { name: linux-x86_64, os: ubuntu-22.04, arch: x86_64 }
+          - { name: linux-aarch64, os: ubuntu-22.04-arm, arch: aarch64 }
+          - { name: macos-arm64, os: macos-15 }
+          - { name: windows-x86_64, os: windows-2022 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      # libwebrtc links ScreenCaptureKit, which macOS has from 12.3.
+      MACOSX_DEPLOYMENT_TARGET: "12.3"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+      - if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-deps
+      - run: rustup show active-toolchain || rustup toolchain install
+      # No Rust cache: one saved from a tag's run can't be restored by any other, and these
+      # release builds share nothing with CI's test builds.
+      - name: Build
+        run: cargo build -p better-matrix-desktop --release --locked
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nfpm zstd xz-utils
+          packaging/linux/package.sh "${{ matrix.arch }}" "${{ needs.verify.outputs.version }}"
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: packaging/macos/package.sh "${{ needs.verify.outputs.version }}"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/out/*
+          if-no-files-found: error
+          retention-days: 3
+          # Every file is compressed already.
+          compression-level: 0
+
+  publish:
+    name: Publish
+    needs: [verify, build]
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          sparse-checkout: packaging/arch
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: PKGBUILD and checksums
+        working-directory: assets
+        run: |
+          sum() { sha256sum "$1" | cut -d' ' -f1; }
+          version="${{ needs.verify.outputs.version }}"
+          # Arch has no "-" in versions, and sorts 1.2.0rc.1 below 1.2.0 (1.2.0_rc.1 above it):
+          # the pre-release joins on directly, after "pre" when it starts with a digit.
+          pkgver="$version"
+          if [[ "$version" == *-* ]]; then
+            pre="${version#*-}"
+            if [[ "$pre" =~ ^[0-9] ]]; then pre="pre$pre"; fi
+            pkgver="${version%%-*}${pre//-/_}"
+          fi
+          sed -e "s/@VERSION@/$version/" -e "s/@PKGVER@/$pkgver/" \
+              -e "s/@SHA256_X86_64@/$(sum better-matrix-linux-x86_64.tar.gz)/" \
+              -e "s/@SHA256_AARCH64@/$(sum better-matrix-linux-aarch64.tar.gz)/" \
+              ../packaging/arch/PKGBUILD.in > PKGBUILD
+          sha256sum -- * > SHA256SUMS
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          flags=()
+          if [[ "$TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          else
+            # A stable release's notes cover everything since the last stable one, release
+            # candidates included.
+            previous=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+              --jq '[.[] | select((.prerelease or .draft) | not)][0].tag_name // empty') || previous=""
+            if [ -n "$previous" ]; then flags+=(--notes-start-tag "$previous"); fi
+          fi
+          # The tag is made here (by hand) or exists already (pushed): either way at $SHA.
+          gh release create "$TAG" assets/* --target "$SHA" \
+            --title "Better Matrix ${{ needs.verify.outputs.version }}" \
+            --generate-notes "${flags[@]}"

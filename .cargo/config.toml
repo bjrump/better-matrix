@@ -1,0 +1,22 @@
+# Link settings LiveKit's libwebrtc needs in the final binary, as livekit/rust-sdks sets them in
+# its own .cargo/config.toml: Cargo doesn't pass a dependency's link arguments on to ours.
+# A RUSTFLAGS environment variable replaces these entirely: don't set one for these targets.
+
+# Without -ObjC, libwebrtc's Objective-C categories don't load and it aborts at startup (doc
+# tests too).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-ObjC"]
+rustdocflags = ["-C", "link-args=-ObjC"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-ObjC"]
+rustdocflags = ["-C", "link-args=-ObjC"]
+
+# libwebrtc links the C runtime statically; the app has to match.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Rust links with lld on x86_64 Linux already; on ARM it would use the system linker, which
+# libwebrtc.a doesn't link with. Needs lld installed (and clang as the linker driver).
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

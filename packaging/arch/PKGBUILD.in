@@ -1,0 +1,33 @@
+# Installs the prebuilt release of Better Matrix. The release workflow fills in the version
+# and checksums; build and install with `makepkg -si`.
+pkgname=better-matrix-bin
+# Arch versions can't carry "-": a pre-release like 1.2.0-rc.1 is 1.2.0rc.1 here (sorting
+# below 1.2.0, as it should).
+pkgver=@PKGVER@
+_tag=v@VERSION@
+pkgrel=1
+pkgdesc="A Matrix client built around several accounts side by side"
+arch=('x86_64' 'aarch64')
+url="https://github.com/m43i/better-matrix"
+license=('MIT')
+depends=('alsa-lib' 'glib2' 'libxkbcommon' 'wayland' 'vulkan-icd-loader')
+optdepends=('pipewire: screen sharing on Wayland')
+# Already built and stripped: nothing to strip or split off as debug info.
+options=('!strip' '!debug')
+provides=('better-matrix')
+conflicts=('better-matrix')
+# Saved under a versioned name, so a later release run in the same folder downloads afresh.
+source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/$_tag/better-matrix-linux-x86_64.tar.gz")
+source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/$_tag/better-matrix-linux-aarch64.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  cd better-matrix
+  install -Dm755 better-matrix "$pkgdir/usr/bin/better-matrix"
+  install -Dm644 chat.bettermatrix.desktop.desktop "$pkgdir/usr/share/applications/chat.bettermatrix.desktop.desktop"
+  install -Dm644 better-matrix.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/better-matrix.svg"
+  install -Dm644 better-matrix-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/better-matrix.png"
+  install -Dm644 better-matrix-512.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/better-matrix.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

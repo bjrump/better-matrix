@@ -1,0 +1,4 @@
+# Matches the toolchain Rune pins (github.com/anomalyco/rune, rust-toolchain.toml).
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,114 @@
+# 0003. Accounts and sign-in
+
+Status: Accepted
+Date: 2026-11-14
+
+## Context
+
+Several accounts run side by side, and users expect to stay signed in across restarts. Tokens
+and store keys must not sit in plain files when the OS offers a keychain. Matrix is moving to
+OAuth 2.0 (MSC3861), but many homeservers offer only passwords. OAuth servers rotate refresh
+tokens, so a refresh that goes unsaved ends the session at the next launch. A server can also
+end a session at any time, hard or softly.
+
+## Decision
+
+- **One store directory per login:**
+  - Each login gets a random store directory under `<data>/accounts/`, its SQLite databases
+    encrypted with a random 32-byte passphrase. A new sign-in is a new device, unless it resumes
+    a suspended account.
+  - `<data>/accounts.json` lists the accounts (`StoredAccount`: ID, homeserver URL, store
+    directory, `signed_out`). No secrets.
+  - Saving an account over one with a different store deletes the old store, after the new
+    secrets and list are written. If the list can't be written, the previous secrets go back,
+    so the store it still lists stays readable. Signing out deletes the account's
+    secrets, entry and store.
+- **Secrets:**
+  - Tokens and the passphrase go to the app's `SecretStore`, one entry per account
+    (`StoredSecrets`). Calls may block, so they run on Tokio's blocking pool.
+  - The desktop uses the OS keychain (macOS Keychain, Windows Credential Manager, Secret Service),
+    probed on first use, and falls back to `FileSecrets` under `<data>/secrets`, saying so in its
+    log.
+  - `Sessions` holds one lock across every read-modify-write of the list or a secret, so a
+    sign-out and a token refresh can't undo each other. The list is written to a temp file and
+    renamed.
+  - A file secret is written to a private (`0600`) temp file, then renamed. Its file name keeps
+    letters and digits and writes every other byte as `_` and two hex digits, so no two account
+    IDs share a file. Names from earlier versions are still read.
+- **Sign-in in two steps** (`SignInStep`):
+  - **Homeserver:** a server name, URL or Matrix ID (which also fills in the username).
+    `Command::Discover` tries `.well-known/matrix/client`, then the input as a URL, and reports a
+    `Homeserver` with its `LoginMethods`.
+  - **Sign in**, chosen by the server: OAuth opens the browser at once; password only shows the
+    fields (`Command::Login`); both open the browser, with "Use a password instead".
+  - The second step shows its server above the form. There is no step indicator.
+  - Everything after discovery uses the resolved URL; restored sessions use the saved one.
+- **OAuth** (`Command::LoginOAuth`): the app registers dynamically as a native client, listens
+  on a loopback redirect and asks the UI to open the URL (`Event::OpenUrl`). It waits up to ten
+  minutes (`BROWSER_LOGIN_TIMEOUT`) and can be cancelled. It introduces itself with
+  `ClientIdentity` (name and public `https` URI, `CLIENT_URI`).
+- **No refresh goes unsaved:**
+  - `Account` subscribes to `SessionChange` as soon as its client exists: in `restore` before
+    `restore_session`, in `signed_in` right after sign-in.
+  - `watch_session` gets that subscription before the first request and saves tokens on each
+    refresh. A lagged channel counts as a refresh.
+- **Restoring at launch:**
+  - The engine sends `Event::Restoring`, then restores every saved account that isn't
+    suspended. Restored accounts get ready like fresh ones (`Account::ready`).
+  - The desktop shows "Signing you back in…" (`Screen::Restoring`) until each account arrives
+    (`AccountAdded`) or fails (`AccountError`).
+  - Dev builds optimise dependencies (`opt-level = 2`), since unoptimised key derivation made
+    restoring take seconds.
+  - Data lives in the app's data folder and the keychain, which no build or install touches, so
+    dev runs, release builds and the installed app (`bun run install:linux`) share accounts.
+- **Ended session:**
+  - `account::session_ended` recognises an unknown access token, or a refresh token missing or
+    rejected with `invalid_grant`; the sync loop then stops. Only `watch_session` sends
+    `Event::SessionEnded`, from the SDK's `UnknownToken` broadcast, which every ending sends
+    and which says whether it was soft: a rejected refresh hides that from the sync's error.
+  - Other sync failures retry after 2 s, doubling to a minute. A sync that ran over a minute
+    starts the waits over.
+  - The desktop sends `Command::Logout`, which forgets the account even when the server refuses
+    the logout. A dialog offers Later or Sign in again.
+  - Sign in again starts discovery with the user ID, so an OAuth account goes straight to the
+    browser.
+- **Soft logout keeps the data:**
+  - `SessionEnded` carries `kept` for `UnknownToken { soft_logout: true }`. The desktop then
+    sends `Command::Suspend`: the engine stops the account and marks it `signed_out`, keeping its
+    store and secrets.
+  - A suspended account isn't restored at launch; the engine reports it as ended and kept.
+  - The desktop lists suspended accounts (`State::suspended`) in the account menu and on the
+    sign-in card, with Sign in again and Remove, so "Later" in the dialog loses nothing.
+  - Signing in as a suspended account's user ID, from the list, the dialog or typed, passes
+    `resume` (`LoginRequest::resume`, `LoginOAuth::resume`), reusing the store, passphrase and
+    device ID, so history, keys and verification carry on.
+  - Remove (or "Remove from this device") sends `Logout`, which only forgets the stopped
+    account.
+- **Backdrop** on the sign-in and restoring screens (`state::backdrop`, `ui::backdrop`):
+  - An ASCII glow over a horizon after React Bits' Gradient ASCII, rising in as an intro.
+  - Built from Rune's parts. A custom shader needs `Compositor`, which takes the whole frame and
+    a GPU in every headless run.
+  - The light is sampled once per character cell per tick. The glow is a `Pixels` image, one
+    pixel per cell, upscaled smoothly. The characters (` =+xX0S8#@`) are one monospace text
+    element per row, coloured by spans, and scramble under the pointer.
+  - 12 ticks a second (`TICK`) on `poll`'s clock, virtual when headless, only while the screen
+    shows in a focused window. Rows are memoized per tick.
+  - A screen shown again rises in anew. Under reduced motion it holds still once risen.
+  - Dark uses deep and pale blues with near white; light runs the same blues as ink.
+
+## Consequences
+
+- Passwords for OAuth servers never pass through the app.
+- The file fallback is weaker than a keychain: anything running as the user can read it.
+- `CLIENT_URI` is a placeholder; set the real site before release, since servers show it.
+- Each browser sign-in registers a new client, as the loopback port changes.
+- `resume` applies only when the sign-in is for that account: the same homeserver, and on a
+  password sign-in the same user. Otherwise the sign-in gets a new store, and the suspended
+  one stays as it was. Changing server clears `resume`.
+- A password sign-in as a suspended account resumes it however it started: the engine looks for
+  a suspended account on that server with that username, and the username decides over
+  `resume`. A browser sign-in started from the
+  server's name can't: the user is known only when the browser returns, so it gets a new store
+  and replaces the suspended one. Signing in from the list, or by the user ID, resumes it.
+- The backdrop rebuilds the view and lays out about 40 rows 12 times a second while it shows.
+  Its look depends on the system's monospace font.

@@ -1,0 +1,27 @@
+name: Linux build libraries
+description: >-
+  What the desktop app builds against on Linux (see AGENTS.md): the development packages, and
+  clang 21+ with lld, which the libc++ bundled with libwebrtc requires (webrtc-sys checks it).
+  Sets CC and CXX to that clang; on ARM it also drives the link (with lld, as libwebrtc needs).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # LLVM's own packages: the distribution's clang is older than libwebrtc's libc++ needs.
+        codename=$(lsb_release -cs)
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+        echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends \
+          clang-21 lld-21 pkg-config libclang-dev \
+          libglib2.0-dev libasound2-dev \
+          libxkbcommon-dev libwayland-dev libpipewire-0.3-dev
+        {
+          echo "CC=clang-21"
+          echo "CXX=clang++-21"
+          # On ARM, clang drives the link, with lld (.cargo/config.toml).
+          if [ "$(uname -m)" = aarch64 ]; then
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang-21"
+          fi
+        } >> "$GITHUB_ENV"

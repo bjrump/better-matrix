@@ -1,0 +1,55 @@
+# Lint and test: on every pull request, on every commit to main, and (called) before a release
+# when its commit hasn't passed here already. One Linux job: the code is the same on every
+# platform, and the release builds catch platform breakage.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to test (the caller's when empty).
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# A newer push to a pull request makes its older run pointless. Every other run (main, a
+# release's tests) has a group of its own, so none cancels or holds up another.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts and full debug info only cost cache space here.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ./.github/actions/linux-deps
+      # The toolchain rust-toolchain.toml pins, with clippy and rustfmt.
+      - run: rustup show active-toolchain || rustup toolchain install
+      # Pull requests read main's cache; only main writes it, so caches don't pile up per branch.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run test

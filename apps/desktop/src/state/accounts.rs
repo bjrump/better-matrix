@@ -1,0 +1,918 @@
+//! Everything the engine has told us about each account: the client-side store the views read.
+//! Pure data and pure updates, so it is tested without a window or a server.
+
+use std::collections::{HashMap, HashSet};
+
+use matrix_core::{
+    AccountId, AccountSummary, Attachment, EntryKind, Message, MessageContent, NotificationMode, RoomChange, RoomKind,
+    RoomList, RoomSummary, SpaceSummary, TimelineDiff, TimelineEntry, TimelineKey,
+};
+use rune::TextEdit;
+
+/// Whether a room should draw attention: any unread message, or only mentions when the room
+/// notifies for mentions only or is muted.
+pub fn wants_attention(room: &RoomSummary) -> bool {
+    match room.notifications {
+        NotificationMode::AllMessages => room.unread > 0,
+        NotificationMode::MentionsOnly | NotificationMode::Mute => room.mentions > 0,
+    }
+}
+
+/// Which slice of an account's rooms the sidebar shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// Every room and direct chat.
+    #[default]
+    Home,
+    /// The rooms in one space and its subspaces.
+    Space(String),
+}
+
+/// A message ready to render: formatted bodies are parsed once, when they arrive.
+#[derive(Debug)]
+pub struct TimelineItem {
+    pub message: Message,
+    /// The sender's formatting, parsed from Matrix HTML into Rune's rich-text model.
+    pub rich: Option<TextEdit>,
+    /// A GIF linked from the text, shown below it like an attachment.
+    pub gif: Option<GifLink>,
+    /// The first other link in the text, which gets a preview card.
+    pub link: Option<String>,
+}
+
+/// One entry of a room's timeline, ready to render.
+#[derive(Debug)]
+pub struct Entry {
+    /// Stable across updates; the element key.
+    pub id: String,
+    pub kind: EntryView,
+}
+
+#[derive(Debug)]
+pub enum EntryView {
+    Message(Box<TimelineItem>),
+    RoomEvent(Box<matrix_core::RoomEvent>),
+    DateDivider(u64),
+    ReadMarker,
+    Start,
+    /// Not drawn; keeps diff indices aligned with the engine's.
+    Other,
+}
+
+impl From<TimelineEntry> for Entry {
+    fn from(entry: TimelineEntry) -> Self {
+        let kind = match entry.kind {
+            EntryKind::Message(message) => EntryView::Message(Box::new(TimelineItem::new(*message))),
+            EntryKind::RoomEvent(event) => EntryView::RoomEvent(event),
+            EntryKind::DateDivider(at) => EntryView::DateDivider(at),
+            EntryKind::ReadMarker => EntryView::ReadMarker,
+            EntryKind::Start => EntryView::Start,
+            EntryKind::Other => EntryView::Other,
+        };
+        Self { id: entry.id, kind }
+    }
+}
+
+impl Entry {
+    pub fn message(&self) -> Option<&Message> {
+        match &self.kind {
+            EntryView::Message(item) => Some(&item.message),
+            _ => None,
+        }
+    }
+
+    /// The pictures it shows of people: a message's sender, a room event's sender and the
+    /// person it was done to.
+    pub fn avatars(&self) -> impl Iterator<Item = &matrix_core::MediaRef> {
+        let (first, second) = match &self.kind {
+            EntryView::Message(item) => (item.message.sender_avatar.as_ref(), None),
+            EntryView::RoomEvent(event) => {
+                let target = match &event.change {
+                    RoomChange::Invited(person)
+                    | RoomChange::InviteRevoked(person)
+                    | RoomChange::Removed(person)
+                    | RoomChange::Banned(person)
+                    | RoomChange::Unbanned(person) => person.avatar.as_ref(),
+                    _ => None,
+                };
+                (event.sender.avatar.as_ref(), target)
+            }
+            _ => (None, None),
+        };
+        first.into_iter().chain(second)
+    }
+
+    /// The image attachment it shows a preview of, if any.
+    pub fn image(&self) -> Option<&Attachment> {
+        match &self.message()?.content {
+            MessageContent::Attachment(attachment) if attachment.preview().is_some() => Some(attachment),
+            _ => None,
+        }
+    }
+
+    /// The link in its text that gets a preview card, if any (see [`TimelineItem::card_link`]).
+    pub fn preview_link(&self, gifs_shown: bool) -> Option<&str> {
+        match &self.kind {
+            EntryView::Message(item) => item.card_link(gifs_shown),
+            _ => None,
+        }
+    }
+
+    /// The GIF linked from its text, if any.
+    pub fn gif_link(&self) -> Option<&str> {
+        match &self.kind {
+            EntryView::Message(item) => item.gif.as_ref().map(|gif| gif.url.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// A room's timeline as its subscription built it, and where loading older history stands.
+#[derive(Debug, Default)]
+pub struct RoomTimeline {
+    pub entries: Vec<Entry>,
+    /// A page of older history is on its way.
+    pub loading: bool,
+    /// Nothing older exists, or this user may not see it.
+    pub reached_start: bool,
+    /// Loading older history failed; nothing loads by itself until the user retries.
+    pub history_error: Option<String>,
+    /// Changes whenever the timeline may have, and is never the same for two timelines: the
+    /// view replans its rows only when it does. 0 for one never changed.
+    pub revision: u64,
+}
+
+/// Which entries of a timeline its view shows (plus a margin), as it last reported: their
+/// range at the timeline's `revision` then, and their IDs, which outlive changes to the range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shown {
+    pub revision: u64,
+    pub range: std::ops::Range<usize>,
+    pub ids: HashSet<String>,
+}
+
+/// The next [`RoomTimeline::revision`], unique in the process.
+fn next_revision() -> u64 {
+    static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl RoomTimeline {
+    /// Applies the engine's diffs, in order. Indices outside the list are ignored rather than
+    /// trusted: a stray diff can't crash the app.
+    pub fn apply(&mut self, diffs: Vec<TimelineDiff>) {
+        let entries = &mut self.entries;
+        for diff in diffs {
+            match diff {
+                TimelineDiff::Reset(all) => *entries = all.into_iter().map(Entry::from).collect(),
+                TimelineDiff::Append(more) => entries.extend(more.into_iter().map(Entry::from)),
+                TimelineDiff::Clear => entries.clear(),
+                TimelineDiff::PushFront(entry) => entries.insert(0, entry.into()),
+                TimelineDiff::PushBack(entry) => entries.push(entry.into()),
+                TimelineDiff::PopFront => {
+                    if !entries.is_empty() {
+                        entries.remove(0);
+                    }
+                }
+                TimelineDiff::PopBack => {
+                    entries.pop();
+                }
+                TimelineDiff::Insert { index, entry } if index <= entries.len() => entries.insert(index, entry.into()),
+                TimelineDiff::Set { index, entry } if index < entries.len() => entries[index] = entry.into(),
+                TimelineDiff::Remove { index } if index < entries.len() => {
+                    entries.remove(index);
+                }
+                TimelineDiff::Truncate { length } => entries.truncate(length),
+                TimelineDiff::Insert { .. } | TimelineDiff::Set { .. } | TimelineDiff::Remove { .. } => {}
+            }
+        }
+        if entries.iter().any(|entry| matches!(entry.kind, EntryView::Start)) {
+            self.reached_start = true;
+        }
+    }
+
+    /// A thread starts at its root: once the root is in, there is nothing older to load.
+    pub fn note_thread_root(&mut self, root: &str) {
+        if self.messages().any(|message| message.event_id == root) {
+            self.reached_start = true;
+        }
+    }
+
+    /// Records that loading older history failed.
+    pub fn history_failed(&mut self, error: String) {
+        self.loading = false;
+        self.history_error = Some(error);
+    }
+
+    /// The entries on screen, as the view last reported them (`shown`): the reported range
+    /// while the timeline is as it was then, else the entries with a reported ID, which a scan
+    /// finds until the view reports again. Before any report, the newest few, which a timeline
+    /// opens on.
+    pub fn on_screen<'a>(&'a self, shown: Option<&'a Shown>) -> Box<dyn Iterator<Item = &'a Entry> + 'a> {
+        match shown {
+            Some(shown) if shown.revision == self.revision => {
+                Box::new(self.entries.get(shown.range.clone()).unwrap_or_default().iter())
+            }
+            Some(shown) => Box::new(self.entries.iter().filter(move |entry| shown.ids.contains(&entry.id))),
+            None => Box::new(self.entries[self.entries.len().saturating_sub(SHOWN_ON_OPEN)..].iter()),
+        }
+    }
+
+    pub fn messages(&self) -> impl DoubleEndedIterator<Item = &Message> {
+        self.entries.iter().filter_map(Entry::message)
+    }
+
+    /// The GIF links its messages show, found once when each message arrived.
+    pub fn gif_links(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(Entry::gif_link)
+    }
+}
+
+/// A GIF link in a message, and the message as it reads without it: the GIF stands in for the
+/// link, which no longer needs showing.
+#[derive(Debug)]
+pub struct GifLink {
+    pub url: String,
+    /// The rest of the message; `None` when the message is only the link.
+    pub rest: Option<Body>,
+}
+
+/// A text body: plain, and parsed formatting when the sender sent some.
+#[derive(Debug)]
+pub struct Body {
+    pub plain: String,
+    pub rich: Option<TextEdit>,
+}
+
+impl TimelineItem {
+    /// The link that gets a preview card: the first link that isn't a GIF, else, while linked
+    /// GIFs don't play, the GIF link (which then shows as an ordinary link).
+    pub fn card_link(&self, gifs_shown: bool) -> Option<&str> {
+        self.link.as_deref().or_else(|| self.gif.as_ref().filter(|_| !gifs_shown).map(|gif| gif.url.as_str()))
+    }
+
+    fn new(message: Message) -> Self {
+        let link = match &message.content {
+            MessageContent::Text { body, .. } => matrix_core::links::find_preview_link(body).map(str::to_owned),
+            _ => None,
+        };
+        let (rich, gif) = match &message.content {
+            MessageContent::Text { body, html } => {
+                let gif = matrix_core::links::find_gif_link(body).map(|url| {
+                    let plain = matrix_core::links::without_link(body, url);
+                    let rest = (!plain.is_empty()).then(|| Body {
+                        rich: html
+                            .as_deref()
+                            .map(|html| TextEdit::from_html(&matrix_core::links::html_without_link(html, url))),
+                        plain,
+                    });
+                    GifLink { url: url.to_owned(), rest }
+                });
+                (html.as_deref().map(TextEdit::from_html), gif)
+            }
+            _ => (None, None),
+        };
+        Self { message, rich, gif, link }
+    }
+}
+
+/// How many timelines off screen keep their entries, per account.
+const KEPT_TIMELINES: usize = 8;
+
+/// One account's synced data.
+#[derive(Debug)]
+pub struct AccountData {
+    pub summary: AccountSummary,
+    pub rooms: Vec<RoomSummary>,
+    pub spaces: Vec<SpaceSummary>,
+    timelines: HashMap<TimelineKey, RoomTimeline>,
+    /// Timelines no longer on screen whose entries are still kept, oldest first: switching back
+    /// shows them at once. Older ones are dropped and load again when opened.
+    closed: Vec<TimelineKey>,
+    /// Each room's newest message, from sync, for previews.
+    latest: HashMap<String, Message>,
+    /// When this device heard of each room's newest message, in milliseconds since the epoch:
+    /// the room's place in the list when the message's own time can't be believed.
+    heard_at: HashMap<String, u64>,
+    /// How encryption stands on this device; `None` until the engine reports.
+    pub security: Option<matrix_core::Security>,
+    /// The signed-in sessions, once listed.
+    pub sessions: Option<Vec<matrix_core::Session>>,
+    /// The linked email addresses and phone numbers, and whether the app may change them, once
+    /// listed.
+    pub contacts: Option<matrix_core::Contacts>,
+    /// Rooms' members, by room ID, once listed.
+    pub members: HashMap<String, matrix_core::Members>,
+    /// Rooms' threads, by room ID, once listed for the info panel.
+    pub threads: HashMap<String, Vec<matrix_core::ThreadInfo>>,
+    /// The files shared in rooms, by room ID, once listed for the info panel.
+    pub files: HashMap<String, Vec<matrix_core::SharedFile>>,
+    /// Who is typing, by room ID, in the rooms whose timelines are open.
+    pub typing: HashMap<String, Vec<matrix_core::Person>>,
+    /// How the user arranged the sidebar.
+    pub sidebar: matrix_core::SidebarLayout,
+    /// Whether `sidebar` is the saved layout yet, rather than the empty one before it is read.
+    pub sidebar_loaded: bool,
+}
+
+impl AccountData {
+    fn new(summary: AccountSummary) -> Self {
+        Self {
+            summary,
+            rooms: Vec::new(),
+            spaces: Vec::new(),
+            timelines: HashMap::new(),
+            closed: Vec::new(),
+            latest: HashMap::new(),
+            heard_at: HashMap::new(),
+            security: None,
+            sessions: None,
+            contacts: None,
+            members: HashMap::new(),
+            threads: HashMap::new(),
+            files: HashMap::new(),
+            typing: HashMap::new(),
+            sidebar: matrix_core::SidebarLayout::default(),
+            sidebar_loaded: false,
+        }
+    }
+
+    pub fn room(&self, room_id: &str) -> Option<&RoomSummary> {
+        self.rooms.iter().find(|room| room.room_id == room_id)
+    }
+
+    pub fn space(&self, room_id: &str) -> Option<&SpaceSummary> {
+        self.spaces.iter().find(|space| space.room_id == room_id)
+    }
+
+    /// The rooms a scope shows, of one kind, in list order. Home shows every direct chat and the
+    /// rooms in no space; a space shows its rooms (subspaces included) and the direct chats with
+    /// its members.
+    pub fn rooms_in<'a>(&'a self, scope: &Scope, kind: RoomKind) -> impl Iterator<Item = &'a RoomSummary> + 'a {
+        let filter = match scope {
+            Scope::Home => Filter::NotIn(self.spaces.iter().flat_map(|s| self.space_rooms(&s.room_id)).collect()),
+            Scope::Space(id) => Filter::Space {
+                rooms: self.space_rooms(id),
+                members: self.space(id).map(|s| s.members.iter().map(String::as_str).collect()).unwrap_or_default(),
+            },
+        };
+        self.rooms.iter().filter(move |room| room.kind == kind && filter.shows(room))
+    }
+
+    /// Every room ID under a space, following subspaces; safe against cycles.
+    fn space_rooms(&self, space_id: &str) -> HashSet<&str> {
+        let mut rooms = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut pending = vec![space_id];
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(space) = self.space(id) else { continue };
+            for child in &space.children {
+                if self.space(child).is_some() {
+                    pending.push(child);
+                } else {
+                    rooms.insert(child.as_str());
+                }
+            }
+        }
+        rooms
+    }
+
+    /// Whether any room in the scope has unread messages, for the rail's dots.
+    pub fn has_unread(&self, scope: &Scope) -> bool {
+        [RoomKind::Group, RoomKind::Direct].into_iter().any(|kind| self.rooms_in(scope, kind).any(wants_attention))
+    }
+
+    pub fn timeline(&self, key: &TimelineKey) -> Option<&RoomTimeline> {
+        self.timelines.get(key)
+    }
+}
+
+impl AccountData {
+    /// The newest message in a room: from its timeline when open, else from sync.
+    pub fn last_message(&self, room_id: &str) -> Option<&Message> {
+        let from_timeline =
+            self.timeline(&TimelineKey::room(room_id)).and_then(|timeline| timeline.messages().next_back());
+        match (from_timeline, self.latest.get(room_id)) {
+            (Some(a), Some(b)) => Some(if a.timestamp_ms >= b.timestamp_ms { a } else { b }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The one-to-one chat with `user_id`, if there is one: a direct chat with them alone, never
+    /// a group chat they're in, nor one a third person joined (a bridge bot, someone invited
+    /// later, even one only invited), where a call would ring them too: the same rule as the
+    /// engine's `Account::direct_chat`, which makes a fresh chat when there's none.
+    pub fn direct_chat_with(&self, user_id: &str) -> Option<&RoomSummary> {
+        self.rooms
+            .iter()
+            .find(|room| room.kind == RoomKind::Direct && room.dm_users == [user_id] && room.active_member_count <= 2)
+    }
+
+    /// When something last happened in a room, for the room list's order: its newest message
+    /// seen this session, or the latest event the store kept from before (so a quiet chat
+    /// keeps its place after a restart); 0 when nothing is known.
+    ///
+    /// A time further in the future than clocks drift (a misdated event, by accident or on
+    /// purpose, or a server whose clock runs fast) doesn't count, so it can't hold a room at the
+    /// top: a message heard this session counts from when it was heard instead; a stored time
+    /// counts once it has passed (until then the room sorts as unknown).
+    pub fn activity(&self, room: &RoomSummary, now_ms: u64) -> u64 {
+        /// How far ahead of this device's clock a server's may be.
+        const DRIFT_MS: u64 = 5 * 60_000;
+        let plausible = |at: &u64| *at <= now_ms.saturating_add(DRIFT_MS);
+        let seen = self
+            .last_message(&room.room_id)
+            .map(|message| message.timestamp_ms)
+            .and_then(|at| if plausible(&at) { Some(at) } else { self.heard_at.get(&room.room_id).copied() });
+        seen.max(room.activity_ms.filter(plausible)).unwrap_or(0)
+    }
+
+    /// What a scope's overview shows: rooms wanting attention (mentions first), and the rooms
+    /// with the most recent messages, newest first.
+    pub fn overview(&self, scope: &Scope) -> Overview<'_> {
+        let in_scope = || [RoomKind::Group, RoomKind::Direct].into_iter().flat_map(|kind| self.rooms_in(scope, kind));
+        let mut unread: Vec<_> = in_scope().filter(|room| wants_attention(room)).collect();
+        unread.sort_by_key(|room| (std::cmp::Reverse(room.mentions), std::cmp::Reverse(room.unread)));
+        let mut recent: Vec<_> =
+            in_scope().filter_map(|room| self.last_message(&room.room_id).map(|message| (room, message))).collect();
+        // By the same believable time as the room list, so a misdated message can't hold a slot.
+        let now = now_ms();
+        recent.sort_by_key(|(room, _)| std::cmp::Reverse(self.activity(room, now)));
+        recent.truncate(RECENT_LIMIT);
+        Overview { unread, recent, rooms: self.rooms_in(scope, RoomKind::Group).count() }
+    }
+}
+
+/// How many recent conversations an overview lists.
+const RECENT_LIMIT: usize = 6;
+
+/// The content of a scope's overview.
+#[derive(Debug)]
+pub struct Overview<'a> {
+    pub unread: Vec<&'a RoomSummary>,
+    pub recent: Vec<(&'a RoomSummary, &'a Message)>,
+    /// Group rooms the scope lists (direct chats not counted).
+    pub rooms: usize,
+}
+
+/// How many of a timeline's newest entries count as on screen before the view reports which
+/// are: about a window's worth, which it opens on.
+const SHOWN_ON_OPEN: usize = 30;
+
+/// Which rooms a [`Scope`] shows.
+enum Filter<'a> {
+    NotIn(HashSet<&'a str>),
+    Space { rooms: HashSet<&'a str>, members: HashSet<&'a str> },
+}
+
+impl Filter<'_> {
+    fn shows(&self, room: &RoomSummary) -> bool {
+        match (self, room.kind) {
+            (Filter::NotIn(_), RoomKind::Direct) => true,
+            (Filter::NotIn(in_spaces), RoomKind::Group) => !in_spaces.contains(room.room_id.as_str()),
+            (Filter::Space { rooms, .. }, RoomKind::Group) => rooms.contains(room.room_id.as_str()),
+            (Filter::Space { rooms, members }, RoomKind::Direct) => {
+                rooms.contains(room.room_id.as_str()) || room.dm_users.iter().any(|u| members.contains(u.as_str()))
+            }
+        }
+    }
+}
+
+/// Every signed-in account, in the order they were added.
+#[derive(Debug, Default)]
+pub struct Accounts {
+    list: Vec<AccountData>,
+}
+
+impl Accounts {
+    pub fn iter(&self) -> impl Iterator<Item = &AccountData> {
+        self.list.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    pub fn get(&self, id: &AccountId) -> Option<&AccountData> {
+        self.list.iter().find(|account| &account.summary.id == id)
+    }
+
+    fn get_mut(&mut self, id: &AccountId) -> Option<&mut AccountData> {
+        self.list.iter_mut().find(|account| &account.summary.id == id)
+    }
+
+    /// Adds an account, or refreshes its summary when it is already known (a re-login).
+    pub fn upsert(&mut self, summary: AccountSummary) {
+        match self.get_mut(&summary.id) {
+            Some(account) => account.summary = summary,
+            None => self.list.push(AccountData::new(summary)),
+        }
+    }
+
+    pub fn remove(&mut self, id: &AccountId) {
+        self.list.retain(|account| &account.summary.id != id);
+    }
+
+    pub fn set_room_list(&mut self, id: &AccountId, list: RoomList) {
+        if let Some(account) = self.get_mut(id) {
+            account.rooms = list.rooms;
+            account.spaces = list.spaces;
+        }
+    }
+
+    pub fn set_security(&mut self, id: &AccountId, security: matrix_core::Security) {
+        if let Some(account) = self.get_mut(id) {
+            account.security = Some(security);
+        }
+    }
+
+    pub fn set_sessions(&mut self, id: &AccountId, sessions: Vec<matrix_core::Session>) {
+        if let Some(account) = self.get_mut(id) {
+            account.sessions = Some(sessions);
+        }
+    }
+
+    pub fn set_sidebar(&mut self, id: &AccountId, layout: matrix_core::SidebarLayout) {
+        if let Some(account) = self.get_mut(id) {
+            account.sidebar = layout;
+            account.sidebar_loaded = true;
+        }
+    }
+
+    /// Who is typing in a room; nobody forgets the room.
+    pub fn set_typing(&mut self, id: &AccountId, room_id: String, people: Vec<matrix_core::Person>) {
+        let Some(account) = self.get_mut(id) else { return };
+        if people.is_empty() {
+            account.typing.remove(&room_id);
+        } else {
+            account.typing.insert(room_id, people);
+        }
+    }
+
+    /// Keeps a room's members; a partial list never replaces a complete one.
+    pub fn set_members(&mut self, id: &AccountId, room_id: String, members: matrix_core::Members) {
+        let Some(account) = self.get_mut(id) else { return };
+        let had_all = account.members.get(&room_id).is_some_and(|known| known.complete);
+        if members.complete || !had_all {
+            account.members.insert(room_id, members);
+        }
+    }
+
+    pub fn set_threads(&mut self, id: &AccountId, room_id: String, threads: Vec<matrix_core::ThreadInfo>) {
+        if let Some(account) = self.get_mut(id) {
+            account.threads.insert(room_id, threads);
+        }
+    }
+
+    pub fn set_files(&mut self, id: &AccountId, room_id: String, files: Vec<matrix_core::SharedFile>) {
+        if let Some(account) = self.get_mut(id) {
+            account.files.insert(room_id, files);
+        }
+    }
+
+    pub fn set_contacts(&mut self, id: &AccountId, contacts: matrix_core::Contacts) {
+        if let Some(account) = self.get_mut(id) {
+            account.contacts = Some(contacts);
+        }
+    }
+
+    /// Records a room's newest message, for previews.
+    pub fn set_latest(&mut self, id: &AccountId, room_id: &str, message: Message) {
+        if let Some(account) = self.get_mut(id) {
+            account.latest.insert(room_id.to_owned(), message);
+            account.heard_at.insert(room_id.to_owned(), now_ms());
+        }
+    }
+
+    /// Starts a thread's timeline with its root, copied from the room's, so the thread panel
+    /// shows it at once; the engine's first update replaces it.
+    pub fn seed_thread(&mut self, id: &AccountId, key: &TimelineKey) {
+        let Some(root) = &key.thread else { return };
+        let Some(account) = self.get_mut(id) else { return };
+        if account.timelines.get(key).is_some_and(|thread| !thread.entries.is_empty()) {
+            return;
+        }
+        let room = account.timelines.get(&TimelineKey::room(&key.room_id));
+        let Some(message) = room.and_then(|room| room.messages().find(|m| m.event_id == *root)).cloned() else {
+            return;
+        };
+        let entry = TimelineEntry { id: format!("seed-{root}"), kind: EntryKind::Message(Box::new(message)) };
+        let thread = account.timelines.entry(key.clone()).or_default();
+        thread.revision = next_revision();
+        thread.entries.push(entry.into());
+        thread.note_thread_root(root);
+    }
+
+    /// A timeline left the screen: its entries stay for a while, as many as the engine keeps
+    /// warm timelines, then go.
+    pub fn timeline_closed(&mut self, id: &AccountId, key: &TimelineKey) {
+        let Some(account) = self.get_mut(id) else { return };
+        // Typing shows only while the room is open: what arrives later is dropped, so what was
+        // shown would go stale.
+        if key.thread.is_none() {
+            account.typing.remove(&key.room_id);
+        }
+        account.closed.retain(|closed| closed != key);
+        account.closed.push(key.clone());
+        while account.closed.len() > KEPT_TIMELINES {
+            let oldest = account.closed.remove(0);
+            account.timelines.remove(&oldest);
+        }
+    }
+
+    /// A timeline is on screen again: it is kept while shown.
+    pub fn timeline_opened(&mut self, id: &AccountId, key: &TimelineKey) {
+        if let Some(account) = self.get_mut(id) {
+            account.closed.retain(|closed| closed != key);
+        }
+    }
+
+    /// A timeline to change, created empty when first touched. Its revision moves on.
+    pub fn timeline_mut(&mut self, id: &AccountId, key: &TimelineKey) -> Option<&mut RoomTimeline> {
+        let timeline = self.get_mut(id)?.timelines.entry(key.clone()).or_default();
+        timeline.revision = next_revision();
+        Some(timeline)
+    }
+
+    /// Sets a room's notification mode locally, ahead of the server's confirmation; `None`
+    /// returns it to the account default.
+    pub fn set_notifications(&mut self, id: &AccountId, room_id: &str, mode: Option<NotificationMode>) {
+        let default = self.get(id).map(|account| account.summary.default_notifications).unwrap_or_default();
+        if let Some(room) = self.room_mut(id, room_id) {
+            room.notifications = mode.unwrap_or(default);
+            room.custom_notifications = mode.is_some();
+        }
+    }
+
+    /// Sets an account's default notification mode locally, and the mode of every room that
+    /// follows it, ahead of the server's confirmation.
+    pub fn set_default_notifications(&mut self, id: &AccountId, mode: NotificationMode) {
+        let Some(account) = self.get_mut(id) else { return };
+        account.summary.default_notifications = mode;
+        for room in account.rooms.iter_mut().filter(|room| !room.custom_notifications) {
+            room.notifications = mode;
+        }
+    }
+
+    fn room_mut(&mut self, id: &AccountId, room_id: &str) -> Option<&mut RoomSummary> {
+        self.get_mut(id).and_then(|account| account.rooms.iter_mut().find(|room| room.room_id == room_id))
+    }
+
+    /// Clears a room's unread counts locally, ahead of the server's next count.
+    pub fn mark_read(&mut self, id: &AccountId, room_id: &str) {
+        if let Some(room) = self.room_mut(id, room_id) {
+            room.unread = 0;
+            room.mentions = 0;
+        }
+    }
+}
+
+/// Now, in milliseconds since the epoch: the room list's clock.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(user_id: &str) -> AccountSummary {
+        AccountSummary {
+            id: AccountId::new(user_id),
+            display_name: user_id.into(),
+            homeserver: "example.org".into(),
+            default_notifications: NotificationMode::AllMessages,
+            avatar: None,
+            sign_in: matrix_core::SignInMethod::Password,
+        }
+    }
+
+    fn message(event_id: &str) -> Message {
+        Message {
+            event_id: event_id.into(),
+            sender_id: "@a:example.org".into(),
+            sender_name: "a".into(),
+            content: MessageContent::Text { body: "hi".into(), html: None },
+            ..Message::default()
+        }
+    }
+
+    fn entry(id: &str) -> TimelineEntry {
+        TimelineEntry { id: id.into(), kind: EntryKind::Message(Box::new(message(&format!("${id}")))) }
+    }
+
+    fn entry_ids(timeline: &RoomTimeline) -> Vec<&str> {
+        timeline.entries.iter().map(|e| e.id.as_str()).collect()
+    }
+
+    fn room(id: &str) -> RoomSummary {
+        RoomSummary {
+            room_id: id.into(),
+            name: id.into(),
+            topic: None,
+            kind: RoomKind::Group,
+            unread: 0,
+            mentions: 0,
+            dm_users: Vec::new(),
+            avatar: None,
+            member_count: 0,
+            active_member_count: 0,
+            history: matrix_core::HistoryVisibility::Shared,
+            notifications: NotificationMode::AllMessages,
+            custom_notifications: false,
+            call: matrix_core::RoomCall::default(),
+            activity_ms: None,
+        }
+    }
+
+    fn dm(id: &str, with: &str) -> RoomSummary {
+        RoomSummary { kind: RoomKind::Direct, dm_users: vec![with.into()], ..room(id) }
+    }
+
+    fn space(id: &str, children: &[&str], members: &[&str]) -> SpaceSummary {
+        let strings = |xs: &[&str]| xs.iter().map(|x| (*x).to_owned()).collect();
+        SpaceSummary {
+            room_id: id.into(),
+            name: id.into(),
+            avatar: None,
+            can_add_rooms: true,
+            can_rename: true,
+            children: strings(children),
+            members: strings(members),
+        }
+    }
+
+    /// Rooms `!a`, `!b`, `!c` and direct chats with `@grace` and `@kai`. Space `!s` (member
+    /// `@grace`) holds `!a` and subspace `!t`, which holds `!b` and, cyclically, `!s`.
+    fn nested() -> AccountData {
+        let mut account = AccountData::new(summary("@a:example.org"));
+        account.rooms = vec![room("!a"), room("!b"), room("!c"), dm("!dg", "@grace"), dm("!dk", "@kai")];
+        account.spaces = vec![space("!s", &["!a", "!t"], &["@grace"]), space("!t", &["!b", "!s"], &[])];
+        account
+    }
+
+    fn ids<'a>(rooms: impl Iterator<Item = &'a RoomSummary>) -> Vec<&'a str> {
+        rooms.map(|r| r.room_id.as_str()).collect()
+    }
+
+    #[test]
+    fn upsert_should_not_duplicate_a_known_account() {
+        let mut accounts = Accounts::default();
+        accounts.upsert(summary("@a:example.org"));
+        accounts.upsert(summary("@a:example.org"));
+        assert_eq!(accounts.iter().count(), 1);
+    }
+
+    #[test]
+    fn diffs_should_apply_in_order() {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![
+            TimelineDiff::Reset(vec![entry("b"), entry("c")]),
+            TimelineDiff::PushFront(entry("a")),
+            TimelineDiff::Insert { index: 3, entry: entry("d") },
+            TimelineDiff::Remove { index: 1 },
+        ]);
+        assert_eq!(entry_ids(&timeline), ["a", "c", "d"]);
+    }
+
+    #[test]
+    fn a_diff_out_of_range_should_be_ignored() {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::Reset(vec![entry("a")]), TimelineDiff::Remove { index: 5 }]);
+        assert_eq!(entry_ids(&timeline), ["a"]);
+    }
+
+    #[test]
+    fn the_start_entry_should_mark_the_history_complete() {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::PushFront(TimelineEntry { id: "s".into(), kind: EntryKind::Start })]);
+        assert!(timeline.reached_start);
+    }
+
+    #[test]
+    fn a_formatted_message_should_be_parsed_once_on_arrival() {
+        let mut bold = message("$1");
+        bold.content = MessageContent::Text { body: "hi".into(), html: Some("<b>hi</b>".into()) };
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::PushBack(TimelineEntry {
+            id: "1".into(),
+            kind: EntryKind::Message(Box::new(bold)),
+        })]);
+        let EntryView::Message(item) = &timeline.entries[0].kind else { panic!("a message") };
+        assert_eq!(item.rich.as_ref().map(|r| r.text.as_str()), Some("hi"));
+    }
+
+    #[test]
+    fn remove_should_forget_the_account() {
+        let mut accounts = Accounts::default();
+        let id = AccountId::new("@a:example.org");
+        accounts.upsert(summary(id.as_str()));
+        accounts.remove(&id);
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn a_muted_room_should_draw_attention_only_for_mentions() {
+        let muted = RoomSummary { unread: 5, notifications: NotificationMode::Mute, ..room("!m") };
+        assert!(!wants_attention(&muted));
+    }
+
+    #[test]
+    fn a_mentions_only_room_should_draw_attention_when_mentioned() {
+        let room = RoomSummary { unread: 5, mentions: 1, notifications: NotificationMode::MentionsOnly, ..room("!m") };
+        assert!(wants_attention(&room));
+    }
+
+    #[test]
+    fn a_new_default_should_reach_rooms_without_their_own_mode() {
+        let mut accounts = Accounts::default();
+        let id = AccountId::new("@a:example.org");
+        accounts.upsert(summary(id.as_str()));
+        let own = RoomSummary { custom_notifications: true, ..room("!own") };
+        accounts.set_room_list(&id, RoomList { rooms: vec![room("!follows"), own], spaces: Vec::new() });
+        accounts.set_default_notifications(&id, NotificationMode::Mute);
+        let modes: Vec<_> = accounts.get(&id).unwrap().rooms.iter().map(|r| r.notifications).collect();
+        assert_eq!(modes, [NotificationMode::Mute, NotificationMode::AllMessages]);
+    }
+
+    #[test]
+    fn the_overview_should_list_mentions_before_other_unread_rooms() {
+        let mut account = nested();
+        account.rooms[2] = RoomSummary { unread: 9, ..room("!c") };
+        account.rooms[3] = RoomSummary { unread: 1, mentions: 1, ..dm("!dg", "@grace") };
+        let unread: Vec<_> = account.overview(&Scope::Home).unread.iter().map(|r| r.room_id.as_str()).collect();
+        assert_eq!(unread, ["!dg", "!c"]);
+    }
+
+    #[test]
+    fn the_overview_should_list_recent_conversations_newest_first() {
+        let mut account = nested();
+        let at = |id: &str, ms| Message { timestamp_ms: ms, ..message(id) };
+        account.latest.insert("!c".into(), at("$old", 1));
+        account.latest.insert("!dk".into(), at("$new", 2));
+        let recent: Vec<_> = account.overview(&Scope::Home).recent.iter().map(|(r, _)| r.room_id.as_str()).collect();
+        assert_eq!(recent, ["!dk", "!c"]);
+    }
+
+    #[test]
+    fn home_should_show_only_rooms_outside_every_space() {
+        assert_eq!(ids(nested().rooms_in(&Scope::Home, RoomKind::Group)), ["!c"]);
+    }
+
+    #[test]
+    fn home_should_show_every_direct_chat() {
+        assert_eq!(ids(nested().rooms_in(&Scope::Home, RoomKind::Direct)), ["!dg", "!dk"]);
+    }
+
+    #[test]
+    fn a_space_should_show_direct_chats_only_with_its_members() {
+        assert_eq!(ids(nested().rooms_in(&Scope::Space("!s".into()), RoomKind::Direct)), ["!dg"]);
+    }
+
+    #[test]
+    fn a_space_should_show_rooms_of_its_subspaces_despite_cycles() {
+        assert_eq!(ids(nested().rooms_in(&Scope::Space("!s".into()), RoomKind::Group)), ["!a", "!b"]);
+    }
+
+    #[test]
+    fn before_the_view_reports_the_newest_entries_should_count_as_on_screen() {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::Reset((0..40).map(|i| entry(&i.to_string())).collect())]);
+        let shown: Vec<&str> = timeline.on_screen(None).map(|e| e.id.as_str()).collect();
+        assert_eq!((shown.len(), shown.first().copied()), (SHOWN_ON_OPEN, Some("10")));
+    }
+
+    #[test]
+    fn once_the_view_reports_only_its_rows_should_count_as_on_screen() {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::Reset((0..40).map(|i| entry(&i.to_string())).collect())]);
+        let reported = Shown { revision: timeline.revision, range: 3..4, ids: HashSet::from(["3".to_owned()]) };
+        let shown: Vec<&str> = timeline.on_screen(Some(&reported)).map(|e| e.id.as_str()).collect();
+        assert_eq!(shown, ["3"]);
+    }
+
+    #[test]
+    fn a_report_from_before_a_change_should_still_find_its_entries() {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::Reset((0..40).map(|i| entry(&i.to_string())).collect())]);
+        let reported = Shown { revision: timeline.revision, range: 3..4, ids: HashSet::from(["3".to_owned()]) };
+        timeline.revision += 1;
+        timeline.apply(vec![TimelineDiff::PushFront(entry("older"))]);
+        let shown: Vec<&str> = timeline.on_screen(Some(&reported)).map(|e| e.id.as_str()).collect();
+        assert_eq!(shown, ["3"]);
+    }
+
+    #[test]
+    fn changing_a_timeline_should_give_it_a_new_revision() {
+        let mut accounts = Accounts::default();
+        let id = AccountId::new("@a:example.org");
+        accounts.upsert(summary("@a:example.org"));
+        let key = TimelineKey::room("!r");
+        let first = accounts.timeline_mut(&id, &key).unwrap().revision;
+        let second = accounts.timeline_mut(&id, &key).unwrap().revision;
+        assert!(first != 0 && second != first);
+    }
+}

@@ -1,0 +1,58 @@
+name: Bug report
+description: Something doesn't work as it should.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting! Leave out anything private (messages, room names, access tokens).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a direct chat
+        2. Start a video call
+        3. …
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version and how you installed it
+      placeholder: 0.2.0, .deb / .rpm / Arch / AppImage / .dmg / .zip
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: OS version; on Linux also the distribution and desktop (Wayland or X11).
+      placeholder: Fedora 43, GNOME on Wayland
+  - type: input
+    id: homeserver
+    attributes:
+      label: Homeserver software, if it matters
+      placeholder: Synapse, Conduit, matrix.org…
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Output from the terminal if you started the app from one.
+      render: text

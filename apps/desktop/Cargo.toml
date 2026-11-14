@@ -1,0 +1,52 @@
+[package]
+name = "better-matrix-desktop"
+description = "Better Matrix for Linux, macOS and Windows, rendered with Rune."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+build = "build.rs"
+
+[[bin]]
+name = "better-matrix"
+path = "src/main.rs"
+
+[features]
+# Live Rust editing with Rune's `scripts/rune-dev` (see `.agent-tools/rune/docs/rune.md`).
+hot = ["rune/hot"]
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# Renders PDF pages for the attachment preview: pure Rust, so every platform previews without a system library.
+hayro = "0.9"
+image = { version = "0.25", default-features = false, features = ["gif"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+matrix-core.workspace = true
+pollster = "0.4"
+rfd = "0.17"
+rune = { workspace = true, features = ["native-file-dialog"] }
+rune-i18n.workspace = true
+# Sound the app plays and records itself (voice messages, audio files, the ring), on the device
+# the user picked: decoders in pure Rust, cpal for the device.
+cpal = "0.18"
+# Every emoji with its name and shortcodes, for the picker's search.
+emojis = "0.9"
+opuscule = "0.2"
+symphonia = { version = "0.5.5", default-features = false, features = ["ogg", "vorbis", "mkv", "wav", "pcm", "mp3", "aac", "isomp4", "flac"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[build-dependencies]
+rune-i18n = { workspace = true, features = ["codegen"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+rune-notify.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = "4"
+# PulseAudio's names for devices, which PipeWire serves too: the names calls see.
+cpal = { version = "0.18", features = ["pulseaudio"] }
+
+[lints]
+workspace = true

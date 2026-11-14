@@ -1,0 +1,27 @@
+{
+  "name": "better-matrix",
+  "private": true,
+  "packageManager": "bun@1.4.4",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "build:release": "turbo run build -- --release",
+    "dev": "turbo run dev --filter=better-matrix-desktop",
+    "test": "turbo run test --filter=better-matrix-cargo",
+    "check": "turbo run check --filter=better-matrix-cargo",
+    "lint": "turbo run lint --filter=better-matrix-cargo && bun run format:check && bun run third-party:check",
+    "format": "turbo run format --filter=better-matrix-cargo",
+    "format:check": "turbo run format --filter=better-matrix-cargo -- --check",
+    "build:windows": "bun scripts/build-windows.ts",
+    "install:linux": "bun scripts/install-linux.ts",
+    "agent-tools": "bun scripts/sync-agent-tools.ts",
+    "third-party": "bun scripts/third-party.ts",
+    "third-party:check": "bun scripts/third-party.ts --check"
+  },
+  "devDependencies": {
+    "turbo": "2.11.11"
+  }
+}

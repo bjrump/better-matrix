@@ -1,0 +1,87 @@
+# 0001. Stack and tooling
+
+Status: Accepted
+Date: 2026-11-14
+
+## Context
+
+- Several apps (desktop now, mobile later) share Matrix code; the desktop runs on Linux, macOS
+  and Windows and should share Rust with the Matrix layer without a JavaScript bridge.
+- The goal is every Matrix feature, calls included; writing encryption, sync and storage from
+  scratch is years of work and a security risk.
+- Development happens mostly on Linux; Windows has no system SQLite.
+- The app ships in English, German and French; a missing message key must never reach users.
+
+## Decision
+
+- **Monorepo:**
+  - `apps/*` hold apps, `packages/*` shared modules.
+  - Bun runs scripts and packages; Turborepo orchestrates tasks.
+  - Rust crates form one Cargo workspace, members listed explicitly so non-Rust packages fit in
+    `packages/`.
+  - Turborepo discovers it (`experimentalCargoWorkspaces`) as `better-matrix-cargo` and maps
+    `build`, `dev`, `test`, `check`, `lint`, `format` to Cargo.
+- **Rune for the desktop UI:**
+  - [Rune](https://github.com/anomalyco/rune), a GPU-rendered Rust UI framework; views are
+    plain functions of state.
+  - One `dev` rev is pinned for `rune`, `rune-i18n` and `rune-notify`; `[patch.crates-io]`
+    mirrors Rune's own patch table at that rev.
+  - Agents read Rune's docs synced at that rev (`bun run agent-tools`), never memory.
+  - What Rune lacks goes behind the app's **shell** ([0002](0002-engine-and-desktop-state.md)).
+- **matrix-rust-sdk:**
+  - `matrix-sdk` (behind Element X) provides the SQLite stores, rustls TLS, OAuth and
+    notification settings; `matrix-sdk-ui` provides timelines ([0006](0006-timelines.md)).
+  - SDK types stay inside `matrix-core` ([0002](0002-engine-and-desktop-state.md)).
+  - Its futures nest deeply, so `matrix-core` sets `recursion_limit = "256"`.
+- **Builds:**
+  - `bundled-sqlite` on every platform: all builds link the same SQLite.
+  - `bun run build:windows` builds natively on Windows and cross-compiles elsewhere with
+    `cargo-xwin` (clang-cl, lld-link).
+  - Windows release builds use the GUI subsystem: no console window.
+- **CI and releases** (`.github/`), kept to as little compute as gives confidence:
+  - CI (`ci.yml`) lints and tests in one Linux job on every pull request and every commit to
+    `main`. A newer push cancels a pull request's older run. Only `main` writes the Rust cache;
+    pull requests read it. Linux builds use clang 21 from LLVM's packages (libwebrtc's libc++
+    needs it), passed to Cargo through Turbo (`CC`, `CXX`, `CARGO_*` in `turbo.json`).
+  - A release (`release.yml`) starts by hand with a version (checked as Cargo reads versions,
+    set in `Cargo.toml` and `Cargo.lock` on `main`) or from a pushed `v*` tag. The tag is made
+    only when the release is published, so a failed run leaves none behind. It tests the commit
+    unless it already passed CI on `main` (a version-only change counts as the same commit),
+    then builds macOS arm64 (`.dmg`, signed ad hoc), Windows x86_64 (`.zip`) and Linux x86_64
+    and aarch64 on Ubuntu 22.04 (glibc 2.35, which the packages require): `.deb`, `.rpm` and an
+    Arch `.pkg.tar.xz` from one nfpm description, an AppImage (linuxdeploy) and a tarball the
+    release's `PKGBUILD` installs. Asset names carry no version, so `releases/latest/download/…`
+    links stay stable. Release builds keep no Rust cache: a tag's cache can't be restored by any
+    other run.
+  - libwebrtc's link settings (`.cargo/config.toml`, as LiveKit's own): `-ObjC` on macOS (or it
+    aborts at startup), the static C runtime on Windows; on ARM Linux, lld (with clang driving the
+    link in CI). Cargo doesn't pass a dependency's link arguments on, so the app sets them.
+  - Release notes come from the merged pull requests, grouped by label (`.github/release.yml`;
+    the labels are in `.github/labels.yml`). The packaging lives in `packaging/`, runnable
+    locally.
+- **Translations:**
+  - Each **catalog** is flat JSON, `apps/desktop/i18n/app/<locale>.json`, listed in
+    `i18n/locales.json`. English is the source and the fallback.
+  - `build.rs` compiles catalogs in (`rune_i18n::codegen`); `t!`, `tf!` and `tp!` resolve keys
+    at compile time, so a typo fails the build.
+  - Tests fail when German or French lacks an English key.
+  - `Language` is `System` (negotiated from the OS) or a catalog locale, kept in `rune::prefs`:
+    read before the first frame, saved off the UI thread.
+  - Element keys use stable IDs (`Format::id`, `mode_id`), never translated labels.
+  - Numbers go through the locale (`I18N.decimal`).
+  - **Headless** runs and tests use English (`Settings::fixed_english`).
+- **Fonts:** `families` are `("Inter", "ui-monospace")`, so `mono()` text (code, recovery keys,
+  the **backdrop**) uses the system's monospace font; Rune's default put Inter in both slots.
+
+## Consequences
+
+- One command set for every language, cached by Turborepo; its Cargo support is experimental,
+  so an upgrade can change task mapping.
+- One language end to end; views test **headless** (`rune::Runtime`, `--snap`, `--tree`).
+- Rune is pre-release: a bump updates every rev, the patch table and `bun run agent-tools`.
+- Encryption and storage come from an audited codebase; an SDK upgrade touches one crate.
+- Windows builds are checked anywhere; running them needs Windows.
+- A new language is one JSON file and one `locales.json` line; new UI text is a key in all
+  three catalogs.
+- SDK error messages show in English inside translated sentences.
+- Monospace text, the backdrop included, depends on the system's font.

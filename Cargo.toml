@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+# Listed explicitly so non-Rust packages can live under packages/ later.
+members = [
+    "apps/desktop",
+    "packages/matrix-core",
+]
+
+# Turborepo's identity for the Cargo workspace (experimentalCargoWorkspaces).
+[workspace.metadata]
+name = "better-matrix-cargo"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.0.1"
+
+[workspace.dependencies]
+matrix-core = { path = "packages/matrix-core" }
+# bundled-sqlite: one SQLite build on every platform; Windows has no system copy to link.
+matrix-sdk = { version = "0.19.1", features = ["bundled-sqlite", "local-server", "experimental-send-custom-to-device"] }
+matrix-sdk-ui = "0.19.1"
+matrix-sdk-base = "0.19.1"
+eyeball-im = "0.9"
+futures-util = "0.3"
+getrandom = "0.4"
+mime_guess = "2"
+rune = { git = "https://github.com/anomalyco/rune", rev = "384c2991e582418ba529835279c5876ac3915e02" }
+rune-i18n = { git = "https://github.com/anomalyco/rune", rev = "384c2991e582418ba529835279c5876ac3915e02" }
+rune-notify = { git = "https://github.com/anomalyco/rune", rev = "384c2991e582418ba529835279c5876ac3915e02" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync"] }
+# Calls: LiveKit's client over Google's libwebrtc (downloaded prebuilt at build time).
+# glib-main-loop: Wayland screen sharing through the desktop portal and PipeWire.
+livekit = { version = "0.11", default-features = false, features = ["tokio", "rustls-tls-webpki-roots", "glib-main-loop"] }
+# Cameras, without the C JPEG decoder: MJPEG frames decode with zune-jpeg.
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
+zune-jpeg = "0.5"
+zune-core = "0.5"
+base64 = "0.22"
+sha2 = "0.10"
+
+# Rune requires apps to patch the same crates it patches, from the same rev.
+# Keep this table in sync with `[patch.crates-io]` in Rune's root Cargo.toml on every bump.
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "384c2991e582418ba529835279c5876ac3915e02" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "384c2991e582418ba529835279c5876ac3915e02" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "384c2991e582418ba529835279c5876ac3915e02" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "384c2991e582418ba529835279c5876ac3915e02" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies optimised in dev builds too: unoptimised, the account stores' key derivation alone
+# takes seconds at every launch, and image decoding and sync crawl.
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+[profile.release]
+codegen-units = 16
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+redundant_clone = "warn"
+needless_collect = "warn"

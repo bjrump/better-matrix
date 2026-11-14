@@ -1,0 +1,281 @@
+//! SDK types to [`model`](crate::model) values. The only place that knows both.
+
+use matrix_sdk::deserialized_responses::TimelineEvent;
+use matrix_sdk::deserialized_responses::{RawAnySyncOrStrippedTimelineEvent, SyncOrStrippedState};
+use matrix_sdk::media::{MediaFormat, MediaThumbnailSettings};
+use matrix_sdk::notification_settings::{IsEncrypted, IsOneToOne, NotificationSettings, RoomNotificationMode};
+use matrix_sdk::ruma::UInt;
+use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::events::room::message::{FormattedBody, MessageFormat, MessageType, SyncRoomMessageEvent};
+use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent};
+use matrix_sdk::{Room, RoomMemberships};
+
+use crate::Error;
+use crate::model::{
+    AccountId, Attachment, AttachmentKind, HistoryVisibility, MediaRef, MediaSize, Message, MessageContent,
+    Notification, NotificationMode, RoomKind, RoomSummary, SpaceSummary,
+};
+
+async fn display_name(room: &Room) -> String {
+    match room.display_name().await {
+        Ok(name) => name.to_string(),
+        Err(_) => room.room_id().to_string(),
+    }
+}
+
+/// A profile or room picture as media to fetch.
+pub(crate) fn avatar(url: matrix_sdk::ruma::OwnedMxcUri) -> Option<MediaRef> {
+    MediaRef::of(&MediaSource::Plain(url))
+}
+
+/// The picture of the person a direct chat is with, from the room's stored members (no request).
+async fn partner_avatar(room: &Room, partner: Option<&String>) -> Option<MediaRef> {
+    let partner = matrix_sdk::ruma::UserId::parse(partner?).ok()?;
+    let member = room.get_member_no_sync(&partner).await.ok()??;
+    member.avatar_url().map(ToOwned::to_owned).and_then(avatar)
+}
+
+/// A room as the room list shows it. `settings` are the account's push rules, read once for the
+/// whole list: reading them per room cost two store reads each, on every sync.
+pub(crate) async fn room_summary(room: &Room, settings: &NotificationSettings, rtc_service: bool) -> RoomSummary {
+    let name = display_name(room).await;
+    let custom = settings.get_user_defined_room_notification_mode(room.room_id()).await;
+    let mode = match custom {
+        Some(mode) => mode,
+        // The cached encryption state: asking for the latest may go to the server.
+        None => {
+            let encrypted = IsEncrypted::from(room.encryption_state().is_encrypted());
+            let one_to_one = IsOneToOne::from(room.active_members_count() == 2);
+            settings.get_default_room_notification_mode(encrypted, one_to_one).await
+        }
+    };
+    let kind = if room.is_direct().await.unwrap_or(false) { RoomKind::Direct } else { RoomKind::Group };
+    let dm_users: Vec<String> =
+        room.direct_targets().iter().filter_map(|t| t.as_user_id()).map(ToString::to_string).collect();
+    let avatar = match room.avatar_url() {
+        Some(url) => avatar(url),
+        None if kind == RoomKind::Direct => partner_avatar(room, dm_users.first()).await,
+        None => None,
+    };
+    RoomSummary {
+        room_id: room.room_id().to_string(),
+        name,
+        avatar,
+        member_count: room.joined_members_count(),
+        active_member_count: room.active_members_count(),
+        topic: room.topic(),
+        kind,
+        unread: room.num_unread_messages(),
+        mentions: room.num_unread_mentions(),
+        dm_users,
+        history: history_visibility(room.history_visibility_or_default()),
+        notifications: notification_mode(mode),
+        custom_notifications: custom.is_some(),
+        call: room_call(room, kind, rtc_service).await,
+        activity_ms: room.latest_event_timestamp().map(|at| at.get().into()),
+    }
+}
+
+/// How a call would start in the room, and who is in its call now.
+pub(crate) async fn room_call(room: &Room, kind: RoomKind, rtc_service: bool) -> crate::calls::RoomCall {
+    use matrix_sdk::ruma::events::{MessageLikeEventType, StateEventType};
+    let me = room.own_user_id();
+    let power = room.power_levels().await.ok();
+    let may_join = power.as_ref().is_some_and(|power| power.user_can_send_state(me, StateEventType::CallMember));
+    let may_call =
+        power.as_ref().is_some_and(|power| power.user_can_send_message(me, MessageLikeEventType::CallInvite));
+    let one_to_one = kind == RoomKind::Direct && room.active_members_count() == 2 && may_call;
+    crate::calls::RoomCall {
+        via: crate::calls::via(rtc_service, may_join, one_to_one),
+        participants: room.active_room_call_participants().iter().map(ToString::to_string).collect(),
+    }
+}
+
+pub(crate) async fn space_summary(room: &Room) -> SpaceSummary {
+    // A child event with an empty `via` is a removed child.
+    let children = room
+        .get_state_events_static::<SpaceChildEventContent>()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|raw| match raw.deserialize().ok()? {
+            SyncOrStrippedState::Sync(event) => {
+                event.as_original().filter(|e| !e.content.via.is_empty()).map(|e| e.state_key.to_string())
+            }
+            SyncOrStrippedState::Stripped(_) => None,
+        })
+        .collect();
+    // Only what the store holds: the sync loop loads a space's full member list beside it.
+    let members = room
+        .members_no_sync(RoomMemberships::JOIN)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|member| member.user_id().to_string())
+        .collect();
+    let power = room.power_levels().await.ok();
+    let me = room.own_user_id();
+    let may = |event: matrix_sdk::ruma::events::StateEventType| {
+        power.as_ref().is_some_and(|power| power.user_can_send_state(me, event))
+    };
+    SpaceSummary {
+        room_id: room.room_id().to_string(),
+        name: display_name(room).await,
+        avatar: room.avatar_url().and_then(avatar),
+        can_add_rooms: may(matrix_sdk::ruma::events::StateEventType::SpaceChild),
+        can_rename: may(matrix_sdk::ruma::events::StateEventType::RoomName),
+        children,
+        members,
+    }
+}
+
+/// The messages among a room's new timeline events; state and other events are skipped until
+/// the timeline renders them.
+pub(crate) async fn messages(room: &Room, events: &[TimelineEvent]) -> Vec<Message> {
+    let mut messages = Vec::new();
+    for event in events {
+        let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncRoomMessageEvent::Original(event),
+        ))) = event.raw().deserialize()
+        else {
+            continue;
+        };
+        let sender_name = sender_name(room, &event.sender).await;
+        messages.push(Message {
+            event_id: event.event_id.to_string(),
+            sender_id: event.sender.to_string(),
+            sender_name,
+            content: content(&event.content.msgtype),
+            timestamp_ms: u64::from(event.origin_server_ts.0),
+            ..Message::default()
+        });
+    }
+    messages
+}
+
+async fn sender_name(room: &Room, sender: &matrix_sdk::ruma::UserId) -> String {
+    match room.get_member_no_sync(sender).await {
+        Ok(Some(member)) => member.name().to_owned(),
+        _ => sender.to_string(),
+    }
+}
+
+/// A push notification for a room message, if it is one the user should hear about.
+pub(crate) async fn notification(
+    account: &AccountId,
+    room: &Room,
+    notification: &matrix_sdk::sync::Notification,
+) -> Option<Notification> {
+    if !notification.actions.iter().any(|action| action.should_notify()) {
+        return None;
+    }
+    let RawAnySyncOrStrippedTimelineEvent::Sync(raw) = &notification.event else { return None };
+    let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncRoomMessageEvent::Original(
+        event,
+    )))) = raw.deserialize()
+    else {
+        return None;
+    };
+    Some(Notification {
+        account: account.clone(),
+        room_id: room.room_id().to_string(),
+        room_name: display_name(room).await,
+        event_id: event.event_id.to_string(),
+        sender_name: sender_name(room, &event.sender).await,
+        body: content(&event.content.msgtype).plain().to_owned(),
+    })
+}
+
+impl MediaRef {
+    pub(crate) fn of(source: &MediaSource) -> Option<Self> {
+        serde_json::to_string(source).ok().map(Self)
+    }
+}
+
+pub(crate) fn media_source(media: &MediaRef) -> Result<MediaSource, Error> {
+    serde_json::from_str(&media.0).map_err(|e| Error::Storage(e.into()))
+}
+
+pub(crate) fn media_format(size: MediaSize) -> MediaFormat {
+    match size {
+        MediaSize::Original => MediaFormat::File,
+        MediaSize::Thumbnail { width, height } => {
+            MediaFormat::Thumbnail(MediaThumbnailSettings::new(UInt::from(width), UInt::from(height)))
+        }
+    }
+}
+
+pub(crate) fn history_visibility(
+    visibility: matrix_sdk::ruma::events::room::history_visibility::HistoryVisibility,
+) -> HistoryVisibility {
+    use matrix_sdk::ruma::events::room::history_visibility::HistoryVisibility as Sdk;
+    match visibility {
+        Sdk::WorldReadable => HistoryVisibility::WorldReadable,
+        Sdk::Invited => HistoryVisibility::Invited,
+        Sdk::Joined => HistoryVisibility::Joined,
+        _ => HistoryVisibility::Shared,
+    }
+}
+
+pub(crate) fn notification_mode(mode: RoomNotificationMode) -> NotificationMode {
+    match mode {
+        RoomNotificationMode::AllMessages => NotificationMode::AllMessages,
+        RoomNotificationMode::MentionsAndKeywordsOnly => NotificationMode::MentionsOnly,
+        RoomNotificationMode::Mute => NotificationMode::Mute,
+    }
+}
+
+pub(crate) fn room_notification_mode(mode: NotificationMode) -> RoomNotificationMode {
+    match mode {
+        NotificationMode::AllMessages => RoomNotificationMode::AllMessages,
+        NotificationMode::MentionsOnly => RoomNotificationMode::MentionsAndKeywordsOnly,
+        NotificationMode::Mute => RoomNotificationMode::Mute,
+    }
+}
+
+pub(crate) fn content(msgtype: &MessageType) -> MessageContent {
+    let text = |body: &str, formatted: &Option<FormattedBody>| MessageContent::Text {
+        body: body.to_owned(),
+        html: formatted.as_ref().filter(|f| f.format == MessageFormat::Html).map(|f| f.body.clone()),
+    };
+    let attachment = |kind, name: &str, source: &MediaSource, size: Option<UInt>| Attachment {
+        kind,
+        name: name.to_owned(),
+        size: size.map(u64::from),
+        media: MediaRef::of(source),
+        thumbnail: None,
+        dimensions: None,
+    };
+    let dimensions = |w: Option<UInt>, h: Option<UInt>| Some((u32::try_from(w?).ok()?, u32::try_from(h?).ok()?));
+    let thumbnail = |source: Option<&MediaSource>| source.and_then(MediaRef::of);
+    let attachment = match msgtype {
+        MessageType::Text(c) => return text(&c.body, &c.formatted),
+        MessageType::Notice(c) => return text(&c.body, &c.formatted),
+        MessageType::Emote(c) => return text(&format!("* {}", c.body), &None),
+        MessageType::Image(c) => {
+            let info = c.info.as_deref();
+            Attachment {
+                thumbnail: thumbnail(info.and_then(|i| i.thumbnail_source.as_ref())),
+                dimensions: info.and_then(|i| dimensions(i.width, i.height)),
+                ..attachment(AttachmentKind::Image, c.filename(), &c.source, info.and_then(|i| i.size))
+            }
+        }
+        MessageType::Video(c) => {
+            let info = c.info.as_deref();
+            Attachment {
+                thumbnail: thumbnail(info.and_then(|i| i.thumbnail_source.as_ref())),
+                dimensions: info.and_then(|i| dimensions(i.width, i.height)),
+                ..attachment(AttachmentKind::Video, c.filename(), &c.source, info.and_then(|i| i.size))
+            }
+        }
+        MessageType::Audio(c) => {
+            attachment(AttachmentKind::Audio, c.filename(), &c.source, c.info.as_deref().and_then(|i| i.size))
+        }
+        MessageType::File(c) => {
+            attachment(AttachmentKind::File, c.filename(), &c.source, c.info.as_deref().and_then(|i| i.size))
+        }
+        other => return MessageContent::Text { body: other.body().to_owned(), html: None },
+    };
+    MessageContent::Attachment(attachment)
+}
