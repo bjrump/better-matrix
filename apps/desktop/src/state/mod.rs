@@ -57,7 +57,7 @@ pub use poll::{MAX_ANSWERS, PollForm};
 pub use preview::{DocumentStatus, ImageStatus, Opens, Preview, PreviewContent, render_document};
 pub use profile::{ContactStep, ProfileForm};
 pub use room_discovery::Directory;
-pub use search::{PeopleSearch, SEARCH_PAUSE, matches};
+pub use search::{MessageSearchStatus, PeopleSearch, SEARCH_PAUSE, matches};
 pub use sections::{DIRECT, INVITATIONS, ROOMS, SectionView, is_builtin, ordered_spaces, sections};
 pub use settings::{Appearance, Settings, SettingsSection, Zoom};
 pub use sign_in::{SignInForm, SignInStep};
@@ -466,6 +466,8 @@ enum Purpose {
     },
     /// Reading a room's threads or files for its side panel.
     SidePanel(AccountId, String, SidePanel),
+    /// A local message search.
+    MessageSearch,
     /// A user-directory search; failures leave the results as they were.
     People,
     /// Inviting someone.
@@ -527,6 +529,8 @@ pub struct Nav {
     /// The thread open beside the room, by its root event, per account.
     threads: HashMap<AccountId, String>,
     pub adding_account: bool,
+    /// The shown room whose visit has been recorded, independent of subscription retries.
+    visited: Option<(AccountId, String)>,
 }
 
 #[derive(Debug)]
@@ -545,6 +549,7 @@ pub struct State {
     pub preview: Option<Preview>,
     /// The top bar's search.
     pub search: PeopleSearch,
+    pub message_jump: Option<search::MessageJump>,
     /// The invite dialog's search.
     pub invite_search: PeopleSearch,
     /// The new-chat search.
@@ -652,6 +657,7 @@ impl State {
             restoring: Vec::new(),
             preview: None,
             search: PeopleSearch::default(),
+            message_jump: None,
             invite_search: PeopleSearch::default(),
             chat_search: PeopleSearch::default(),
             audio: None,
@@ -892,6 +898,7 @@ impl State {
                 self.nav.rooms.remove(&id);
                 self.nav.scopes.remove(&id);
                 if self.nav.account.as_ref() == Some(&id) {
+                    self.reset_search();
                     self.nav.account = self.accounts.iter().next().map(|account| account.summary.id.clone());
                 }
                 self.open_timelines.retain(|(account, _)| *account != id);
@@ -1064,6 +1071,10 @@ impl State {
             }
             Event::MembersInvalidated { account, room_id } => {
                 self.invalidate_members(&account, &room_id);
+            }
+            Event::SearchUsage { account, usage } => self.accounts.set_search_usage(&account, usage),
+            Event::MessagesFound { request, messages } => {
+                self.search.messages_found(request, messages);
             }
             Event::PeopleFound { request, people } => {
                 self.link_person_found(request, &people);
@@ -1398,6 +1409,7 @@ impl State {
     }
 
     fn finish(&mut self, request: RequestId, result: Result<(), String>) {
+        self.search.finished(request, result.is_err());
         self.receipts.finished(request, result.is_ok(), std::time::Instant::now());
         let Some(purpose) = self.pending.remove(&request) else { return };
         let Err(error) = result else {
@@ -1528,7 +1540,12 @@ impl State {
                 self.link_previews.failed(key, std::time::Instant::now());
                 self.schedule_retry();
             }
-            Purpose::Members { .. } | Purpose::People | Purpose::Read | Purpose::Typing | Purpose::CallVideo => {}
+            Purpose::Members { .. }
+            | Purpose::MessageSearch
+            | Purpose::People
+            | Purpose::Read
+            | Purpose::Typing
+            | Purpose::CallVideo => {}
             Purpose::Call => self.notice = Some(tf!("call.failed", error = error)),
             Purpose::Layout(account) => {
                 self.notice = Some(tf!("notice.layout", error = error));
@@ -1566,6 +1583,13 @@ impl State {
             shown.push((account.clone(), TimelineKey::room(room_id)));
             if let Some(root) = self.active_thread() {
                 shown.push((account.clone(), TimelineKey::thread(room_id, root)));
+            }
+        }
+        let visiting = shown.first().map(|(account, key)| (account.clone(), key.room_id.clone()));
+        if self.nav.visited != visiting {
+            self.nav.visited = visiting.clone();
+            if let Some((account, room_id)) = visiting {
+                self.engine.send(Command::VisitRoom { account, room_id });
             }
         }
         if self.open_timelines.first() != shown.first() {
@@ -1690,6 +1714,7 @@ impl State {
         changed |= self.call.as_mut().is_some_and(Call::measure_videos);
         self.retry_due(now, tx);
         changed |= self.search_people(now);
+        changed |= self.position_message(tx);
         // Searches go out for the active account; with none, nothing waits.
         if let Some(wait) = [&self.search, &self.invite_search, &self.chat_search]
             .iter()
@@ -1862,6 +1887,9 @@ impl State {
     }
 
     fn mark_timeline_read(&mut self, account: AccountId, key: TimelineKey) {
+        if self.message_jump.is_some() {
+            return;
+        }
         if !self.timelines_ready.contains(&(account.clone(), key.clone())) {
             return;
         }
@@ -2383,7 +2411,17 @@ impl State {
     pub fn search_people(&mut self, now: std::time::Instant) -> bool {
         let Some(account) = self.nav.account.clone() else { return false };
         let popover = self.popover.clone();
-        if let Some(term) = self.search.due(now) {
+        let previous = self.search.message_request();
+        let due = self.search.due(now);
+        if let Some(request) = previous
+            && previous != self.search.message_request()
+        {
+            self.engine.send(Command::Cancel(request));
+        }
+        if let Some(term) = due {
+            let messages = Command::SearchMessages { account: account.clone(), term: term.clone() };
+            self.search.message_status =
+                MessageSearchStatus::Searching(self.dispatch(messages, Purpose::MessageSearch));
             let command = Command::SearchPeople { account: account.clone(), term };
             self.search.request = Some(self.dispatch(command, Purpose::People));
             self.popover = Some(Popover::Search);
@@ -2431,7 +2469,7 @@ impl State {
     pub fn open_direct_chat(&mut self, user_id: &str) {
         let Some(account) = self.nav.account.clone() else { return };
         self.popover = None;
-        self.search = PeopleSearch::default();
+        self.reset_search();
         self.chat_search = PeopleSearch::default();
         let purpose = Purpose::DirectChat(account.clone());
         self.dispatch(Command::OpenDirectChat { account, user_id: user_id.to_owned() }, purpose);
@@ -2441,14 +2479,14 @@ impl State {
     pub fn open_found_room(&mut self, room_id: &str) {
         let Some(account) = self.nav.account.clone() else { return };
         self.popover = None;
-        self.search = PeopleSearch::default();
+        self.reset_search();
         self.open_room(&account, room_id);
     }
 
     /// A space picked in the top bar's search.
     pub fn open_found_space(&mut self, space_id: &str) {
         self.popover = None;
-        self.search = PeopleSearch::default();
+        self.reset_search();
         self.select_scope(Scope::Space(space_id.to_owned()));
     }
 
@@ -2558,6 +2596,9 @@ impl State {
 
     pub fn select_account(&mut self, id: &AccountId) {
         if self.accounts.get(id).is_some() {
+            if self.nav.account.as_ref() != Some(id) {
+                self.reset_search();
+            }
             self.nav.account = Some(id.clone());
             self.nav.adding_account = false;
             self.sync_timeline();
