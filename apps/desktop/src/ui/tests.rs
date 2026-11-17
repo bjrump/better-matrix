@@ -3,7 +3,7 @@ use rune::{Env, Runtime};
 
 use crate::{
     demo,
-    state::{SettingsSection, State},
+    state::{SettingsSection, SidePanel, State},
 };
 
 fn runtime(scene: impl FnOnce(&mut State)) -> Runtime<State> {
@@ -364,4 +364,90 @@ fn a_message_hit_should_scroll_an_offscreen_row_into_view() {
     let viewport = rt.presented("timeline").unwrap().0;
     let row = rt.presented("msg-search-row-0").expect("the matching row should be mounted").0;
     assert!(row[1] + row[3] > viewport[1] && row[1] < viewport[1] + viewport[3]);
+}
+
+#[test]
+fn right_clicking_message_text_should_open_the_full_message_menu() {
+    let mut rt = runtime(|s| {
+        demo::pinned_messages(s);
+    });
+    rt.update(|_, tx| tx.scroll_into_view_in("timeline", format!("text-{}", demo::DEMO_THREAD.1)));
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    let (x, y) = rt.find(&format!("text-{}", demo::DEMO_THREAD.1)).expect("message text");
+    rt.secondary_down(x, y);
+    rt.secondary_up(x, y);
+    rt.frame(0.1);
+    assert!(
+        matches!(rt.state.popover, Some(crate::state::Popover::MessageMenu { .. })),
+        "secondary press at {x}, {y}: {:?}",
+        rt.state.popover
+    );
+    assert!(rt.find("message-copy-link").is_some());
+    assert!(rt.find("message-forward").is_some());
+    assert!(rt.find("message-pin").is_some());
+    assert!(rt.find("message-edit").is_none());
+}
+
+#[test]
+fn room_info_should_open_the_shared_pinned_messages() {
+    let mut rt = runtime(|s| {
+        demo::pinned_messages(s);
+        s.show_side(SidePanel::Info);
+    });
+    press(&mut rt, "info-pins");
+    assert!(rt.find("pins-panel").is_some());
+    assert!(rt.find(&format!("pinned-open-{}", demo::DEMO_THREAD.1)).is_some());
+}
+
+#[test]
+fn opening_a_pin_should_jump_to_its_message_in_the_conversation() {
+    let mut rt = runtime(|s| {
+        demo::pinned_messages(s);
+        s.show_side(SidePanel::Pins);
+    });
+    press(&mut rt, &format!("pinned-open-{}", demo::DEMO_THREAD.1));
+    assert_eq!(rt.state.active_room_id(), Some(demo::DEMO_THREAD.0));
+    assert_eq!(rt.state.active_thread(), None);
+    assert!(rt.state.side.is_none());
+}
+
+#[test]
+fn right_clicking_formatted_message_text_should_open_message_actions() {
+    let mut rt = runtime(|s| {
+        demo::seed(s);
+        s.select_room(demo::DEMO_THREAD.0);
+    });
+    let id = "$demo-@alan:example.org-2";
+    rt.update(|_, tx| tx.scroll_into_view_in("timeline", format!("rich-{id}")));
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    let (x, y) = rt.find(&format!("rich-{id}-0")).expect("formatted paragraph");
+    rt.secondary_down(x, y);
+    rt.secondary_up(x, y);
+    rt.frame(0.1);
+    assert!(rt.find("message-copy-link").is_some());
+}
+
+#[test]
+fn the_unpin_icon_should_not_open_the_message() {
+    let mut rt = runtime(|s| {
+        demo::pinned_messages(s);
+        s.show_side(SidePanel::Pins);
+    });
+    press(&mut rt, &format!("pinned-unpin-{}", demo::DEMO_THREAD.1));
+    assert_eq!(rt.state.side, Some(SidePanel::Pins));
+    assert!(rt.state.message_jump.is_none());
+}
+
+#[test]
+fn forwarding_should_separate_rooms_and_direct_messages() {
+    let rt = runtime(|s| {
+        s.start_forward(TimelineKey::room(demo::DEMO_THREAD.0), demo::DEMO_THREAD.1.into());
+    });
+    let rooms = rt.find("forward-rooms").expect("rooms section");
+    let direct = rt.find("forward-direct").expect("direct messages section");
+    assert!(rooms.1 < direct.1);
 }

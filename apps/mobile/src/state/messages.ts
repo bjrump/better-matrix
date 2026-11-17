@@ -3,6 +3,7 @@
 // votes, call cards' status, image preview sizes, which actions the user has on it.
 
 import { draftOf } from './format';
+import { matches } from './people';
 import type {
   AccountId,
   Attachment,
@@ -100,6 +101,10 @@ export function isLocal(message: Message): boolean {
 
 /** What the user may do with a message, as the desktop's toolbar and menu offer it. */
 export interface MessageActions {
+  forward: boolean;
+  link: boolean;
+  pin: boolean;
+  translate: boolean;
   react: boolean;
   reply: boolean;
   thread: boolean;
@@ -115,23 +120,39 @@ export function messageActions(
   message: Message,
   account: AccountId,
   inThread: boolean,
+  canPin = false,
 ): MessageActions {
   const own = message.sender_id === account;
   const content = message.content;
   const sent = !isLocal(message);
-  const readable = content.type !== 'Redacted' && content.type !== 'Undecryptable';
+
+  const readable =
+    content.type !== 'Call' && content.type !== 'Redacted' && content.type !== 'Undecryptable';
 
   return {
+    forward: sent && (content.type === 'Text' || content.type === 'Attachment'),
+    link: sent && content.type !== 'Call',
+    pin: sent && readable && canPin,
+    translate: content.type === 'Text' && messageText(message) !== '',
     // A call's card takes no reactions: the timeline keeps none on it.
-    react: sent && readable && content.type !== 'Call',
+    react: sent && readable,
     reply: sent && readable,
     thread: sent && readable && !inThread,
     copy: messageText(message) !== null,
-    edit: sent && message.editable,
+    edit: sent && own && message.editable,
     delete: sent && own && content.type !== 'Redacted',
     endPoll: sent && own && content.type === 'Poll' && !content.data.ended,
     file: content.type === 'Attachment' && content.data.media !== null,
   };
+}
+
+/** Forwarding destinations follow the sidebar: rooms first, then direct messages. */
+export function forwardSections(rooms: readonly RoomSummary[], query: string) {
+  return (['Group', 'Direct'] as const).flatMap((kind) => {
+    const data = rooms.filter((room) => room.kind === kind && matches(room.name, query));
+
+    return data.length > 0 ? [{ kind, data }] : [];
+  });
 }
 
 /** The message with this event ID among `entries`. */

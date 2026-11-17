@@ -5,7 +5,7 @@
 use matrix_core::{AttachmentKind, RoomKind, RoomSummary};
 use rune::{El, ScrollSpec, col, el, icon, row, text};
 
-use super::components::{divider, icon_button, media_avatar};
+use super::components::{ButtonKind, button, divider, icon_button, media_avatar};
 use super::icons;
 use super::theme::{Palette, font};
 use crate::i18n::{t, tp};
@@ -106,6 +106,10 @@ pub fn overview(s: &State, room: &RoomSummary, p: &Palette) -> El {
         .child(
             link_row(&icons::THREAD, t!("info.threads"), None, "info-threads", p)
                 .on_press(|s: &mut State| s.show_side(SidePanel::Threads)),
+        )
+        .child(
+            link_row(&icons::PIN, t!("info.pins"), Some(room.pinned.len().to_string()), "info-pins", p)
+                .on_press(|s: &mut State| s.show_side(SidePanel::Pins)),
         )
         .child(
             link_row(&icons::FILE, t!("info.files"), None, "info-files", p)
@@ -212,4 +216,89 @@ pub fn files(account: &AccountData, room: &RoomSummary, p: &Palette) -> El {
         }),
     };
     frame("files-panel", t!("info.files"), list, None, p)
+}
+
+/// Shared pins, independent of how far the room's timeline has been paged.
+pub fn pins(s: &State, account: &AccountData, room: &RoomSummary, p: &Palette) -> El {
+    let mut list = col().w_full().py(8.0);
+    if let Some(error) = account.pin_errors.get(&room.room_id) {
+        list = list.child(
+            col()
+                .w_full()
+                .px(16.0)
+                .py(12.0)
+                .gap(8.0)
+                .child(text(error.clone()).font(font::BODY).color(p.danger).wrap())
+                .child(
+                    button(t!("info.pins_retry"), ButtonKind::Secondary, true, p)
+                        .key("pins-retry")
+                        .on_press(|s: &mut State| s.show_side(SidePanel::Pins)),
+                ),
+        );
+    }
+    match account.pins.get(&room.room_id) {
+        None if account.pin_errors.contains_key(&room.room_id) => {}
+        None => list = list.child(text(t!("info.loading")).font(font::BODY).color(p.text_muted).px(16.0).py(12.0)),
+        Some(pins) => {
+            if room.pinned.is_empty() {
+                list =
+                    list.child(text(t!("info.no_pins")).font(font::BODY).color(p.text_muted).px(16.0).py(12.0).wrap());
+            }
+            for pin in pins.iter().filter(|pin| room.pinned.contains(&pin.event_id)) {
+                let destination =
+                    matrix_core::TimelineKey { room_id: room.room_id.clone(), thread: pin.thread.clone() };
+                let event_id = pin.event_id.clone();
+                let (key, id) = (matrix_core::TimelineKey::room(&room.room_id), pin.event_id.clone());
+                let mut header =
+                    row().w_full().min_h(28.0).gap(4.0).center_y().child(
+                        text(pin.sender_name.clone()).font(font::BODY_STRONG).color(p.text).grow(1.0).truncate(),
+                    );
+                if room.can_pin {
+                    header = header.child(
+                        icon_button(&icons::UNPIN, t!("actions.unpin"), false, p.text_muted, p)
+                            .key(format!("pinned-unpin-{}", pin.event_id))
+                            .help(t!("actions.unpin"))
+                            .on_press(move |s: &mut State| s.set_message_pinned(&key, &id, false)),
+                    );
+                }
+                let mut body = col().grow(1.0).min_w(0.0).gap(3.0).child(header).child(
+                    text(pin.body.clone().unwrap_or_else(|| t!("message.unavailable").to_owned()))
+                        .font(font::BODY)
+                        .color(if pin.body.is_some() { p.text } else { p.text_muted })
+                        .max_lines(4)
+                        .wrap(),
+                );
+                if let Some(at) = pin.timestamp_ms {
+                    body = body.child(text(when(at)).font(font::META).color(p.text_muted));
+                }
+                let mut message = row()
+                    .key(format!("pinned-open-{}", pin.event_id))
+                    .w_full()
+                    .px(16.0)
+                    .py(10.0)
+                    .gap(10.0)
+                    .items_start()
+                    .border_sides([0.0, 0.0, 1.0, 0.0], p.divider)
+                    .child(
+                        media_avatar(&pin.sender_id, &pin.sender_name, pin.sender_avatar.as_ref(), &s.media, 32.0)
+                            .mt(3.0),
+                    )
+                    .child(body);
+                if pin.body.is_some() {
+                    message = message
+                        .role("button")
+                        .label(t!("message.open"))
+                        .focusable(true)
+                        .cursor(rune::Cursor::Pointer)
+                        .hover(p.hover)
+                        .on_press(move |s: &mut State| {
+                            s.side = None;
+                            s.open_message(&destination, &event_id);
+                        });
+                }
+                list = list.child(message);
+            }
+        }
+    }
+    frame("pins-panel", t!("info.pins"), list, None, p)
 }

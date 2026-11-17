@@ -225,6 +225,13 @@ fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str
     head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
 }
 
+/// A shareable message link, with a joined member's server as a routing hint (also for v12 IDs).
+pub fn message_link(room_id: &str, event_id: &str, account: &str) -> String {
+    let encode = |text: &str| url::form_urlencoded::byte_serialize(text.as_bytes()).collect::<String>();
+    let via = account.split_once(':').map(|(_, server)| format!("?via={}", encode(server))).unwrap_or_default();
+    format!("https://matrix.to/#/{}/{}{via}", encode(room_id), encode(event_id))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -245,6 +252,26 @@ mod tests {
             LinkAction::Chat => "chat",
         });
         json!({ "kind": kind, "id": id, "event": event, "via": link.via, "action": action })
+    }
+
+    #[test]
+    fn message_links_should_match_the_shared_mobile_vectors() {
+        let vectors: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("message_links.json")).expect("vectors");
+        for vector in vectors {
+            assert_eq!(
+                message_link(
+                    vector["room"].as_str().unwrap(),
+                    vector["event"].as_str().unwrap(),
+                    vector["account"].as_str().unwrap()
+                ),
+                vector["link"]
+            );
+            assert_eq!(
+                crate::links::translation_url(vector["body"].as_str().unwrap(), vector["language"].as_str().unwrap()),
+                vector["translation"]
+            );
+        }
     }
 
     #[test]

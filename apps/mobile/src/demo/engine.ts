@@ -10,10 +10,12 @@ import type {
   MessageContent,
   MessageHit,
   Outgoing,
+  RoomList,
   RequestId,
   RoomPreview,
 } from '@better-matrix/matrix-native/types';
 
+import { messageText } from '../state/messages';
 import { fuzzyMatch } from '../state/search';
 import {
   DEMO_DAY_MS,
@@ -24,6 +26,7 @@ import {
   demoThreads,
   seedEvents,
   GENERAL,
+  DEMO_THREAD,
   GRACE,
   KAI,
 } from './fixtures';
@@ -61,6 +64,30 @@ export function answer(
             account: command.data.account,
             room_id: command.data.room_id,
             members: demoMembers(),
+          },
+        },
+      ];
+    case 'ListPinnedMessages':
+      return [
+        {
+          type: 'PinnedMessages',
+          data: {
+            account: command.data.account,
+            room_id: command.data.room_id,
+            messages:
+              command.data.room_id === GENERAL
+                ? [
+                    {
+                      event_id: DEMO_THREAD.root,
+                      sender_name: 'Alan Turing',
+                      sender_id: '@alan:example.org',
+                      sender_avatar: null,
+                      timestamp_ms: DEMO_DAY_MS + 11 * 3_600_000 + 15 * 60_000,
+                      body: 'Cross-signing verification passes on Linux, macOS and Windows.',
+                      thread: null,
+                    },
+                  ]
+                : [],
           },
         },
       ];
@@ -300,6 +327,29 @@ function sentContent(message: Outgoing): MessageContent | null {
   }
 }
 
+/** A source message and its containing thread, from the shared demo fixtures. */
+function demoMessage(account: string, roomId: string, eventId: string) {
+  for (const event of seedEvents()) {
+    if (
+      event.type !== 'TimelineChanged' ||
+      event.data.account !== account ||
+      event.data.key.room_id !== roomId
+    )
+      continue;
+
+    for (const diff of event.data.diffs) {
+      if (diff.type !== 'Reset') continue;
+
+      for (const entry of diff.data) {
+        if (entry.kind.type === 'Message' && entry.kind.data.event_id === eventId)
+          return { message: entry.kind.data, thread: event.data.key.thread };
+      }
+    }
+  }
+
+  return null;
+}
+
 /** Starts a demo engine. `resolveMedia` serves the demo's own media refs. */
 export function demoEngine(resolveMedia: MediaResolver): Engine {
   let next = 1;
@@ -316,6 +366,11 @@ export function demoEngine(resolveMedia: MediaResolver): Engine {
     },
   });
 
+  const lists = new Map<string, RoomList>();
+  engine.subscribe((event) => {
+    if (event.type === 'RoomsUpdated') lists.set(event.data.account, event.data.list);
+  });
+
   const finish = (request: RequestId, error?: string) =>
     engine.emit({
       type: 'Finished',
@@ -323,6 +378,99 @@ export function demoEngine(resolveMedia: MediaResolver): Engine {
     });
 
   async function respond(command: Command, request: RequestId) {
+    if (command.type === 'ListPinnedMessages') {
+      const { account, room_id: roomId } = command.data;
+      const pins = lists.get(account)?.rooms.find((r) => r.room_id === roomId)?.pinned ?? [];
+
+      const messages = pins.map((eventId) => {
+        const source = demoMessage(account, roomId, eventId);
+
+        return {
+          event_id: eventId,
+          sender_name: source?.message.sender_name ?? '',
+          sender_id: source?.message.sender_id ?? '',
+          sender_avatar: source?.message.sender_avatar ?? null,
+          timestamp_ms: source?.message.timestamp_ms ?? null,
+          body: source ? messageText(source.message) : null,
+          thread: source?.thread ?? null,
+        };
+      });
+
+      engine.emit({ type: 'PinnedMessages', data: { account, room_id: roomId, messages } });
+      finish(request);
+
+      return;
+    }
+
+    if (command.type === 'SetPinned') {
+      const { account, room_id: roomId, event_id: eventId, pinned } = command.data;
+      const list = lists.get(account);
+
+      if (list)
+        engine.emit({
+          type: 'RoomsUpdated',
+          data: {
+            account,
+            list: {
+              ...list,
+              rooms: list.rooms.map((r) =>
+                r.room_id === roomId
+                  ? {
+                      ...r,
+                      pinned: pinned
+                        ? [...new Set([...r.pinned, eventId])]
+                        : r.pinned.filter((id) => id !== eventId),
+                    }
+                  : r,
+              ),
+            },
+          },
+        });
+      finish(request);
+
+      return;
+    }
+
+    if (command.type === 'Forward') {
+      const { account, key, event_id: eventId, room_id: roomId } = command.data;
+
+      const source = demoMessage(account, key.room_id, eventId);
+
+      if (!source) {
+        finish(request, 'message unavailable');
+
+        return;
+      }
+
+      const message = {
+        ...source.message,
+        event_id: `$forward-${request}`,
+        sender_id: account,
+        sender_name: 'Ada Lovelace',
+        reply_to: null,
+        thread: null,
+        reactions: [],
+        editable: source.message.content.type === 'Text',
+      };
+
+      engine.emit({
+        type: 'TimelineChanged',
+        data: {
+          account,
+          key: { room_id: roomId, thread: null },
+          diffs: [
+            {
+              type: 'PushBack',
+              data: { id: message.event_id, kind: { type: 'Message', data: message } },
+            },
+          ],
+        },
+      });
+      finish(request);
+
+      return;
+    }
+
     if (command.type === 'FetchMedia') {
       const path = await resolveMedia(command.data.media).catch(() => null);
 

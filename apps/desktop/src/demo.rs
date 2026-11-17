@@ -512,6 +512,8 @@ fn room(id: &str, name: &str, topic: Option<&str>, unread: u64, mentions: u64) -
         activity_ms: None,
         encrypted: true,
         can_rename: true,
+        pinned: Vec::new(),
+        can_pin: true,
     }
 }
 
@@ -828,4 +830,35 @@ pub fn search(s: &mut State) {
     s.search.messages = hits.into_iter().take(30).map(|(_, hit)| hit).collect();
     s.search.message_status = crate::state::MessageSearchStatus::Ready;
     s.search.request = None;
+}
+
+/// Pinned messages with both a timeline marker and a shared preview list.
+pub fn pinned_messages(s: &mut State) {
+    seed(s);
+    let account = AccountId::new(ADA);
+    let Some(data) = s.accounts.get(&account) else { return };
+    let ids = [DEMO_THREAD.1, "$demo-@alan:example.org-2"];
+    let pins = data
+        .timeline(&TimelineKey::room(DEMO_THREAD.0))
+        .into_iter()
+        .flat_map(|timeline| &timeline.entries)
+        .filter_map(|entry| entry.message())
+        .filter(|message| ids.contains(&message.event_id.as_str()))
+        .map(|message| matrix_core::PinnedMessage {
+            event_id: message.event_id.clone(),
+            sender_name: message.sender_name.clone(),
+            sender_id: message.sender_id.clone(),
+            sender_avatar: message.sender_avatar.clone(),
+            timestamp_ms: Some(message.timestamp_ms),
+            body: Some(message.content.plain().to_owned()),
+            thread: None,
+        })
+        .collect();
+    let (mut rooms, spaces) = (data.rooms.clone(), data.spaces.clone());
+    if let Some(room) = rooms.iter_mut().find(|r| r.room_id == DEMO_THREAD.0) {
+        room.pinned = ids.iter().map(|id| (*id).to_owned()).collect();
+    }
+    s.accounts.set_room_list(&account, matrix_core::RoomList { rooms, spaces, invitations: Vec::new() });
+    s.accounts.set_pins(&account, DEMO_THREAD.0.into(), pins);
+    s.select_room(DEMO_THREAD.0);
 }
