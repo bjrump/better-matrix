@@ -48,6 +48,7 @@ pub use calls::{
 pub use discovery::{Homeserver, SignInInput};
 pub use engine::{
     Command, DetachedCommands, Engine, EngineConfig, EngineHandle, EngineStopped, Event, EventSink, RequestId,
+    StoreSharing,
 };
 pub use model::{
     AccountId, AccountSummary, Attachment, AttachmentKind, CallCard, EntryKind, HistoryVisibility, Invitation,

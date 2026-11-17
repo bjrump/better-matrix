@@ -2584,6 +2584,26 @@ fn the_backdrop_should_rest_while_the_window_is_in_the_background() {
 }
 
 #[test]
+fn the_selected_tile_should_stop_breathing_in_an_idle_window() {
+    let (mut s, _) = state();
+    with_rooms(&mut s, &AccountId::new("@a:example.org"), &["!one:x"], Vec::new());
+    s.animate(0.0, &mut Tx::default());
+    assert!(s.animate(60.0, &mut Tx::default()), "coming to rest changes the view");
+    assert!(!s.breath.breathing());
+}
+
+#[test]
+fn choosing_a_scope_should_make_the_selected_tile_breathe_again() {
+    let (mut s, _) = state();
+    with_rooms(&mut s, &AccountId::new("@a:example.org"), &["!one:x"], Vec::new());
+    s.animate(0.0, &mut Tx::default());
+    s.animate(60.0, &mut Tx::default());
+    s.select_scope(Scope::Home);
+    s.animate(61.0, &mut Tx::default());
+    assert!(s.breath.breathing());
+}
+
+#[test]
 fn an_account_suspended_and_put_off_should_stay_listed() {
     let (mut s, _) = state();
     let id = AccountId::new("@a:example.org");
@@ -3907,4 +3927,83 @@ fn directory_results_should_request_their_avatar_as_soon_as_they_arrive() {
     assert!(all_commands(&mut commands).iter().any(|command| matches!(command,
         Command::FetchMedia { account: owner, media, size } if owner == &account && media == &avatar && size == &AVATAR_SIZE
     )));
+}
+
+fn read_member(id: &str, name: &str) -> matrix_core::RoomMember {
+    matrix_core::RoomMember {
+        person: matrix_core::Person { id: id.into(), name: name.into(), avatar: None },
+        role: matrix_core::MemberRole::Member,
+        presence: matrix_core::Presence::Unknown,
+        verified: false,
+        level: 0,
+    }
+}
+
+fn post(s: &mut State, account: &AccountId, event_id: &str, sender: &str, name: &str) {
+    let message = matrix_core::Message {
+        event_id: event_id.into(),
+        sender_id: sender.into(),
+        sender_name: name.into(),
+        ..matrix_core::Message::default()
+    };
+    apply(
+        s,
+        Event::TimelineChanged {
+            account: account.clone(),
+            key: TimelineKey::room("!one:x"),
+            diffs: vec![matrix_core::TimelineDiff::PushBack(matrix_core::TimelineEntry {
+                id: event_id.into(),
+                kind: matrix_core::EntryKind::Message(Box::new(message)),
+            })],
+        },
+    );
+}
+
+#[test]
+fn a_reader_should_take_the_name_the_room_members_give_them() {
+    let (mut s, _) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x"], Vec::new());
+    post(&mut s, &id, "$1", "@b:x", "Bea from a message");
+    let members =
+        matrix_core::Members { people: vec![read_member("@b:x", "Bea")], complete: true, ..Default::default() };
+    apply(&mut s, Event::Members { request: None, account: id.clone(), room_id: "!one:x".into(), members });
+    assert_eq!(s.accounts.get(&id).unwrap().reader("!one:x", "@b:x").name, "Bea");
+}
+
+#[test]
+fn a_newer_member_list_should_rename_its_readers() {
+    let (mut s, _) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x"], Vec::new());
+    for name in ["Bea", "Beatrice"] {
+        let members = matrix_core::Members {
+            people: vec![read_member("@c:x", "Cy"), read_member("@b:x", name)],
+            complete: true,
+            ..Default::default()
+        };
+        apply(&mut s, Event::Members { request: None, account: id.clone(), room_id: "!one:x".into(), members });
+    }
+    assert_eq!(s.accounts.get(&id).unwrap().reader("!one:x", "@b:x").name, "Beatrice");
+}
+
+#[test]
+fn a_reader_outside_the_members_should_take_their_newest_message_name() {
+    let (mut s, _) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x"], Vec::new());
+    s.select_room("!one:x");
+    post(&mut s, &id, "$1", "@b:x", "Bea");
+    assert_eq!(s.accounts.get(&id).unwrap().reader("!one:x", "@b:x").name, "Bea");
+    post(&mut s, &id, "$2", "@b:x", "Beatrice");
+    assert_eq!(s.accounts.get(&id).unwrap().reader("!one:x", "@b:x").name, "Beatrice");
+}
+
+#[test]
+fn a_reader_the_room_knows_nothing_about_should_go_by_their_user_id() {
+    let (mut s, _) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x"], Vec::new());
+    post(&mut s, &id, "$1", "@b:x", "Bea");
+    assert_eq!(s.accounts.get(&id).unwrap().reader("!one:x", "@z:x").name, "@z:x");
 }
