@@ -33,6 +33,7 @@ mod search;
 mod sections;
 mod settings;
 mod sign_in;
+mod status_message;
 mod typing;
 mod updates;
 mod water;
@@ -70,6 +71,7 @@ pub use search::{PeopleSearch, SEARCH_PAUSE, SearchFilter, SearchStatus, matches
 pub use sections::{DIRECT, INVITATIONS, ROOMS, SectionView, is_builtin, ordered_spaces, sections};
 pub use settings::{Appearance, Settings, SettingsSection, Zoom};
 pub use sign_in::{SignInForm, SignInStep};
+pub use status_message::{leading_emoji, suggestions as status_suggestions};
 pub use updates::Update;
 pub use water::WATER_HEIGHT;
 
@@ -275,6 +277,8 @@ pub enum EmojiFor {
     Reaction { key: TimelineKey, event_id: String },
     /// The draft in a composer, at its caret.
     Composer(ComposerTarget),
+    /// The status message being written in the account menu, which it starts.
+    StatusMessage,
 }
 
 /// A dialog over the whole window, with the rest dimmed. At most one is open; new kinds are new
@@ -483,6 +487,11 @@ enum Purpose {
         account: AccountId,
         chosen: matrix_core::Status,
     },
+    /// Setting the user's status message; once the latest one set finishes, the message shows as
+    /// the engine reports it.
+    StatusMessage {
+        account: AccountId,
+    },
     Leave,
     Recover,
     RecoveryKey,
@@ -643,6 +652,10 @@ pub struct State {
     pub modal: Option<Modal>,
     /// What the emoji picker searches for.
     pub emoji_search: TextEdit,
+    /// The account whose status message is being written in the account menu, while one is.
+    pub status_draft: Option<AccountId>,
+    /// The status message being written.
+    pub status_edit: TextEdit,
     /// The poll being written, while [`Modal::Poll`] shows.
     pub poll_form: PollForm,
     /// Edits set aside: refused by the server, or left by navigating away. Each comes back into
@@ -737,6 +750,8 @@ impl State {
             popover: None,
             modal: None,
             emoji_search: TextEdit::default(),
+            status_draft: None,
+            status_edit: TextEdit::default(),
             poll_form: PollForm::default(),
             set_aside: Vec::new(),
             side: None,
@@ -1139,6 +1154,7 @@ impl State {
             Event::Sessions { account, sessions } => self.accounts.set_sessions(&account, sessions),
             Event::ContactDetails { account, contacts } => self.accounts.set_contacts(&account, contacts),
             Event::Status { account, status } => self.accounts.status_saved(&account, status),
+            Event::Presence { account, people } => self.accounts.set_presence(&account, people),
             Event::SidebarLayout { account, layout } => {
                 let newer = self
                     .accounts
@@ -1529,6 +1545,9 @@ impl State {
                     }
                 }
                 Purpose::ProfileName => self.profile.saving_name = false,
+                Purpose::StatusMessage { account } => {
+                    self.accounts.status_message_saved(account, request);
+                }
                 Purpose::Audio { media, path } => {
                     if let Some(clip) = self.audio.as_mut().filter(|clip| clip.media == *media) {
                         let speaker = self.settings.devices.speaker.clone();
@@ -1597,6 +1616,12 @@ impl State {
                     self.accounts.set_status(&account, saved);
                 }
                 self.notice = Some(tf!("notice.status", error = error));
+            }
+            // A choice made since has the say.
+            Purpose::StatusMessage { account } => {
+                if self.accounts.status_message_saved(&account, request) {
+                    self.notice = Some(tf!("notice.status_message", error = error));
+                }
             }
             Purpose::Leave => self.notice = Some(tf!("notice.leave", error = error)),
             // History that couldn't load waits for the user to retry, instead of retrying on every
@@ -2884,6 +2909,10 @@ impl State {
 
     pub fn toggle_popover(&mut self, popover: Popover) {
         self.popover = if self.popover.as_ref() == Some(&popover) { None } else { Some(popover) };
+        // The account menu opens showing the status message set, not one left half written.
+        if self.popover == Some(Popover::AccountSwitcher) {
+            self.status_draft = None;
+        }
         // The emoji picker opens empty, ready to type a search into.
         if matches!(self.popover, Some(Popover::Emoji(_))) {
             self.emoji_search = TextEdit::default();
@@ -3769,6 +3798,7 @@ impl State {
                 // Back to writing, the search having had the keyboard.
                 edit.focused = true;
             }
+            EmojiFor::StatusMessage => self.status_emoji_chosen(emoji),
         }
     }
 

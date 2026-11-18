@@ -16,7 +16,7 @@ pub const READ_MARKER_FADE: f32 = 2.5;
 /// notifies for mentions only or is muted.
 pub fn wants_attention(room: &RoomSummary) -> bool {
     match room.notifications {
-        NotificationMode::AllMessages => room.unread > 0,
+        NotificationMode::AllMessages => room.unread > 0 || room.mentions > 0,
         NotificationMode::MentionsOnly | NotificationMode::Mute => room.mentions > 0,
     }
 }
@@ -548,6 +548,14 @@ pub struct AccountData {
     pub status: matrix_core::Status,
     /// The status as last saved: what a choice that fails to save falls back to.
     pub saved_status: matrix_core::Status,
+    /// What people show others (presence and status message), the user included, by user ID:
+    /// as the engine reports it, and from member lists for whoever it hasn't reported yet.
+    pub presence: HashMap<String, matrix_core::PersonPresence>,
+    /// The user's status message as the engine last reported it.
+    pub saved_status_message: Option<String>,
+    /// The latest status message chosen while it is saved: until that request finishes, it shows
+    /// over what the engine reports.
+    pub saving_status_message: Option<matrix_core::RequestId>,
 }
 
 impl AccountData {
@@ -590,7 +598,20 @@ impl AccountData {
             sidebar_loaded: false,
             status: matrix_core::Status::default(),
             saved_status: matrix_core::Status::default(),
+            presence: HashMap::new(),
+            saved_status_message: None,
+            saving_status_message: None,
         }
+    }
+
+    /// The status message `user_id` set, if any.
+    pub fn status_message_of(&self, user_id: &str) -> Option<&str> {
+        self.presence.get(user_id).and_then(|shown| shown.status_message.as_deref())
+    }
+
+    /// The status message the user set on this account, if any.
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message_of(self.summary.id.as_str())
     }
 
     pub fn room(&self, room_id: &str) -> Option<&RoomSummary> {
@@ -850,6 +871,57 @@ impl Accounts {
         }
     }
 
+    /// What people show now, as the engine reported it.
+    pub fn set_presence(&mut self, id: &AccountId, people: Vec<matrix_core::PersonPresence>) {
+        if let Some(account) = self.get_mut(id) {
+            for mut shown in people {
+                if shown.user_id == account.summary.id.as_str() {
+                    account.saved_status_message.clone_from(&shown.status_message);
+                    if account.saving_status_message.is_some()
+                        && let Some(chosen) = account.presence.get_mut(&shown.user_id)
+                    {
+                        shown.status_message = chosen.status_message.take();
+                    }
+                }
+                account.presence.insert(shown.user_id.clone(), shown);
+            }
+        }
+    }
+
+    /// Shows the user's own status message as `message` at once, while `request` saves it.
+    pub fn status_message_chosen(&mut self, id: &AccountId, message: Option<String>, request: matrix_core::RequestId) {
+        let Some(account) = self.get_mut(id) else { return };
+        account.saving_status_message = Some(request);
+        let presence = match account.status {
+            matrix_core::Status::Online => matrix_core::Presence::Online,
+            matrix_core::Status::Away => matrix_core::Presence::Away,
+            matrix_core::Status::Hidden => matrix_core::Presence::Offline,
+        };
+        let me = account.summary.id.as_str().to_owned();
+        let shown = account.presence.entry(me.clone()).or_insert(matrix_core::PersonPresence {
+            user_id: me,
+            presence,
+            status_message: None,
+        });
+        shown.status_message = message;
+    }
+
+    /// Saving a status message finished: once the latest one has, the message shows as the
+    /// engine last reported it (the one saved, or the one before when saving failed). Whether it
+    /// was the latest.
+    pub fn status_message_saved(&mut self, id: &AccountId, request: matrix_core::RequestId) -> bool {
+        let Some(account) = self.get_mut(id) else { return false };
+        if account.saving_status_message != Some(request) {
+            return false;
+        }
+        account.saving_status_message = None;
+        let saved = account.saved_status_message.clone();
+        if let Some(me) = account.presence.get_mut(account.summary.id.as_str()) {
+            me.status_message = saved;
+        }
+        true
+    }
+
     pub fn set_sidebar(&mut self, id: &AccountId, layout: matrix_core::SidebarLayout) {
         if let Some(account) = self.get_mut(id) {
             account.sidebar = layout;
@@ -870,6 +942,21 @@ impl Accounts {
     /// Keeps a room's members; a partial list never replaces a complete one.
     pub fn set_members(&mut self, id: &AccountId, room_id: String, members: matrix_core::Members) {
         let Some(account) = self.get_mut(id) else { return };
+        // The engine's reports are newer than a member list read from the store: a list only
+        // fills in those it hasn't reported.
+        // The user's own is the engine's to report: the list's may predate a save.
+        for member in &members.people {
+            if member.person.id == account.summary.id.as_str() {
+                continue;
+            }
+            if member.presence != matrix_core::Presence::Unknown || member.status_message.is_some() {
+                account.presence.entry(member.person.id.clone()).or_insert_with(|| matrix_core::PersonPresence {
+                    user_id: member.person.id.clone(),
+                    presence: member.presence,
+                    status_message: member.status_message.clone(),
+                });
+            }
+        }
         let stale = account.stale_members.remove(&room_id);
         let had_all = account.members.get(&room_id).is_some_and(|known| known.complete);
         if members.complete || !had_all || stale {
@@ -1255,6 +1342,12 @@ mod tests {
     fn a_muted_room_should_draw_attention_only_for_mentions() {
         let muted = RoomSummary { unread: 5, notifications: NotificationMode::Mute, ..room("!m") };
         assert!(!wants_attention(&muted));
+    }
+
+    #[test]
+    fn a_mention_should_draw_attention_even_without_unread_messages() {
+        let room = RoomSummary { unread: 0, mentions: 1, ..room("!m") };
+        assert!(wants_attention(&room));
     }
 
     #[test]

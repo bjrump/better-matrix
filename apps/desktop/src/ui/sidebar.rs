@@ -1,10 +1,10 @@
 //! The room list for the active account's current scope: Home or one space.
 
 use crate::i18n::t;
-use matrix_core::{NotificationMode, RoomKind, RoomSummary};
+use matrix_core::{NotificationMode, PersonPresence, RoomKind, RoomSummary};
 use rune::{El, ScrollSpec, col, el, icon, row, text};
 
-use super::components::{NavEmphasis, media_avatar, nav_row};
+use super::components::{NavEmphasis, badge, media_avatar, nav_row, with_presence};
 use super::icons;
 use super::theme::{Palette, font};
 use crate::state::{
@@ -153,6 +153,8 @@ fn section_block(s: &State, view: &SectionView<'_>, open: Option<&str>, drop_at:
         _ => t!("sidebar.direct").to_owned(),
     };
     let toggle = id.clone();
+    let news = view.rooms.iter().any(|room| wants_attention(room));
+    let mentions: u64 = view.rooms.iter().map(|room| room.mentions).sum();
     let mut header = row()
         .key(format!("section-header-{id}"))
         .w_full()
@@ -169,7 +171,16 @@ fn section_block(s: &State, view: &SectionView<'_>, open: Option<&str>, drop_at:
             icon(if view.collapsed { &icons::CHEVRON_RIGHT } else { &icons::CHEVRON_DOWN }, 14.0)
                 .color(p.sidebar_text_muted),
         )
-        .child(text(title).font(font::SECTION).color(p.sidebar_text_muted).grow(1.0).truncate())
+        // Something new in a room sets the title in bold, and the section counts their mentions,
+        // so both show while it is collapsed.
+        .child(
+            text(title)
+                .font(if news { font::SECTION_STRONG } else { font::SECTION })
+                .color(if news { p.sidebar_text } else { p.sidebar_text_muted })
+                .grow(1.0)
+                .truncate(),
+        )
+        .children(badge(mentions, p).map(|badge| badge.key(format!("section-mentions-{id}"))))
         .on_press(move |s: &mut State| s.toggle_section(&toggle))
         .on_drag({
             let id = id.clone();
@@ -199,7 +210,8 @@ fn section_block(s: &State, view: &SectionView<'_>, open: Option<&str>, drop_at:
             }
             shown += 1;
         }
-        block = block.child(room_row(room, selected, dragged == Some(room.room_id.as_str()), &s.media, p));
+        let partner = dm_partner(room).and_then(|id| s.active_account().and_then(|account| account.presence.get(id)));
+        block = block.child(room_row(room, partner, selected, dragged == Some(room.room_id.as_str()), &s.media, p));
     }
     if !is_builtin(&id) && drop_at.is_some_and(|at| at >= shown) && !view.collapsed {
         block = block.child(line());
@@ -215,17 +227,34 @@ fn section_block(s: &State, view: &SectionView<'_>, open: Option<&str>, drop_at:
 
 /// A room's row, built again only when something it shows changed: the sidebar of hundreds of
 /// rooms then costs nearly nothing per commit.
-fn room_row(room: &RoomSummary, selected: bool, dragged: bool, media: &crate::state::MediaCache, p: &Palette) -> El {
+fn room_row(
+    room: &RoomSummary,
+    partner: Option<&PersonPresence>,
+    selected: bool,
+    dragged: bool,
+    media: &crate::state::MediaCache,
+    p: &Palette,
+) -> El {
     let picture_ready = room.avatar.as_ref().is_some_and(|picture| media.image(picture).is_some());
     let version = (
-        (&room.name, room.unread, room.mentions, room.notifications, room.kind, &room.dm_users),
+        (&room.name, room.unread, room.mentions, room.notifications, room.kind, &room.dm_users, partner),
         (&room.avatar, picture_ready, selected, dragged, format!("{:?}", p.sidebar_bg)),
     );
-    rune::memo(format!("room-{}", room.room_id), version, || build_room_row(room, selected, dragged, media, p))
+    rune::memo(format!("room-{}", room.room_id), version, || build_room_row(room, partner, selected, dragged, media, p))
+}
+
+/// The one other person in a direct chat of two, when it is one: a chat marked direct with one
+/// person may since have been joined by, or invited, more.
+pub fn dm_partner(room: &RoomSummary) -> Option<&str> {
+    match room.dm_users.as_slice() {
+        [partner] if room.kind == RoomKind::Direct && room.active_member_count <= 2 => Some(partner),
+        _ => None,
+    }
 }
 
 fn build_room_row(
     room: &RoomSummary,
+    partner: Option<&PersonPresence>,
     selected: bool,
     dragged: bool,
     media: &crate::state::MediaCache,
@@ -241,20 +270,38 @@ fn build_room_row(
         NavEmphasis::Normal
     };
     let status_color = if selected { p.sidebar_selected_text } else { p.sidebar_text_muted };
+    // With nothing to say about notifications, a direct chat shows the emoji its person's
+    // status message starts with; the whole message is on hover.
+    let message = partner.and_then(|partner| partner.status_message.as_deref());
     let status = match room.notifications {
-        NotificationMode::AllMessages => None,
+        NotificationMode::AllMessages => message.and_then(|message| {
+            crate::state::leading_emoji(message).map(|emoji| {
+                text(emoji.to_owned())
+                    .font(font::NAV)
+                    .key(format!("status-emoji-{}", room.room_id))
+                    .help(message.to_owned())
+            })
+        }),
         NotificationMode::MentionsOnly => Some(icon(&icons::AT, 14.0).color(status_color)),
         NotificationMode::Mute => Some(icon(&icons::BELL_OFF, 14.0).color(status_color)),
     };
     let leading = match room.kind {
         RoomKind::Group => el().w(18.0).center().child(text("#").font(font::NAV).color(p.sidebar_text_muted)),
         RoomKind::Direct => {
-            media_avatar(room.dm_users.first().unwrap_or(&room.room_id), &room.name, room.avatar.as_ref(), media, 18.0)
+            let face = media_avatar(
+                room.dm_users.first().unwrap_or(&room.room_id),
+                &room.name,
+                room.avatar.as_ref(),
+                media,
+                18.0,
+            );
+            let ring = if selected { p.sidebar_selected } else { p.sidebar_bg };
+            with_presence(face, 18.0, partner, ring, p)
         }
     };
     let (open, menu) = (room.room_id.clone(), room.room_id.clone());
     let (drag, zone) = (room.room_id.clone(), room.room_id.clone());
-    nav_row(leading, &room.name, emphasis, status, room.mentions, p)
+    nav_row(leading, &room.name, emphasis, status, p)
         .key(format!("room-{}", room.room_id))
         .opacity(if dragged { 0.35 } else { 1.0 })
         .on_press_tx(crate::state::navigate(move |s| s.select_room(&open)))

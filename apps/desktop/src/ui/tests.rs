@@ -1330,6 +1330,7 @@ fn large_room_view_build_timing() {
             person: matrix_core::Person { name: id.clone(), id, avatar: None },
             role: matrix_core::MemberRole::Member,
             presence: matrix_core::Presence::Unknown,
+            status_message: None,
             verified: false,
             level: 0,
         };
@@ -1434,6 +1435,113 @@ fn an_update_failure_should_keep_the_rail_action_available() {
     });
     press(&mut rt, "rail-update");
     assert!(matches!(rt.state.update, crate::state::Update::Installing(_)));
+}
+
+#[test]
+fn pressing_the_status_message_should_open_its_field_with_suggestions() {
+    let mut rt = runtime(|_| {});
+    press(&mut rt, "account-button");
+    press(&mut rt, "status-message");
+    assert!(rt.find("status-message-field").is_some() && rt.find("status-suggestion-vacation").is_some());
+    assert!(rt.find("status-online").is_none(), "writing, the menu is only the status message");
+}
+
+#[test]
+fn picking_a_suggested_status_message_should_set_it() {
+    let mut rt = runtime(|_| {});
+    press(&mut rt, "account-button");
+    press(&mut rt, "status-message");
+    press(&mut rt, "status-suggestion-vacation");
+    assert_eq!(rt.state.active_account().and_then(|a| a.status_message()), Some("🌴 On vacation"));
+    assert!(rt.find("account-menu").is_none());
+}
+
+#[test]
+fn a_set_status_message_should_have_a_button_clearing_it() {
+    let mut rt = runtime(|s| s.set_status_message(&AccountId::new(demo::ADA), "🌴 Away"));
+    press(&mut rt, "account-button");
+    press(&mut rt, "status-message-clear");
+    assert_eq!(rt.state.active_account().and_then(|a| a.status_message()), None);
+}
+
+#[test]
+fn a_direct_chat_should_show_the_emoji_its_persons_status_message_starts_with() {
+    let rt = runtime(|_| {});
+    assert!(rt.find("status-emoji-!dm-kai:example.org").is_some());
+}
+
+#[test]
+fn a_direct_chats_header_should_say_what_its_person_shows() {
+    let rt = runtime(|s| s.select_room("!dm-kai:example.org"));
+    assert!(rt.find("room-presence").is_some());
+}
+
+#[test]
+fn a_room_header_should_not_show_presence() {
+    let rt = runtime(|s| s.select_room(demo::DEMO_THREAD.0));
+    assert!(rt.find("room-presence").is_none());
+}
+
+#[test]
+fn a_section_should_count_its_rooms_mentions_while_collapsed() {
+    let rt = runtime(|s| {
+        let ada = AccountId::new(demo::ADA);
+        s.accounts.set_sidebar(&ada, matrix_core::SidebarLayout::default());
+        s.toggle_section(crate::state::DIRECT);
+    });
+    // Grace's two and Kai's one.
+    assert!(rt.find("section-mentions-direct").is_some());
+    let elements = rt.elements();
+    let badge = elements.iter().position(|element| element.key.as_deref() == Some("section-mentions-direct"));
+    assert!(badge.is_some(), "the section's mention count");
+    assert!(elements.iter().any(|element| element.text.as_deref() == Some("3") && element.parent == badge));
+    assert!(rt.find("room-!dm-grace:example.org").is_none(), "collapsed, its rooms are hidden");
+}
+
+#[test]
+fn escape_while_writing_a_status_message_should_go_back_to_the_menu() {
+    let mut rt = runtime(|_| {});
+    rt.on_key = crate::spec().on_key;
+    press(&mut rt, "account-button");
+    press(&mut rt, "status-message");
+    rt.key(rune::KeyEvent { key: rune::Key::Escape, mods: rune::Mods::default() });
+    rt.frame(0.1);
+    assert!(rt.state.status_draft.is_none());
+    assert!(rt.find("status-online").is_some(), "the account menu stays open");
+}
+
+#[test]
+fn a_direct_chats_row_should_follow_its_persons_presence() {
+    let mut rt = runtime(|_| {});
+    assert!(rt.find("status-emoji-!dm-kai:example.org").is_some());
+    let back = matrix_core::PersonPresence {
+        user_id: "@kai:example.org".into(),
+        presence: matrix_core::Presence::Online,
+        status_message: None,
+    };
+    rt.update(|s, tx| s.apply(Event::Presence { account: AccountId::new(demo::ADA), people: vec![back] }, tx));
+    rt.frame(1.0 / 60.0);
+    assert!(rt.find("status-emoji-!dm-kai:example.org").is_none());
+}
+
+#[test]
+fn a_direct_chat_more_people_joined_should_show_no_presence() {
+    let rt = runtime(|s| {
+        let ada = AccountId::new(demo::ADA);
+        let Some(account) = s.active_account() else { return };
+        let mut list = matrix_core::RoomList {
+            rooms: account.rooms.clone(),
+            spaces: account.spaces.clone(),
+            invitations: Vec::new(),
+        };
+        // Two joined, a third invited.
+        for room in list.rooms.iter_mut().filter(|room| room.room_id == "!dm-kai:example.org") {
+            room.member_count = 2;
+            room.active_member_count = 3;
+        }
+        s.apply(Event::RoomsUpdated { account: ada, list }, &mut rune::Tx::default());
+    });
+    assert!(rt.find("status-emoji-!dm-kai:example.org").is_none());
 }
 
 #[test]

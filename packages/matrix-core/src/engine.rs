@@ -225,6 +225,14 @@ pub enum Command {
         /// The new status.
         status: crate::Status,
     },
+    /// Set the status message others see beside the user's presence, or clear it with `None`;
+    /// an [`Event::Presence`] with the user's follows.
+    SetStatusMessage {
+        /// Which account.
+        account: AccountId,
+        /// What the user is up to ("🌴 On vacation"); blank clears it too.
+        message: Option<String>,
+    },
     /// Leave a room; an updated [`Event::RoomsUpdated`] follows without it.
     LeaveRoom {
         /// Whose room.
@@ -886,6 +894,16 @@ pub enum Event {
         /// The status.
         status: crate::Status,
     },
+    /// What people show others (presence and status message), the user included: at start for
+    /// the people in their direct chats, as this device stored it; then whoever's a sync brings.
+    /// The user's own is read from the server, at start and when a sync brings a change, and
+    /// reported after [`Command::SetStatusMessage`].
+    Presence {
+        /// Which account learned it.
+        account: AccountId,
+        /// One entry per person.
+        people: Vec<crate::PersonPresence>,
+    },
     /// A new recovery key, to show the user once.
     RecoveryKey {
         /// Which account.
@@ -1233,6 +1251,7 @@ impl Engine {
             rings: HashMap::new(),
             next_ring: 0,
             status_stamp: 0,
+            message_number: 0,
             devices: crate::calls::DeviceChoice::default(),
         };
         let thread = std::thread::Builder::new().name("matrix-engine".into()).spawn(move || {
@@ -1388,6 +1407,8 @@ struct State {
     /// When the last status was chosen (`Command::SetStatus`), in ms since the epoch: each is
     /// stamped later than the one before, even within one millisecond.
     status_stamp: u64,
+    /// The number of the last status message set (`Command::SetStatusMessage`).
+    message_number: u64,
     /// The microphone, speaker and camera the user picked for calls.
     devices: crate::calls::DeviceChoice,
 }
@@ -2414,6 +2435,17 @@ impl State {
                     Ok(Outcome::Done)
                 })
             }
+            Command::SetStatusMessage { account: id, message } => {
+                let account = self.account(&id);
+                // Numbered here, as commands arrive: messages settle in the order they were set.
+                self.message_number += 1;
+                let number = self.message_number;
+                Box::pin(async move {
+                    let report = |me| sink.emit(Event::Presence { account: id.clone(), people: vec![me] });
+                    account?.set_status_message(message.as_deref(), number, report).await?;
+                    Ok(Outcome::Done)
+                })
+            }
             Command::SetNotificationMode { account: id, room_id, mode } => {
                 let (account, feed) = (self.account(&id), self.feed(&id));
                 Box::pin(async move {
@@ -2503,13 +2535,31 @@ impl State {
                                 }
                             }
                         };
+                        // What people show as this device stored it, before syncing starts: a
+                        // sync's newer report must not come first and be undone by it.
+                        let people = account.known_presence().await;
+                        if !people.is_empty() {
+                            sink.emit(Event::Presence { account: account.id().clone(), people });
+                        }
+                        // The user's own presence, read from the server at start and again when a
+                        // sync asks; asks made meanwhile wait as one. It ends with the account.
+                        let own_refresh = Arc::new(tokio::sync::Notify::new());
+                        let own = async {
+                            let report =
+                                |me| sink.emit(Event::Presence { account: account.id().clone(), people: vec![me] });
+                            loop {
+                                account.report_own_presence(report).await;
+                                own_refresh.notified().await;
+                            }
+                        };
                         tokio::join!(
                             profile,
                             layout,
                             status,
+                            own,
                             calls,
                             crate::security::watch(account.clone(), flows, Arc::clone(&sink)),
-                            sync_loop(account.clone(), Arc::clone(&sink), feed),
+                            sync_loop(account.clone(), Arc::clone(&sink), feed, Arc::clone(&own_refresh)),
                         );
                     })
                 };
@@ -2563,7 +2613,8 @@ impl State {
 
 /// Syncs one account until it fails or is aborted, reporting rooms, new messages and
 /// notifications. The first response only catches up, so it notifies about nothing.
-async fn sync_loop(account: Account, sink: Arc<dyn EventSink>, feed: RoomFeed) {
+/// `own_refresh` asks for the user's own presence to be read again.
+async fn sync_loop(account: Account, sink: Arc<dyn EventSink>, feed: RoomFeed, own_refresh: Arc<tokio::sync::Notify>) {
     // Waits between failed syncs: from a few seconds, doubling, to a minute.
     const FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
     const LAST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -2571,7 +2622,7 @@ async fn sync_loop(account: Account, sink: Arc<dyn EventSink>, feed: RoomFeed) {
     let mut retry = FIRST_RETRY;
     loop {
         let started = std::time::Instant::now();
-        let Err(error) = sync_until_error(&account, &sink, &feed, &caught_up).await else { return };
+        let Err(error) = sync_until_error(&account, &sink, &feed, &caught_up, &own_refresh).await else { return };
         // The session is over. The SDK broadcasts every ending as `UnknownToken`, with whether
         // it was soft, and `watch_session` reports that: the error here may hide it (a rejected
         // refresh), so reporting from here too could call a soft ending hard.
@@ -2594,6 +2645,7 @@ async fn sync_until_error(
     sink: &Arc<dyn EventSink>,
     feed: &RoomFeed,
     caught_up: &Arc<std::sync::atomic::AtomicBool>,
+    own_refresh: &Arc<tokio::sync::Notify>,
 ) -> Result<(), matrix_sdk::Error> {
     // Members load as rooms need them (lazy loading): a first sync doesn't download every member
     // of every room.
@@ -2738,6 +2790,19 @@ async fn sync_until_error(
                 && let Ok(layout) = account.sidebar_layout().await
             {
                 sink.emit(Event::SidebarLayout { account: account.id().clone(), layout });
+            }
+            // The user's own, as the server says now: the sync may predate a status message saved
+            // meanwhile.
+            let me = account.client().user_id().map(ToString::to_string);
+            let (own, people): (Vec<_>, Vec<_>) = crate::people::synced_presence(&response.presence)
+                .into_iter()
+                .partition(|shown| me.as_deref() == Some(shown.user_id.as_str()));
+            if !people.is_empty() {
+                sink.emit(Event::Presence { account: account.id().clone(), people });
+            }
+            // Read aside, so the next sync doesn't wait for it.
+            if !own.is_empty() {
+                own_refresh.notify_one();
             }
             let report = |status| sink.emit(Event::Status { account: account.id().clone(), status });
             account.follow_status(&response.account_data, &sent, report).await;

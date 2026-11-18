@@ -5,6 +5,7 @@
 use rune::{Color, El, Icon, Image, SurfaceFit, TextEdit, col, el, icon, row, text, text_input};
 
 use super::theme::{Palette, font, identity_color};
+use crate::i18n::{t, tf};
 
 /// A square avatar with rounded corners, showing initials over the identity's colour. Used for
 /// people, spaces and accounts.
@@ -61,6 +62,43 @@ pub fn status_dot(status: matrix_core::Status, size: f32, ring: Color, p: &Palet
         matrix_core::Status::Away => dot.fill(p.warning).border(2.0, ring),
         matrix_core::Status::Hidden => dot.fill(ring).border(2.0, p.text_muted),
     }
+}
+
+/// A dot showing whether someone is around, as [`status_dot`] draws the user's own: green
+/// online, amber away, a hollow ring offline. None when their server shares no presence.
+pub fn presence_dot(presence: matrix_core::Presence, size: f32, ring: Color, p: &Palette) -> Option<El> {
+    let status = match presence {
+        matrix_core::Presence::Online => matrix_core::Status::Online,
+        matrix_core::Presence::Away => matrix_core::Status::Away,
+        matrix_core::Presence::Offline => matrix_core::Status::Hidden,
+        matrix_core::Presence::Unknown => return None,
+    };
+    Some(status_dot(status, size, ring, p))
+}
+
+/// `face`, an avatar `size` across, with the dot of what its person `shown` over its
+/// bottom-right corner. `ring` is the surface it sits on.
+pub fn with_presence(face: El, size: f32, shown: Option<&matrix_core::PersonPresence>, ring: Color, p: &Palette) -> El {
+    let dot = (size * 0.33).round().clamp(9.0, 14.0);
+    let at = size - dot + 2.0;
+    el().size(size, size)
+        .child(face)
+        .children(shown.and_then(|shown| presence_dot(shown.presence, dot, ring, p)).map(|d| d.absolute(at, at)))
+}
+
+/// What someone shows, in words: "Away", or "Away · 🌴 On vacation". Nothing when their server
+/// shares no presence.
+pub fn presence_text(shown: &matrix_core::PersonPresence) -> Option<String> {
+    let presence = match shown.presence {
+        matrix_core::Presence::Online => t!("presence.online"),
+        matrix_core::Presence::Away => t!("presence.away"),
+        matrix_core::Presence::Offline => t!("presence.offline"),
+        matrix_core::Presence::Unknown => return None,
+    };
+    Some(match shown.status_message.as_deref() {
+        Some(message) => tf!("presence.with_message", presence = presence, message = message),
+        None => presence.to_owned(),
+    })
 }
 
 /// A square button showing an icon; `active` draws it pressed (a toggled format, say).
@@ -344,12 +382,12 @@ pub enum NavEmphasis {
     Muted,
 }
 
-/// One row in the sidebar: a leading mark, a label, an optional status mark, and a mention
-/// badge.
-pub fn nav_row(leading: El, label: &str, emphasis: NavEmphasis, status: Option<El>, mentions: u64, p: &Palette) -> El {
+/// One row in the sidebar: a leading mark, a label and an optional status mark. Something new
+/// in it lights it up and sets its label in bold; how many mentions is its section's to say.
+pub fn nav_row(leading: El, label: &str, emphasis: NavEmphasis, status: Option<El>, p: &Palette) -> El {
     let (fill, color, style) = match emphasis {
         NavEmphasis::Selected => (p.sidebar_selected, p.sidebar_selected_text, font::NAV_STRONG),
-        NavEmphasis::Unread => (Color::TRANSPARENT, p.sidebar_text, font::NAV_STRONG),
+        NavEmphasis::Unread => (p.sidebar_unread, p.sidebar_text, font::NAV_STRONG),
         NavEmphasis::Normal => (Color::TRANSPARENT, p.sidebar_text_muted, font::NAV),
         NavEmphasis::Muted => (Color::TRANSPARENT, p.sidebar_text_muted.alpha(p.sidebar_text_muted.a * 0.6), font::NAV),
     };
@@ -373,10 +411,7 @@ pub fn nav_row(leading: El, label: &str, emphasis: NavEmphasis, status: Option<E
     if let Some(status) = status {
         r = r.child(status);
     }
-    match badge(mentions, p) {
-        Some(b) => r.child(b),
-        None => r,
-    }
+    r
 }
 
 /// Button styles.

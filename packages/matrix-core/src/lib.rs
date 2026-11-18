@@ -63,7 +63,7 @@ pub use model::{
 /// scroll to the top loads. About a screen and a half at the desktop's density.
 pub const HISTORY_PAGE: u16 = 30;
 pub use history::{PinnedMessage, SharedFile, ThreadInfo};
-pub use people::{MemberRole, Members, Moderation, Presence, RoomMember};
+pub use people::{MemberRole, Members, Moderation, PersonPresence, Presence, RoomMember};
 pub use permalinks::{LinkAction, LinkTarget, Permalink};
 pub use profile::{AccountPage, ContactDetail, ContactKind, Contacts, PendingContact};
 pub use rooms::{DirectoryKind, JoinRule, RoomPreview};
@@ -182,6 +182,9 @@ pub enum Error {
     /// The server rejected a confirmation code.
     #[error("that code is not right")]
     WrongCode,
+    /// The server did not answer in time.
+    #[error("the server took too long to answer")]
+    TimedOut,
     /// The browser approval of an identity reset did not arrive in time.
     #[error("the reset was not approved in time; start it again")]
     ApprovalTimedOut,

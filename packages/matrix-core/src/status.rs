@@ -64,6 +64,13 @@ pub(crate) struct Known {
     saved: Option<Content>,
     /// What this session last announced as presence, if that went through.
     announced: Option<Status>,
+    /// Whether a sync has brought the status yet: until then `saved` may be stale.
+    synced: bool,
+    /// The number of the latest status message set ([`Account::set_status_message`]).
+    message_number: u64,
+    /// How many status messages were saved: a read of the user's presence that one went through
+    /// during is older than what the save reported.
+    messages_saved: u64,
 }
 
 impl Account {
@@ -116,6 +123,81 @@ impl Account {
         }
     }
 
+    /// Sets the status message others see beside the user's presence, or clears it with `None`,
+    /// and `report`s what the user shows then. `number` orders the messages as they were set: one
+    /// whose task runs after a later one's is dropped. It goes with the presence of the status
+    /// that holds (Online when none was ever set), or offline until a sync has brought the status,
+    /// which could be Hidden; the sync's announcement then sets the presence, keeping the message.
+    /// Under the status's lock, so an announcement can't put the old message back.
+    pub async fn set_status_message(
+        &self,
+        message: Option<&str>,
+        number: u64,
+        report: impl Fn(crate::PersonPresence),
+    ) -> Result<(), Error> {
+        let me = self.user_id()?;
+        let message = crate::people::status_message(message);
+        let mut known = self.known().await;
+        if known.message_number > number {
+            return Ok(());
+        }
+        known.message_number = number;
+        let presence = match known.saved {
+            _ if !known.synced => PresenceState::Offline,
+            Some(saved) => saved.status.presence(),
+            None => PresenceState::Online,
+        };
+        let mut request = set_presence::v3::Request::new(me.clone(), presence.clone());
+        request.status_msg = message.clone();
+        // Syncs wait for the lock: a server asking to retry later must not hold them up long.
+        tokio::time::timeout(ANNOUNCE_WAIT, self.client().send(request)).await.map_err(|_| Error::TimedOut)??;
+        known.messages_saved += 1;
+        report(crate::PersonPresence {
+            user_id: me.to_string(),
+            presence: crate::people::presence(&presence),
+            status_message: message,
+        });
+        Ok(())
+    }
+
+    /// `report`s what the user shows as the server says now: at start, and when a sync brings a
+    /// change, as what a sync or this device's store says may be older than a status message
+    /// saved meanwhile. Read without the status's lock, which syncs wait for; a message saved
+    /// while reading reported itself, so the read is then dropped. Nothing when the server
+    /// can't be read.
+    pub(crate) async fn report_own_presence(&self, report: impl Fn(crate::PersonPresence)) {
+        let Ok(me) = self.user_id() else { return };
+        let before = self.known().await.messages_saved;
+        let read = self.client().send(get_presence::v3::Request::new(me.clone()));
+        let current = match tokio::time::timeout(ANNOUNCE_WAIT, read).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(error)) => return eprintln!("matrix-engine: could not read the presence of {}: {error}", self.id()),
+            Err(_) => return eprintln!("matrix-engine: reading the presence of {} took too long", self.id()),
+        };
+        let presence = crate::people::presence(&current.presence);
+        let status_message = match presence {
+            crate::Presence::Unknown => None,
+            _ => crate::people::status_message(current.status_msg.as_deref()),
+        };
+        let shown = crate::PersonPresence { user_id: me.to_string(), presence, status_message };
+        self.report_read_presence(before, shown, report).await;
+    }
+
+    /// `report`s the user's own presence as read when `before` status messages had been saved,
+    /// unless one was saved since; under the status's lock, so no save reports in between.
+    async fn report_read_presence(
+        &self,
+        before: u64,
+        shown: crate::PersonPresence,
+        report: impl Fn(crate::PersonPresence),
+    ) {
+        let known = self.known().await;
+        if known.messages_saved == before {
+            report(shown);
+        }
+        drop(known);
+    }
+
     /// `report`s the status known now, if any: at start, in turn with saves and syncs.
     pub(crate) async fn report_status(&self, report: impl Fn(Status)) {
         if let Some(saved) = self.known().await.saved {
@@ -145,6 +227,7 @@ impl Account {
         if came.is_some() {
             known.saved = came;
         }
+        known.synced = true;
         let raced = known.saved.is_some_and(|saved| saved.status.presence() != *sent);
         self.settle(&mut known, came.is_some() || raced).await;
         if let Some(came) = came {
@@ -307,6 +390,13 @@ mod tests {
     async fn sync(account: &Account) -> matrix_sdk::sync::SyncResponse {
         let settings = matrix_sdk::config::SyncSettings::default().timeout(std::time::Duration::ZERO);
         account.client().sync_once(settings).await.unwrap()
+    }
+
+    /// A presence `report` that keeps what it hears.
+    fn shown() -> (Arc<Mutex<Vec<crate::PersonPresence>>>, impl Fn(crate::PersonPresence)) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let keep = heard.clone();
+        (heard, move |me| keep.lock().unwrap().push(me))
     }
 
     /// A `report` that keeps what it hears.
@@ -490,5 +580,115 @@ mod tests {
         assert_eq!(server.presence().len(), 1);
         account.follow_status(&[], &PresenceState::Offline, |_| {}).await;
         assert_eq!(server.presence().len(), 1, "announced once it went through");
+    }
+
+    #[tokio::test]
+    async fn a_status_message_should_be_announced_trimmed_with_the_status_presence() {
+        let server = Homeserver::plain();
+        let account = server.account().await;
+        account.set_status(Status::Away, 10, |_| {}).await.unwrap();
+        account.follow_status(&[], &PresenceState::Unavailable, |_| {}).await;
+        let (heard, report) = shown();
+        account.set_status_message(Some("  🌴 On vacation "), 1, report).await.unwrap();
+        let sent = server.sent("/presence/");
+        assert_eq!(sent.last(), Some(&json!({ "presence": "unavailable", "status_msg": "🌴 On vacation" })));
+        let me = heard.lock().unwrap().pop().unwrap();
+        assert_eq!((me.presence, me.status_message.as_deref()), (crate::Presence::Away, Some("🌴 On vacation")));
+    }
+
+    #[tokio::test]
+    async fn a_blank_status_message_should_clear_it() {
+        let server = Homeserver::plain();
+        let account = server.account().await;
+        account.follow_status(&[], &PresenceState::Online, |_| {}).await;
+        let (heard, report) = shown();
+        account.set_status_message(Some("   "), 1, report).await.unwrap();
+        assert_eq!(server.sent("/presence/").last(), Some(&json!({ "presence": "online" })));
+        assert_eq!(heard.lock().unwrap().pop().map(|me| me.status_message), Some(None));
+    }
+
+    #[tokio::test]
+    async fn the_users_own_presence_should_be_read_from_the_server() {
+        let server = Homeserver::new(Value::Null, Some("🌴 Out"), || true);
+        let account = server.account().await;
+        let (heard, report) = shown();
+        account.report_own_presence(report).await;
+        let me = heard.lock().unwrap().pop().unwrap();
+        assert_eq!((me.presence, me.status_message.as_deref()), (crate::Presence::Online, Some("🌴 Out")));
+    }
+
+    #[tokio::test]
+    async fn own_presence_read_before_a_status_message_was_saved_should_be_dropped() {
+        let server = Homeserver::plain();
+        let account = server.account().await;
+        let read =
+            crate::PersonPresence { user_id: "@me:x".into(), presence: crate::Presence::Online, status_message: None };
+        account.set_status_message(Some("Out"), 1, |_| {}).await.unwrap();
+        let (heard, report) = shown();
+        account.report_read_presence(0, read, report).await;
+        assert!(heard.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_status_message_should_not_drop_a_presence_read() {
+        let server = Homeserver::plain();
+        let account = server.account().await;
+        account.known().await.message_number = 1;
+        let read =
+            crate::PersonPresence { user_id: "@me:x".into(), presence: crate::Presence::Online, status_message: None };
+        let (heard, report) = shown();
+        account.report_read_presence(0, read, report).await;
+        assert_eq!(heard.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reading_own_presence_should_not_hold_the_status_for_syncs() {
+        // The server says when a presence read arrives, and answers it only once told to.
+        let (arrived, arrival) = std::sync::mpsc::channel::<()>();
+        let (answer, answered) = std::sync::mpsc::channel::<()>();
+        let (arrived, answered) = (Mutex::new(arrived), Mutex::new(answered));
+        let server = Homeserver::new(Value::Null, Some("Out"), move || {
+            let _ = arrived.lock().unwrap().send(());
+            answered.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).is_ok()
+        });
+        let account = Arc::new(server.account().await);
+        let reading = {
+            let account = Arc::clone(&account);
+            tokio::spawn(async move { account.report_own_presence(|_| {}).await })
+        };
+        let wait = std::time::Duration::from_secs(5);
+        tokio::task::spawn_blocking(move || arrival.recv_timeout(wait)).await.unwrap().unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(1), account.status()).await;
+        answer.send(()).unwrap();
+        reading.await.unwrap();
+        assert!(status.is_ok(), "a sync could read the status while presence was being read");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_own_presence_should_report_nothing() {
+        let server = Homeserver::new(Value::Null, Some("🌴 Out"), || false);
+        let account = server.account().await;
+        let (heard, report) = shown();
+        account.report_own_presence(report).await;
+        assert!(heard.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_status_message_set_before_a_sync_brought_the_status_should_go_out_offline() {
+        let server = Homeserver::plain();
+        let account = server.account().await;
+        account.set_status_message(Some("Out"), 1, |_| {}).await.unwrap();
+        assert_eq!(server.sent("/presence/"), vec![json!({ "presence": "offline", "status_msg": "Out" })]);
+    }
+
+    #[tokio::test]
+    async fn an_earlier_status_message_saved_after_a_later_one_should_be_dropped() {
+        let server = Homeserver::plain();
+        let account = server.account().await;
+        account.set_status_message(None, 2, |_| {}).await.unwrap();
+        let (heard, report) = shown();
+        account.set_status_message(Some("Out"), 1, report).await.unwrap();
+        assert_eq!(server.sent("/presence/").len(), 1);
+        assert!(heard.lock().unwrap().is_empty());
     }
 }
