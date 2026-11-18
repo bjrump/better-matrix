@@ -27,6 +27,7 @@ import { useMedia } from '../media';
 import { useNow } from '../shell/useNow';
 import { usePalette } from '../theme';
 import { useTimelineContext } from './context';
+import { useContentWidth } from './readersLayout';
 import { openLink } from './open';
 
 /** The message a reply answers: who wrote it and an excerpt, behind a bar. Pressing it goes there. */
@@ -84,7 +85,9 @@ export const Reactions = memo(function Reactions({
             },
           ]}
         >
-          <Text style={font.body}>{reaction.key}</Text>
+          <Text style={[font.body, styles.chipKey]} numberOfLines={1}>
+            {reaction.key}
+          </Text>
           <Text style={[font.meta, { color: reaction.mine ? palette.accent : palette.textMuted }]}>
             {reaction.count}
           </Text>
@@ -149,7 +152,15 @@ export function ThreadLink({ root, thread }: { root: string; thread: ThreadSumma
 /** The size link cards fetch their image at. */
 const CARD_IMAGE: MediaSize = { type: 'Thumbnail', data: { width: 192, height: 192 } };
 
-/** A link's card once the homeserver described the page: site, title, description and image. */
+const CARD_IMAGE_SIDE = 64;
+
+/** The least width a link card keeps for its words beside its picture. */
+const CARD_WORDS_MIN = 100;
+
+/**
+ * A link's card once the homeserver described the page: site, title, description and image
+ * (left out where it would leave the words too little room).
+ */
 export function LinkCard({ url }: { url: string }) {
   const palette = usePalette();
   const store = useAppStore();
@@ -157,6 +168,9 @@ export function LinkCard({ url }: { url: string }) {
   const preview = useStore((s) => s.linkPreviews[previewKey(account, url)]);
   useEffect(() => fetchLinkPreview(store, account, url), [store, account, url]);
   const image = useMedia(account, preview?.image?.[0] ?? null, CARD_IMAGE);
+  // The picture shows only where it leaves the words a readable width beside it.
+  const words = useContentWidth() - 2 * 12 - 3 - 2 * 12 - CARD_IMAGE_SIDE;
+  const showImage = preview?.image != null && words >= CARD_WORDS_MIN;
 
   if (!preview) return null;
 
@@ -186,7 +200,7 @@ export function LinkCard({ url }: { url: string }) {
           </Text>
         ) : null}
       </View>
-      {preview.image ? (
+      {showImage ? (
         image ? (
           <Image source={{ uri: image }} style={styles.cardImage} contentFit="cover" />
         ) : (
@@ -199,12 +213,15 @@ export function LinkCard({ url }: { url: string }) {
   );
 }
 
-/** A GIF behind a link, playing once fetched; pressing it opens the link. */
+const GIF_WIDTH = 240;
+
+/** A GIF behind a link, playing once fetched, as wide as fits; pressing it opens the link. */
 export function LinkedGif({ url }: { url: string }) {
   const palette = usePalette();
   const store = useAppStore();
   const path = useStore((s) => s.gifs[url]);
   const [aspect, setAspect] = useState(4 / 3);
+  const width = Math.min(GIF_WIDTH, useContentWidth());
   useEffect(() => fetchGif(store, url), [store, url]);
 
   return (
@@ -217,7 +234,7 @@ export function LinkedGif({ url }: { url: string }) {
       {path ? (
         <Image
           source={{ uri: `file://${path}` }}
-          style={[styles.gifImage, { aspectRatio: aspect }]}
+          style={[styles.gifImage, { width, aspectRatio: aspect }]}
           contentFit="cover"
           autoplay
           onLoad={(event) => {
@@ -232,6 +249,7 @@ export function LinkedGif({ url }: { url: string }) {
             styles.gifImage,
             styles.center,
             {
+              width,
               aspectRatio: aspect,
               backgroundColor: palette.surface,
               borderColor: palette.divider,
@@ -254,9 +272,13 @@ const styles = StyleSheet.create({
   quoteText: { flexShrink: 1, paddingVertical: 2 },
   quoteSender: { fontWeight: '600' },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingTop: 4 },
+  chipKey: { flexShrink: 1 },
+  // A long reaction (a shortcode, say) is cut short within the message's width; its
+  // accessibility label keeps all of it.
   chip: {
     height: 28,
     minWidth: 40,
+    maxWidth: '100%',
     paddingHorizontal: 8,
     gap: 6,
     borderRadius: 14,
@@ -286,8 +308,8 @@ const styles = StyleSheet.create({
   },
   cardBar: { width: 3, borderRadius: 1.5 },
   cardWords: { flex: 1, gap: 2 },
-  cardImage: { width: 64, height: 64, borderRadius: 8 },
+  cardImage: { width: CARD_IMAGE_SIDE, height: CARD_IMAGE_SIDE, borderRadius: 8 },
   center: { alignItems: 'center', justifyContent: 'center' },
   gif: { marginTop: 4, alignSelf: 'flex-start' },
-  gifImage: { width: 240, maxHeight: 320, borderRadius: 8, overflow: 'hidden' },
+  gifImage: { maxHeight: 320, borderRadius: 8, overflow: 'hidden' },
 });

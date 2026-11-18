@@ -30,6 +30,9 @@ const ESTIMATED_ROW: f32 = 64.0;
 /// Messages from one sender this close together share one header.
 const GROUP_WINDOW_MS: u64 = 5 * 60_000;
 const AVATAR: f32 = 36.0;
+/// A message row's side padding, and the gap between its parts.
+const MESSAGE_PAD_X: f32 = 20.0;
+const MESSAGE_GAP: f32 = 10.0;
 
 /// What every message row in one timeline needs.
 pub struct Context<'a> {
@@ -50,6 +53,14 @@ pub struct Context<'a> {
     pub ringing: bool,
     /// The audio playing, if any.
     pub audio: Option<&'a AudioClip>,
+    /// The most reader pictures a read indicator shows: fewer in a narrow timeline.
+    pub reader_faces: usize,
+    /// Whether messages keep the readers' column: not in a timeline too narrow for it, where an
+    /// indicator takes a line under its message instead.
+    pub readers_column: bool,
+    /// The widest a message's content can be, once the timeline has a size: pictures and GIFs
+    /// fit it, so they never reach into the readers' column.
+    pub content_width: f32,
 }
 
 impl<'a> Context<'a> {
@@ -68,6 +79,9 @@ impl<'a> Context<'a> {
             call_here: s.call_here().filter(|call| call.info.room_id == key.room_id).map(|call| call.info.via),
             ringing: s.rings.iter().any(|ring| ring.account == data.summary.id && ring.room_id == key.room_id),
             audio: s.audio.as_ref(),
+            reader_faces: crate::state::READER_FACES,
+            readers_column: key.thread.is_none(),
+            content_width: f32::INFINITY,
         }
     }
 
@@ -414,6 +428,17 @@ pub fn timeline(
     let (keys, shown) = (Rc::clone(&plan), Rc::clone(&plan));
     let (account, key, palette) = (cx.account.clone(), cx.key.clone(), *p);
     let (seen_account, seen_key) = (account.clone(), key.clone());
+    let frame_width = rune::memo::layout_with(&format!("{view_key}-frame"), |frame| frame[2]);
+    let reader_faces = match frame_width {
+        Some(width) if width < super::readers::NARROW_TIMELINE => super::readers::NARROW_FACES,
+        _ => crate::state::READER_FACES,
+    };
+    // Less the row's padding, the sender's picture and the readers' column, each with its gap;
+    // a timeline that can't spare the column for messages drops it.
+    let beside = frame_width.map_or(f32::INFINITY, |width| width - 2.0 * MESSAGE_PAD_X - AVATAR - MESSAGE_GAP);
+    let readers = super::readers::column_width(reader_faces) + MESSAGE_GAP;
+    let readers_column = !cx.in_thread() && beside - readers >= super::readers::MIN_CONTENT;
+    let content_width = if readers_column { beside - readers } else { beside };
     let mut list = col()
         .w_full()
         .py(16.0)
@@ -425,7 +450,12 @@ pub fn timeline(
             move |s: &State, i| {
                 let Some((row_key, row)) = plan.get(i) else { return el() };
                 match row_context(s, &account, &key) {
-                    Some((cx, timeline)) => build_row(&cx, timeline, row_key, row, &palette),
+                    Some((mut cx, timeline)) => {
+                        cx.reader_faces = reader_faces;
+                        cx.readers_column = readers_column;
+                        cx.content_width = content_width;
+                        build_row(&cx, timeline, row_key, row, &palette)
+                    }
                     None => el().key(row_key.clone()),
                 }
             },
@@ -605,7 +635,7 @@ fn message_row(
             if let Some(rest) = &gif.rest {
                 body = body.child(text_body(&message.event_id, &rest.plain, rest.rich.as_ref(), p));
             }
-            body = body.child(linked_gif(&gif.url, cx.gifs, p));
+            body = body.child(linked_gif(&gif.url, cx.content_width, cx.gifs, p));
         }
         None => body = body.child(message_body(item, cx, latest_call, p)),
     }
@@ -613,7 +643,14 @@ fn message_row(
     if let Some((url, card)) =
         item.card_link(cx.show_gifs).and_then(|url| Some((url, cx.link_previews?.get(cx.account, url)?)))
     {
-        body = body.child(link_card(&cx.key(&format!("link-{}", message.event_id)), url, card, cx.media, p));
+        body = body.child(link_card(
+            &cx.key(&format!("link-{}", message.event_id)),
+            url,
+            card,
+            cx.content_width,
+            cx.media,
+            p,
+        ));
     }
     if interactive && !message.reactions.is_empty() {
         body = body.child(reactions(cx, message, p));
@@ -621,9 +658,11 @@ fn message_row(
     if let (true, Some(thread), false) = (interactive, &message.thread, cx.in_thread()) {
         body = body.child(thread_link(&message.event_id, thread, cx.media, p));
     }
-
-    if !cx.in_thread() && !message.pending && !message.read_receipts.is_empty() {
-        body = body.child(super::readers::indicator(cx.data, cx.key, message, cx.media, p));
+    // Too narrow a timeline for the readers' column: the indicator takes a line of its own.
+    let read = !message.pending && !message.read_receipts.is_empty();
+    if !cx.in_thread() && !cx.readers_column && read {
+        let indicator = super::readers::indicator(cx.data, cx.key, message, cx.reader_faces, cx.media, p);
+        body = body.child(row().w_full().justify_end().child(indicator));
     }
 
     let mut status = Vec::new();
@@ -641,10 +680,12 @@ fn message_row(
         }
         content
     } else {
+        // A long name is cut short, keeping the time beside it within the message's width.
         let mut meta = row()
             .gap(8.0)
             .center_y()
-            .child(text(message.sender_name.clone()).font(font::BODY_STRONG).color(p.text))
+            .min_w(0.0)
+            .child(text(message.sender_name.clone()).font(font::BODY_STRONG).color(p.text).shrink().truncate())
             .child(text(clock_time(local_ms(message.timestamp_ms))).font(font::META).color(p.text_muted));
         if let Some(status) = status {
             meta = meta.child(status);
@@ -676,14 +717,28 @@ fn message_row(
     let mut row = row()
         .key(key.to_owned())
         .w_full()
-        .px(20.0)
+        .px(MESSAGE_PAD_X)
         .pt(if continues { 2.0 } else { 10.0 })
         .pb(2.0)
-        .gap(10.0)
+        .gap(MESSAGE_GAP)
         .items_start()
         .opacity(if message.pending { 0.6 } else { 1.0 })
         .child(gutter)
         .child(content);
+    // Room messages keep a column at the right for who has read them, filled or not and as tall
+    // as the indicator, so a receipt arriving never rewraps or grows the message (threads track
+    // no receipts).
+    if cx.readers_column {
+        let mut readers = row_el()
+            .w(super::readers::column_width(cx.reader_faces))
+            .min_h(super::readers::HEIGHT)
+            .self_end()
+            .justify_end();
+        if read {
+            readers = readers.child(super::readers::indicator(cx.data, cx.key, message, cx.reader_faces, cx.media, p));
+        }
+        row = row.child(readers);
+    }
     if pinned {
         row = row.fill(p.accent.alpha(0.06)).border_sides([0.0, 0.0, 0.0, 3.0], p.accent);
     }
@@ -707,8 +762,14 @@ fn message_row(
     row
 }
 
+/// The message toolbar's distance from its row's right edge.
+fn toolbar_right(cx: &Context<'_>) -> f32 {
+    if cx.readers_column { MESSAGE_PAD_X + super::readers::column_width(cx.reader_faces) } else { 16.0 }
+}
+
 /// React, reply and reply in thread, at the message's top right while it is hovered (or its
-/// reaction picker is open).
+/// reaction picker is open): in a room, left of the readers' column, so the toolbar never covers
+/// a one-line message's read indicator.
 fn toolbar(cx: &Context<'_>, message: &Message, p: &Palette) -> El {
     let event_id = message.event_id.clone();
     let open = cx.picking == Some(event_id.as_str());
@@ -728,7 +789,7 @@ fn toolbar(cx: &Context<'_>, message: &Message, p: &Palette) -> El {
     let (key, quoted) = (cx.key.clone(), message.clone());
     let mut bar = row()
         .key(cx.key(&format!("actions-{event_id}")))
-        .pin(None, Some(-14.0), Some(16.0), None)
+        .pin(None, Some(-14.0), Some(toolbar_right(cx)), None)
         .px(2.0)
         .py(2.0)
         .gap(2.0)
@@ -776,7 +837,7 @@ fn quote_block(quote: &Quote, p: &Palette) -> El {
             .grow(1.0)
             .min_w(0.0)
             .py(2.0)
-            .child(text(sender).font(font::META.family(rune::Family::Sans)).color(p.text))
+            .child(text(sender).font(font::META.family(rune::Family::Sans)).color(p.text).truncate())
             .child(text(body).font(font::META).color(p.text_muted).max_lines(2).truncate()),
     )
 }
@@ -799,6 +860,7 @@ fn reactions(cx: &Context<'_>, message: &Message, p: &Palette) -> El {
         chips = chips.child(
             row()
                 .key(cx.key(&format!("reaction-{}-{}", message.event_id, reaction.key)))
+                .max_w(cx.content_width)
                 .h(26.0)
                 .px(8.0)
                 .gap(6.0)
@@ -811,7 +873,8 @@ fn reactions(cx: &Context<'_>, message: &Message, p: &Palette) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .label(format!("{} {}", reaction.key, reaction.count))
                 .checked(reaction.mine)
-                .child(text(reaction.key.clone()).font(font::BODY))
+                // A long reaction (a shortcode, say) is cut short; its label keeps all of it.
+                .child(text(reaction.key.clone()).font(font::BODY).shrink().truncate())
                 .child(text(reaction.count.to_string()).font(font::META).color(if reaction.mine {
                     p.accent
                 } else {
@@ -854,14 +917,16 @@ fn thread_link(root: &str, thread: &ThreadSummary, media: &MediaCache, p: &Palet
         } else {
             tf!("thread.last_reply", date = date_label(at, now), time = time)
         };
-        link = link.child(text(when).font(font::META).color(p.text_muted));
+        // Cut short in a narrow message rather than reach into the readers' column.
+        link = link.child(text(when).font(font::META).color(p.text_muted).shrink().truncate());
     }
     link.on_press(move |s: &mut State| s.open_thread(&root))
 }
 
-/// A GIF behind a link in the message, playing once it has loaded.
-fn linked_gif(url: &str, gifs: &GifCache, p: &Palette) -> El {
-    let frame = el().key(format!("gif-{url}")).w(280.0).radius(8.0).role("img").label(url.to_owned());
+/// A GIF behind a link in the message, playing once it has loaded; up to `max_width` wide.
+fn linked_gif(url: &str, max_width: f32, gifs: &GifCache, p: &Palette) -> El {
+    let frame =
+        el().key(format!("gif-{url}")).w(max_width.clamp(0.0, 280.0)).radius(8.0).role("img").label(url.to_owned());
     match gifs.player(url) {
         Some(player) => frame.pixels(player.pixels()),
         None => frame
@@ -883,8 +948,8 @@ fn message_body(item: &TimelineItem, cx: &Context<'_>, latest_call: bool, p: &Pa
             audio_card(attachment, cx.audio, p)
         }
         (MessageContent::Attachment(attachment), _) => match attachment.preview() {
-            Some((preview, _)) if !media.has_failed(&preview) => image_preview(attachment, media, p),
-            _ => attachment_card(attachment, p),
+            Some((preview, _)) if !media.has_failed(&preview) => image_preview(attachment, cx.content_width, media, p),
+            _ => attachment_card(attachment, cx.content_width, p),
         },
         (MessageContent::Redacted, _) => notice_text(t!("message.deleted"), p),
         (MessageContent::Undecryptable, _) => notice_text(t!("message.undecryptable"), p),
@@ -895,6 +960,9 @@ fn message_body(item: &TimelineItem, cx: &Context<'_>, latest_call: bool, p: &Pa
         (MessageContent::Call(card), _) => call_card(cx, &item.message.event_id, card, latest_call, p),
     }
 }
+
+/// The least width a call card's title and status keep beside its picture.
+const CALL_WORDS_MIN: f32 = 100.0;
 
 /// A call's card: what kind it is and how it stands. The newest card in the room shows whether
 /// the room's call is under way, with the way in; older ones have ended.
@@ -925,18 +993,24 @@ fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: boo
         .gap(2.0)
         .child(text(crate::state::call_title(card)).font(font::BODY_STRONG).color(p.text).truncate())
         .child(text(status).font(font::META).color(p.text_muted).truncate());
+    // The picture and words keep a readable width, or all the card has; in a narrow message,
+    // Join takes a line under them.
+    const PADDING: f32 = 12.0;
+    let room = cx.content_width - 2.0 * (PADDING + 1.0);
+    let head =
+        row().grow(1.0).min_w((40.0 + 12.0 + CALL_WORDS_MIN).min(room)).gap(12.0).center_y().child(tile).child(words);
     let mut entry = row()
         .key(cx.key(&format!("call-card-{event_id}")))
         .max_w(460.0)
         .mt(2.0)
-        .padding(12.0)
+        .padding(PADDING)
         .gap(12.0)
+        .flex_wrap()
         .center_y()
         .radius(10.0)
         .fill(p.surface)
         .border(1.0, if ongoing { p.success.alpha(0.6) } else { p.divider })
-        .child(tile)
-        .child(words);
+        .child(head);
     // Join as the header offers it: where the room allows calls, and not when already in it here.
     if cx.call_here.is_some() && ongoing {
         entry = entry.child(text(t!("call.card.joined")).font(font::META).color(p.text_muted));
@@ -963,7 +1037,8 @@ fn text_body(event_id: &str, plain: &str, rich: Option<&rune::TextEdit>, p: &Pal
             .font(font::BODY)
             .color(p.text)
             .self_start()
-            .wrap()
+            // A word longer than the line (a hash, say) breaks rather than runs out of the message.
+            .wrap_anywhere()
             .selectable(true)
             .cursor(rune::Cursor::Text)
             .on_press(|_: &mut State| {}),
@@ -978,9 +1053,10 @@ fn notice_text(message: &str, p: &Palette) -> El {
 /// The largest box an image preview may take.
 const PREVIEW_BOX: (f32, f32) = (360.0, 280.0);
 
-/// A link's preview card: the site, the page's title and description, its image beside them.
+/// A link's preview card, up to `max_width` wide: the site, the page's title and description,
+/// and its image beside them when that leaves the words room.
 /// Pressing it opens the link.
-fn link_card(key: &str, url: &str, card: &LinkPreview, media: &MediaCache, p: &Palette) -> El {
+fn link_card(key: &str, url: &str, card: &LinkPreview, max_width: f32, media: &MediaCache, p: &Palette) -> El {
     /// The image's side.
     const THUMB: f32 = 72.0;
     let mut words = col().grow(1.0).min_w(0.0).gap(2.0);
@@ -988,10 +1064,10 @@ fn link_card(key: &str, url: &str, card: &LinkPreview, media: &MediaCache, p: &P
         words = words.child(text(site.clone()).font(font::META).color(p.text_muted).truncate());
     }
     if let Some(title) = &card.title {
-        words = words.child(text(title.clone()).font(font::BODY_STRONG).color(p.accent).max_lines(2));
+        words = words.child(text(title.clone()).font(font::BODY_STRONG).color(p.accent).max_lines(2).wrap_anywhere());
     }
     if let Some(description) = &card.description {
-        words = words.child(text(description.clone()).font(font::META).color(p.text).max_lines(3));
+        words = words.child(text(description.clone()).font(font::META).color(p.text).max_lines(3).wrap_anywhere());
     }
     let label = card.title.clone().unwrap_or_else(|| url.to_owned());
     let opened = url.to_owned();
@@ -1012,8 +1088,11 @@ fn link_card(key: &str, url: &str, card: &LinkPreview, media: &MediaCache, p: &P
         .focusable(true)
         .child(el().w(3.0).h_full().min_h(THUMB.min(40.0)).radius(1.5).fill(p.accent))
         .child(words);
-    // An image that failed to load leaves the words on their own.
-    if let Some((image, _)) = card.image.as_ref().filter(|(image, _)| !media.has_failed(image)) {
+    // An image that failed to load leaves the words on their own, as does a message too narrow
+    // to keep a readable width for them beside it.
+    const WORDS_MIN: f32 = 120.0;
+    let room = max_width - 2.0 * 12.0 - 3.0 - 2.0 * 12.0 - THUMB;
+    if let Some((image, _)) = card.image.as_ref().filter(|(image, _)| !media.has_failed(image) && room >= WORDS_MIN) {
         let thumb = el().size(THUMB, THUMB).radius(8.0).clip_rounded(8.0);
         entry = entry.child(match media.image(image) {
             Some(image) => thumb.pixels_fit(image.pixels(), SurfaceFit::Fill),
@@ -1023,10 +1102,12 @@ fn link_card(key: &str, url: &str, card: &LinkPreview, media: &MediaCache, p: &P
     entry.on_press_tx(move |s: &mut State, tx| s.open_link(&opened, tx))
 }
 
-/// An image, scaled to fit [`PREVIEW_BOX`] by the sender's dimensions so the timeline doesn't
-/// jump when it loads; a placeholder of the same size until then.
-fn image_preview(attachment: &Attachment, media: &MediaCache, p: &Palette) -> El {
+/// An image, scaled to fit [`PREVIEW_BOX`] and `max_width` by the sender's dimensions so the
+/// timeline doesn't jump when it loads; a placeholder of the same size until then.
+fn image_preview(attachment: &Attachment, max_width: f32, media: &MediaCache, p: &Palette) -> El {
     let (w, h) = preview_size(attachment.dimensions);
+    let scale = (max_width / w).clamp(0.0, 1.0);
+    let (w, h) = (w * scale, h * scale);
     let opened = attachment.clone();
     let frame = el()
         .key(format!("image-{}", attachment.name))
@@ -1055,7 +1136,8 @@ pub fn preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
     ((w * scale).round(), (h * scale).round())
 }
 
-fn attachment_card(attachment: &Attachment, p: &Palette) -> El {
+/// A file's card, up to `max_width` wide: a long name is cut short.
+fn attachment_card(attachment: &Attachment, max_width: f32, p: &Palette) -> El {
     let glyph = match attachment.kind {
         AttachmentKind::Image => &icons::IMAGE,
         AttachmentKind::Video => &icons::VIDEO,
@@ -1063,14 +1145,14 @@ fn attachment_card(attachment: &Attachment, p: &Palette) -> El {
         AttachmentKind::File => &icons::FILE,
     };
     let mut titles =
-        col().min_w(0.0).child(text(attachment.name.clone()).font(font::BODY_STRONG).color(p.text).truncate());
+        col().min_w(0.0).shrink().child(text(attachment.name.clone()).font(font::BODY_STRONG).color(p.text).truncate());
     if let Some(size) = attachment.size {
         titles = titles.child(text(human_size(size)).font(font::META).color(p.text_muted));
     }
     let opened = attachment.clone();
     row()
         .key(format!("file-{}", attachment.name))
-        .max_w(420.0)
+        .max_w(max_width.clamp(0.0, 420.0))
         .mt(4.0)
         .px(12.0)
         .py(10.0)
@@ -1106,7 +1188,7 @@ fn audio_card(attachment: &Attachment, clip: Option<&AudioClip>, p: &Palette) ->
     });
     let opened = attachment.clone();
     let mut titles =
-        col().min_w(0.0).child(text(attachment.name.clone()).font(font::BODY_STRONG).color(p.text).truncate());
+        col().min_w(0.0).shrink().child(text(attachment.name.clone()).font(font::BODY_STRONG).color(p.text).truncate());
     if let Some(time) = time {
         titles = titles.child(text(time).font(font::META).color(p.text_muted));
     }

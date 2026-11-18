@@ -6,14 +6,7 @@ import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import { Image } from 'expo-image';
 import { router } from 'expo-router';
 import { type ReactNode, useState } from 'react';
-import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  Text,
-  useWindowDimensions,
-  View,
-} from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { t } from '../../i18n';
 import { fetchOriginal } from '../../state/actions/timeline';
@@ -27,16 +20,15 @@ import { Icon, type IconName } from '../icons';
 import { ORIGINAL, PREVIEW_SIZE, useMedia } from '../media';
 import { usePalette } from '../theme';
 import { useTimelineContext } from './context';
+import { useContentWidth } from './readersLayout';
 import { shareAttachment } from './files';
 
-/** Room on the left of a message's content: the gutter, the avatar and the gaps. */
-const ROW_INSET = 16 + 36 + 10 + 16;
-
-/** The largest box an image or video takes: the row's width, up to the desktop's 360 × 280. */
+/**
+ * The largest box an image or video takes: the content's width (clear of the readers'
+ * column in a room), up to the desktop's 360 × 280.
+ */
 function useMediaBox() {
-  const { width } = useWindowDimensions();
-
-  return { width: Math.min(width - ROW_INSET, 360), height: 280 };
+  return { width: Math.min(useContentWidth(), 360), height: 280 };
 }
 
 export function AttachmentView({

@@ -812,10 +812,7 @@ fn a_reader_outside_the_member_list_should_keep_chat_actions_without_moderation(
     assert!(rt.find("member-menu-role").is_none());
 }
 
-#[test]
-fn moving_all_readers_away_should_remove_an_open_read_indicator() {
-    let mut rt = readers_runtime();
-    open_readers(&mut rt);
+fn clear_demo_readers(rt: &mut Runtime<State>) {
     rt.update(|s, tx| {
         let key = TimelineKey::room(demo::DEMO_THREAD.0);
         let account = s.nav.account.clone().unwrap();
@@ -833,6 +830,344 @@ fn moving_all_readers_away_should_remove_an_open_read_indicator() {
     });
     rt.settle_all();
     rt.frame(1.0 / 60.0);
+}
+
+#[test]
+fn a_read_indicator_should_not_make_its_message_taller() {
+    let mut rt = readers_runtime();
+    let height = |rt: &Runtime<State>| rt.presented("msg-read-demo").expect("the message row").0[3];
+    let with_readers = height(&rt);
+    clear_demo_readers(&mut rt);
+    assert_eq!(height(&rt), with_readers);
+}
+
+fn plain(body: &str) -> MessageContent {
+    MessageContent::Text { body: body.to_owned(), html: None }
+}
+
+/// Sets a message of `content` from the demo message's sender after it, so its row continues the
+/// sender's run (no name line), read by `readers` people; gives back the row's height.
+fn set_continued_message(rt: &mut Runtime<State>, content: MessageContent, readers: usize) -> f32 {
+    rt.update(|s, tx| {
+        let account = s.nav.account.clone().unwrap();
+        let key = TimelineKey::room(demo::DEMO_THREAD.0);
+        let entries = &s.active_account().unwrap().timeline(&key).unwrap().entries;
+        let existing = entries.iter().position(|entry| entry.id == "continued");
+        let read_receipts = (0..readers)
+            .map(|i| matrix_core::ReadReceipt { user_id: format!("@reader-{i}:example.org"), timestamp_ms: None })
+            .collect();
+        let message = Message {
+            event_id: "$continued".into(),
+            sender_id: demo::ADA.into(),
+            sender_name: "Ada Lovelace".into(),
+            timestamp_ms: demo::DEMO_DAY_MS + 13 * 3_600_000 + 60_000,
+            content,
+            read_receipts,
+            ..Message::default()
+        };
+        let entry = TimelineEntry { id: "continued".into(), kind: EntryKind::Message(Box::new(message)) };
+        let diff = match existing {
+            Some(index) => TimelineDiff::Set { index, entry },
+            None => TimelineDiff::PushBack(entry),
+        };
+        s.apply(Event::TimelineChanged { account, key, diffs: vec![diff] }, tx);
+    });
+    rt.settle_all();
+    rt.frame(1.0 / 60.0);
+    rt.presented("msg-continued").expect("the continued message's row").0[3]
+}
+
+#[test]
+fn a_read_indicator_should_not_rewrap_a_long_message() {
+    let mut rt = readers_runtime();
+    let body = "Ready to try. ".repeat(40);
+    let width = |rt: &Runtime<State>| rt.presented("text-$continued").expect("the message's text").0[2];
+    let with_reader = set_continued_message(&mut rt, plain(&body), 1);
+    let text_with_reader = width(&rt);
+    assert!(rt.find(&format!("readers-{}-$continued", demo::DEMO_THREAD.0)).is_some());
+    assert_eq!(set_continued_message(&mut rt, plain(&body), 0), with_reader);
+    assert_eq!(width(&rt), text_with_reader, "the text must keep its width");
+}
+
+#[test]
+fn a_read_indicator_should_not_make_content_shorter_than_a_line_taller() {
+    let mut rt = readers_runtime();
+    let tiny = || {
+        MessageContent::Attachment(matrix_core::Attachment {
+            kind: matrix_core::AttachmentKind::Image,
+            name: "dot.png".into(),
+            size: None,
+            media: Some(matrix_core::MediaRef::opaque("dot.png")),
+            thumbnail: None,
+            dimensions: Some((8, 8)),
+        })
+    };
+    let unread = set_continued_message(&mut rt, tiny(), 0);
+    assert_eq!(set_continued_message(&mut rt, tiny(), 1), unread);
+}
+
+#[test]
+fn a_read_indicator_on_a_one_line_message_should_open_readers_not_its_actions() {
+    let mut rt = readers_runtime();
+    set_continued_message(&mut rt, plain("Ready."), 1);
+    let (x, y) = rt.find(&format!("readers-{}-$continued", demo::DEMO_THREAD.0)).unwrap();
+    rt.pointer_move(x, y);
+    rt.frame(1.0 / 60.0);
+    press(&mut rt, &format!("readers-{}-$continued", demo::DEMO_THREAD.0));
+    rt.settle_all();
+    rt.frame(1.0 / 60.0);
+    assert!(rt.find("readers-panel").is_some());
+    assert!(rt.find("message-menu").is_none());
+}
+
+#[test]
+fn a_large_reader_count_should_stay_inside_the_readers_column() {
+    let mut rt = readers_runtime();
+    let indicator = format!("readers-{}-$continued", demo::DEMO_THREAD.0);
+    for (viewport, faces) in
+        [((1200.0, 760.0), crate::state::READER_FACES), ((760.0, 760.0), super::readers::NARROW_FACES)]
+    {
+        rt.set_viewport(viewport, 1.0);
+        rt.frame(1.0 / 60.0);
+        set_continued_message(&mut rt, plain("Ready."), 150);
+        assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("99+")));
+        let width = rt.presented(&indicator).expect("the read indicator").0[2];
+        assert!(width <= super::readers::column_width(faces), "{width} must fit {faces} faces' column");
+    }
+}
+
+/// Where the readers' column starts in the room's timeline, in a window of its narrowest size.
+fn readers_column_start(rt: &mut Runtime<State>) -> f32 {
+    readers_column_start_at(rt, crate::spec().min_size.unwrap())
+}
+
+/// Where the readers' column starts in the room's (narrow) timeline, in a window of `size`.
+fn readers_column_start_at(rt: &mut Runtime<State>, size: (f32, f32)) -> f32 {
+    rt.set_viewport(size, 1.0);
+    rt.frame(1.0 / 60.0);
+    rt.settle_all();
+    rt.frame(1.0 / 60.0);
+    let frame = rt.presented("timeline-frame").expect("the timeline").0;
+    frame[0] + frame[2] - 20.0 - super::readers::column_width(super::readers::NARROW_FACES)
+}
+
+#[test]
+fn an_image_should_leave_the_readers_column_clear_in_the_narrowest_window() {
+    let mut rt = runtime(demo::attachment_message);
+    let column = readers_column_start(&mut rt);
+    let image = rt.presented("image-better-matrix.png").expect("the image").0;
+    assert!(image[0] + image[2] <= column, "the image ends at {}, the column starts at {column}", image[0] + image[2]);
+}
+
+#[test]
+fn a_linked_gif_should_leave_the_readers_column_clear_in_the_narrowest_window() {
+    let mut rt = readers_runtime();
+    set_continued_message(&mut rt, plain("https://x.org/a.gif"), 0);
+    let column = readers_column_start(&mut rt);
+    let gif = rt.presented("gif-https://x.org/a.gif").expect("the GIF").0;
+    assert!(gif[0] + gif[2] <= column, "the GIF ends at {}, the column starts at {column}", gif[0] + gif[2]);
+}
+
+#[test]
+fn a_file_card_should_leave_the_readers_column_clear_in_the_narrowest_window() {
+    let mut rt = runtime(|s| s.select_room(demo::DEMO_THREAD.0));
+    let column = readers_column_start(&mut rt);
+    let names = rt.elements().into_iter().filter(|e| e.text.as_deref() == Some("release-notes-0.2.pdf"));
+    for e in names.chain(rt.elements().into_iter().filter(|e| e.key.as_deref() == Some("file-release-notes-0.2.pdf"))) {
+        assert!(
+            e.rect[0] + e.rect[2] <= column,
+            "{:?} ends at {}, the column starts at {column}",
+            e.key,
+            e.rect[0] + e.rect[2]
+        );
+    }
+}
+
+#[test]
+fn a_long_link_should_wrap_clear_of_the_readers_column() {
+    let mut rt = readers_runtime();
+    let column = readers_column_start_at(&mut rt, (760.0, 1200.0));
+    let link = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.text.as_deref().is_some_and(|t| t.contains("bettermatrix.example.org/blog")))
+        .expect("the message with the link");
+    assert!(
+        link.rect[0] + link.rect[2] <= column,
+        "the link ends at {}, the column starts at {column}",
+        link.rect[0] + link.rect[2]
+    );
+}
+
+#[test]
+fn long_names_words_and_reactions_should_stay_clear_of_the_readers_column_in_the_narrowest_window() {
+    const LONG: &str = "3f1c9a7e5b2d4f6a8c0e1b3d5f7a9c2e4b6d8f0a";
+    let mut rt = readers_runtime();
+    rt.update(|s, tx| {
+        let account = s.nav.account.clone().unwrap();
+        let read = vec![matrix_core::ReadReceipt { user_id: "@kai:example.org".into(), timestamp_ms: None }];
+        let message = |id: &str, content: MessageContent| {
+            let message = Message {
+                event_id: format!("${id}"),
+                sender_id: "@alexandra:example.org".into(),
+                sender_name: "Alexandra Montgomery-Wellington".into(),
+                timestamp_ms: demo::DEMO_DAY_MS + 13 * 3_600_000 + 120_000,
+                content,
+                read_receipts: read.clone(),
+                ..Message::default()
+            };
+            TimelineEntry { id: id.into(), kind: EntryKind::Message(Box::new(message)) }
+        };
+        let mut text = message("long", plain(&format!("Fixed in {LONG}")));
+        if let EntryKind::Message(message) = &mut text.kind {
+            message.reactions =
+                vec![matrix_core::Reaction { key: ":party_parrot_celebrate_forever:".into(), count: 12, mine: false }];
+            message.reply_to = Some(matrix_core::Quote {
+                event_id: "$read-demo".into(),
+                sender_name: Some("Bartholomew Fitzgerald-Kensington".into()),
+                body: Some(LONG.into()),
+                call: None,
+            });
+        }
+        let answer = |id: &str| matrix_core::PollAnswer { id: id.into(), text: LONG.into(), votes: 0, mine: false };
+        let poll = matrix_core::Poll {
+            question: format!("Which {LONG}?"),
+            answers: vec![answer("a"), answer("b")],
+            max_selections: 1,
+            ..matrix_core::Poll::default()
+        };
+        let poll = message("long-poll", MessageContent::Poll(poll));
+        let key = TimelineKey::room(demo::DEMO_THREAD.0);
+        s.apply(
+            Event::TimelineChanged {
+                account,
+                key,
+                diffs: vec![TimelineDiff::PushBack(text), TimelineDiff::PushBack(poll)],
+            },
+            tx,
+        );
+    });
+    let column = readers_column_start(&mut rt);
+    let frame = rt.presented("timeline-frame").expect("the timeline").0;
+    for key in ["msg-long", "msg-long-poll"] {
+        let row = rt.presented(key).expect("the message").0;
+        let inside = rt.elements().into_iter().filter(|e| {
+            e.rect[1] >= row[1].max(frame[1])
+                && e.rect[1] + e.rect[3] <= row[1] + row[3]
+                && e.rect[0] < column
+                && e.key.as_deref() != Some(key)
+        });
+        for e in inside {
+            assert!(
+                e.rect[0] + e.rect[2] <= column,
+                "{:?} ends at {}, the column starts at {column}",
+                e.text,
+                e.rect[0] + e.rect[2]
+            );
+        }
+    }
+}
+
+#[test]
+fn a_timeline_too_narrow_for_the_readers_column_should_show_indicators_under_their_messages() {
+    let mut rt = readers_runtime();
+    rt.update(|s, _| s.open_thread(demo::DEMO_THREAD.1));
+    // 780 points at 125% zoom, beside a thread.
+    rt.set_viewport((624.0, 1280.0), 1.0);
+    rt.frame(1.0 / 60.0);
+    rt.settle_all();
+    rt.frame(1.0 / 60.0);
+    let text = rt.presented("text-$read-demo").expect("the message's text").0;
+    let indicator = rt.presented(&format!("readers-{}-$read-demo", demo::DEMO_THREAD.0)).expect("the indicator").0;
+    assert!(indicator[1] >= text[1] + text[3], "the indicator takes a line under the message");
+    let answer = rt.elements().into_iter().find(|e| e.text.as_deref() == Some("Friday")).expect("a poll answer");
+    assert!(answer.rect[3] < 30.0, "a poll answer keeps to a line: {}", answer.rect[3]);
+    let site = rt.elements().into_iter().find(|e| e.text.as_deref() == Some("Better Matrix")).expect("the site's name");
+    assert!(site.rect[2] >= 40.0, "the link card's words keep room: {}", site.rect[2]);
+}
+
+#[test]
+fn a_call_card_at_the_narrowest_column_width_should_keep_its_words_readable() {
+    let mut rt = runtime(|s| s.select_room("!dm-kai:example.org"));
+    // Just wide enough to keep the readers' column.
+    let column = readers_column_start_at(&mut rt, (694.0, 900.0));
+    let frame = rt.presented("timeline-frame").expect("the timeline").0;
+    let content = column - 10.0 - (frame[0] + 20.0 + 36.0 + 10.0);
+    assert!(content >= super::readers::MIN_CONTENT, "the column stays at {content}");
+    let join = rt.elements().into_iter().find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("call-card-join-")));
+    let join = join.expect("the call card's join button").rect;
+    assert!(join[0] + join[2] <= column, "join ends at {}, the column starts at {column}", join[0] + join[2]);
+    let title = rt.elements().into_iter().find(|e| e.text.as_deref() == Some("Voice call")).expect("the call's title");
+    assert!(title.rect[2] >= 60.0, "the call's title keeps room: {}", title.rect[2]);
+}
+
+#[test]
+fn a_call_card_in_a_cramped_timeline_should_keep_its_words_beside_its_picture_and_inside_it() {
+    let mut rt = runtime(|s| s.select_room("!dm-kai:example.org"));
+    // 720 points at 150% zoom.
+    rt.set_viewport((480.0, 900.0), 1.0);
+    rt.frame(1.0 / 60.0);
+    rt.settle_all();
+    rt.frame(1.0 / 60.0);
+    let card = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("call-card-") && !k.starts_with("call-card-join-")));
+    let card = card.expect("the call card").rect;
+    let title = rt.elements().into_iter().find(|e| e.text.as_deref() == Some("Voice call")).expect("the title").rect;
+    let join = rt.elements().into_iter().find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("call-card-join-")));
+    let join = join.expect("the join button").rect;
+    for (what, rect) in [("title", title), ("join", join)] {
+        assert!(
+            rect[0] + rect[2] <= card[0] + card[2],
+            "the {what} ends at {}, the card at {}",
+            rect[0] + rect[2],
+            card[0] + card[2]
+        );
+    }
+    assert!(title[1] < card[1] + 12.0 + 40.0, "the title sits beside the picture, at {}", title[1]);
+}
+
+#[test]
+fn a_thread_link_should_leave_the_readers_column_clear_in_a_narrow_window() {
+    let mut rt = readers_runtime();
+    rt.set_viewport((760.0, 1200.0), 1.0);
+    rt.frame(1.0 / 60.0);
+    rt.settle_all();
+    rt.frame(1.0 / 60.0);
+    let frame = rt.presented("timeline-frame").expect("the timeline").0;
+    let column = frame[0] + frame[2] - 20.0 - super::readers::column_width(super::readers::NARROW_FACES);
+    let link = format!("thread-link-{}", demo::DEMO_THREAD.1);
+    let link = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(link.as_str())).expect("the thread link");
+    let texts = rt.elements().into_iter().filter(|e| {
+        e.text.is_some() && e.rect[1] >= link.rect[1] && e.rect[1] + e.rect[3] <= link.rect[1] + link.rect[3]
+    });
+    for e in texts {
+        assert!(
+            e.rect[0] + e.rect[2] <= column,
+            "{:?} ends at {}, the column starts at {column}",
+            e.text,
+            e.rect[0] + e.rect[2]
+        );
+    }
+}
+
+#[test]
+fn a_narrow_timeline_should_show_fewer_reader_pictures() {
+    let overflow = |rt: &Runtime<State>| rt.elements().into_iter().any(|e| e.text.as_deref() == Some("+4"));
+    let mut rt = readers_runtime();
+    assert!(!overflow(&rt), "a wide timeline shows four of the six readers");
+    rt.set_viewport((760.0, 760.0), 1.0);
+    rt.frame(1.0 / 60.0);
+    rt.frame(1.0 / 60.0);
+    assert!(overflow(&rt), "a narrow timeline shows two of the six readers");
+}
+
+#[test]
+fn moving_all_readers_away_should_remove_an_open_read_indicator() {
+    let mut rt = readers_runtime();
+    open_readers(&mut rt);
+    clear_demo_readers(&mut rt);
     assert!(rt.find("readers-panel").is_none());
     assert!(rt.find(&format!("readers-{}-$read-demo", demo::DEMO_THREAD.0)).is_none());
 }
