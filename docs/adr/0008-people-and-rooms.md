@@ -24,6 +24,46 @@ Date: 2026-11-14
     not the sign-in method: where it allows changes, the add and remove form shows; where not,
     the linked details show read-only (kinds with none are left out), and an OAuth account gets
     a link to its account page (`Command::OpenAccountPage`, answered by `Event::OpenUrl`).
+- **Status:** the account menu starts with the user's status for the account on screen: Online,
+  Away, or Hidden (shown to others as offline); a dot on the account's avatar shows it. Do not
+  disturb is left out: Matrix presence has only `online`, `unavailable` and `offline`, and
+  MSC3026's `busy` is not in the spec.
+  - Saved in the account data event `chat.bettermatrix.status`, not on the device: presence
+    belongs to the user, so every session of this app announces the same one. Other clients
+    still announce online while they sync.
+  - Each session keeps the status as it knows it in one place (`status::Known`): read from
+    this device's copy of the account data once, then settled by saves and syncs under one lock
+    by `changed_at` (stamped as the engine receives `Command::SetStatus`, each later than the
+    last, so in the order chosen). A save answered late, a sync answered before a save or
+    carrying an older status, and choices whose tasks run out of order all lose to what was
+    chosen later; a save that replaced a later status on the server while in flight puts the
+    later one back. Saves wait for each other on a lock of their own, so a slow save doesn't
+    hold up syncs.
+  - Every sync sends it as `set_presence`. Until the first sync has caught up, every sync sends
+    `offline`, which marks no one: the copy here may be stale, and one set elsewhere meanwhile
+    could be Hidden. With none ever set, Online. Syncs the SDK makes itself (fetching a push,
+    in the engine or without it) always send `offline`: a push is no sign of the user.
+  - A sync as `offline` leaves the session's presence as it was, so hiding needs an explicit
+    `PUT /presence` on every session. A session announces the status after saving one, when a
+    sync brings one, after a sync that sent another presence (asked for before a save here, it
+    may reach the server after the save's announcement; also when that sync failed, as the
+    server may have applied it first), and after any sync while it hasn't
+    announced the current one yet: after starting, and again while announcing fails. Waiting for the server to time a session out isn't
+    enough: Synapse counts from the session's last activity, so one in use would stay visible.
+    Announcing keeps the status message another client set, and sends nothing when it can't
+    read it; it gives up after 20 s, retries and waits the server asks for included, as it runs
+    between syncs.
+  - `Event::Status` reports the status that holds, under the same lock: at start, after a save
+    (the later one, if the save lost), and when a sync brings one. The apps show a choice at once and, if saving
+    fails, show the status last reported with a notice, unless another was chosen or reported
+    since. Accepted limits: cross-device clock skew can misorder changes made seconds apart on
+    two devices, as for the sidebar layout; conflicting saves on two devices at the same moment
+    can leave the older one on the server for sessions that start later; and several choices
+    made while one save is still pending (offline, say) can end on an earlier one, which shows
+    and can be chosen again.
+  - Synapse turns Away (`unavailable`) back into online when the user sends a message, types or
+    reads; the next sync or change sets it again. Hidden is not affected. Servers with presence
+    switched off accept the status but show nobody's.
 - **Contact details** step through `ContactStep` per kind:
   1. `Entering` the address.
   2. `Requesting`: `RequestContactCode` sends a link or code; `Event::ContactCodeSent` carries

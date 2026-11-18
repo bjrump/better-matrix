@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use matrix_sdk::config::SyncSettings;
+use matrix_sdk::ruma::presence::PresenceState;
 use matrix_sdk::{LoopCtrl, SessionChange};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
@@ -215,6 +216,14 @@ pub enum Command {
         account: AccountId,
         /// The new default.
         mode: NotificationMode,
+    },
+    /// Set what others see of the user (online, away or hidden) on every session of this app;
+    /// an [`Event::Status`] follows.
+    SetStatus {
+        /// Which account.
+        account: AccountId,
+        /// The new status.
+        status: crate::Status,
     },
     /// Leave a room; an updated [`Event::RoomsUpdated`] follows without it.
     LeaveRoom {
@@ -869,6 +878,14 @@ pub enum Event {
         /// The arrangement.
         layout: crate::SidebarLayout,
     },
+    /// The status the user set for an account, as saved: sent once an account is ready and
+    /// whenever it changes, here or on another session.
+    Status {
+        /// Whose.
+        account: AccountId,
+        /// The status.
+        status: crate::Status,
+    },
     /// A new recovery key, to show the user once.
     RecoveryKey {
         /// Which account.
@@ -1215,6 +1232,7 @@ impl Engine {
             leaving: crate::calls::Leaving::default(),
             rings: HashMap::new(),
             next_ring: 0,
+            status_stamp: 0,
             devices: crate::calls::DeviceChoice::default(),
         };
         let thread = std::thread::Builder::new().name("matrix-engine".into()).spawn(move || {
@@ -1367,6 +1385,9 @@ struct State {
     rings: HashMap<(AccountId, String), (u64, Ring)>,
     /// The number of the next ring.
     next_ring: u64,
+    /// When the last status was chosen (`Command::SetStatus`), in ms since the epoch: each is
+    /// stamped later than the one before, even within one millisecond.
+    status_stamp: u64,
     /// The microphone, speaker and camera the user picked for calls.
     devices: crate::calls::DeviceChoice,
 }
@@ -2381,6 +2402,18 @@ impl State {
                     Ok(Outcome::Done)
                 })
             }
+            Command::SetStatus { account: id, status } => {
+                let account = self.account(&id);
+                // Stamped here, as commands arrive: choices settle in the order they were made,
+                // whichever task runs first.
+                let changed_at = now_ms().max(self.status_stamp + 1);
+                self.status_stamp = changed_at;
+                Box::pin(async move {
+                    let report = |status| sink.emit(Event::Status { account: id.clone(), status });
+                    account?.set_status(status, changed_at, report).await?;
+                    Ok(Outcome::Done)
+                })
+            }
             Command::SetNotificationMode { account: id, room_id, mode } => {
                 let (account, feed) = (self.account(&id), self.feed(&id));
                 Box::pin(async move {
@@ -2459,6 +2492,8 @@ impl State {
                             };
                             sink.emit(Event::SidebarLayout { account: account.id().clone(), layout });
                         };
+                        let status = account
+                            .report_status(|status| sink.emit(Event::Status { account: account.id().clone(), status }));
                         // Once the homeserver names a call service, rooms offer MatrixRTC calls.
                         let calls = {
                             let (account, feed) = (account.clone(), feed.clone());
@@ -2471,6 +2506,7 @@ impl State {
                         tokio::join!(
                             profile,
                             layout,
+                            status,
                             calls,
                             crate::security::watch(account.clone(), flows, Arc::clone(&sink)),
                             sync_loop(account.clone(), Arc::clone(&sink), feed),
@@ -2652,7 +2688,7 @@ async fn sync_until_error(
         })
     };
     let _unread = AbortOnDrop(unread.abort_handle());
-    let on_response = |response: matrix_sdk::sync::SyncResponse| {
+    let on_response = |response: matrix_sdk::sync::SyncResponse, sent: PresenceState| {
         let (account, sink, caught_up, feed) = (account.clone(), Arc::clone(sink), Arc::clone(caught_up), feed.clone());
         let want_members = &want_members;
         async move {
@@ -2703,6 +2739,8 @@ async fn sync_until_error(
             {
                 sink.emit(Event::SidebarLayout { account: account.id().clone(), layout });
             }
+            let report = |status| sink.emit(Event::Status { account: account.id().clone(), status });
+            account.follow_status(&response.account_data, &sent, report).await;
             feed.refresh((!all).then_some(&changed)).await;
             LoopCtrl::Continue
         }
@@ -2717,9 +2755,18 @@ async fn sync_until_error(
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         last_sync = Some(std::time::Instant::now());
-        let response = account.sync_once_locked(settings.clone()).await?;
+        // Each sync announces the status as last synced, so one set elsewhere holds here too.
+        let sent = crate::status::sync_presence(account.status().await, caught_up.load(Ordering::Relaxed));
+        settings = settings.set_presence(sent.clone());
+        let response = match account.sync_once_locked(settings.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                account.sync_failed(&sent).await;
+                return Err(error);
+            }
+        };
         settings = settings.token(response.next_batch.clone());
-        if on_response(response).await == LoopCtrl::Break {
+        if on_response(response, sent).await == LoopCtrl::Break {
             return Ok(());
         }
     }

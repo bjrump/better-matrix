@@ -23,6 +23,7 @@ import type {
   SharedFile,
   SidebarLayout,
   SpaceSummary,
+  Status,
   ThreadInfo,
   TimelineEntry,
   VerificationStep,
@@ -91,6 +92,10 @@ export interface AccountData {
   sidebar: SidebarLayout;
   searchUsage: SearchUsage;
   sidebarLoaded: boolean;
+  /** What others see of the user, as they set it, including a choice still being saved. */
+  status: Status;
+  /** The status as last saved: what a choice that fails to save falls back to. */
+  savedStatus: Status;
 }
 
 /** A verification running for one of the accounts. */
