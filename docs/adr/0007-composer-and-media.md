@@ -46,6 +46,29 @@ screenshots, voice memos, and images and PDFs that open large.
     picked emoji goes (`State::choose_emoji`). Its search (focused when it opens) matches every
     Unicode emoji by its English name and shortcodes (the `emojis` crate), up to 96; Enter picks
     the first. Without a search it shows the quick reactions and the curated groups.
+- **Drafts:** every room and thread keeps its own draft. The desktop's two composers each hold
+  the draft of the timeline they write into (`Composer::owner`); when the timeline on screen
+  changes, `State::follow_drafts` (from `sync_timeline`) sets the draft aside, with its reply and
+  attachments (`composer::Draft`, in `State::drafts`), and brings back the new timeline's. Phones
+  keep a composer per timeline already (`ComposerState`). The text and its formatting also go to
+  the device's store through the SDK's composer drafts (`Command::SaveDraft` / `LoadDraft`,
+  `NewMessage` drafts by room and thread root), so a draft survives a restart; replies and
+  attachments don't. The engine runs an account's draft reads and writes one at a time in the
+  order asked (`DraftQueue`), so a write never lands after a later clear. A draft being typed is
+  written at most every 500 ms; an emptied one (sent or cleared), one being left, and the drafts
+  on screen as the window loses focus (phones: as the conversation is left) at once, so a sent
+  message never comes back. Quitting within half a second of the last keystroke can lose it.
+  (`state/drafts.rs`, `state/actions/drafts.ts`.) A timeline asks the store once per run, on its
+  first visit; its text goes in only if the composer still writes there, the draft's text is blank
+  (a reply or files picked meanwhile stay; under an edit started meanwhile it becomes the draft set
+  aside), no draft was written there since (reads and writes run in order, so the store holds that
+  write), and the user hasn't changed it this run (`Kept::touched`, `ComposerState.touched`; typing in an edit or sending
+  counts as changing it on phones only for the draft, not the edit), without a typing notice; if
+  they had, what they left is written over it, even after leaving the timeline. Phones take the
+  answer only for the read that asked (`DraftLoaded.request`, and a token per follow, so a read
+  answered after sign-out is dropped), and put it under an edit started meanwhile as the draft
+  it sets aside. Phones keep their own composer source (markers
+  and all) as the body, so it comes back exactly; the desktop keeps text and HTML.
 - **Uploads:** `Outgoing::File` carries an `Upload`, a path on disk or bytes with a name.
   - Pastes reach the field through `on_input_paste`. A pasted image joins the draft as
     `image.png`, `image-2.png` and so on; pasted files are attached; text pastes as text.

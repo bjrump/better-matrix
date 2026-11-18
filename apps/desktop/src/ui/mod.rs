@@ -25,6 +25,7 @@ mod readers;
 mod room;
 mod room_discovery;
 mod room_menu;
+mod saved;
 mod search;
 mod security;
 mod settings;
@@ -90,7 +91,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     let mut root = el().key("root").w_full().h_full().child(base.child(body.child(content)));
     let panels = match (&s.popover, account) {
-        (Some(Popover::AccountSwitcher), _) => vec![account_menu::account_menu(s, &p)],
+        (Some(Popover::AccountSwitcher), _) => {
+            let window = cx.layout_size("root").unwrap_or([1200.0, 760.0]);
+            vec![account_menu::account_menu(s, window, &p)]
+        }
         (Some(Popover::RoomMenu { room_id, notifications }), Some(account)) => {
             room_menu::room_menu(account, room_id, *notifications, &p)
         }
@@ -154,6 +158,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
         Some(Modal::Confirm(action)) => Some(confirm::confirm(action, &p)),
         Some(Modal::Forward { .. } | Modal::Translate(_)) => message_actions::dialog(s, &p),
+        Some(Modal::Saved(id)) => s.accounts.get(id).map(|account| saved::saved(s, account, &p)),
         Some(Modal::Poll) => Some(poll::form(s, &p)),
         Some(Modal::Link(dialog)) => Some(link::link_dialog(s, dialog, &p)),
         Some(Modal::Invite { room_id, invited, .. }) => {

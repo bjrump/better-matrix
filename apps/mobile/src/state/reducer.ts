@@ -86,6 +86,7 @@ function newAccount(summary: AccountSummary): AccountData {
     threads: {},
     files: {},
     pins: {},
+    saved: null,
     sidebar: EMPTY_LAYOUT,
     searchUsage: { rooms: {}, people: {} },
     sidebarLoaded: false,
@@ -184,6 +185,10 @@ export function apply(state: State, event: EngineEvent, now: number = Date.now()
         verifications: state.verifications.filter((v) => v.account !== event.data),
         // Its pusher went with its session (signing out removes it first, ADR 0010).
         pushers: withoutKey(state.pushers, event.data),
+        // Its drafts go with it; signing in again reads the ones its store kept.
+        composers: Object.fromEntries(
+          Object.entries(state.composers).filter(([id]) => !id.startsWith(`${event.data}|`)),
+        ),
       };
     }
 
@@ -301,6 +306,11 @@ export function apply(state: State, event: EngineEvent, now: number = Date.now()
       return updateAccount(state, event.data.account, (a) => ({
         ...a,
         pins: { ...a.pins, [event.data.room_id]: event.data.messages },
+      }));
+    case 'SavedMessages':
+      return updateAccount(state, event.data.account, (a) => ({
+        ...a,
+        saved: event.data.messages,
       }));
     case 'Files':
       return updateAccount(state, event.data.account, (a) => ({
@@ -420,6 +430,8 @@ export function apply(state: State, event: EngineEvent, now: number = Date.now()
     case 'ContactCodeSent':
     case 'MessagesFound':
     case 'PeopleFound':
+    // Answers the composer's own read (`state/actions/drafts.ts`).
+    case 'DraftLoaded':
     case 'DirectoryFound':
     case 'DirectChat':
     case 'PublicRooms':

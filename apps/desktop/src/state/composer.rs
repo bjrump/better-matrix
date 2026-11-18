@@ -117,6 +117,9 @@ pub struct Composer {
     pub editing: Option<Editing>,
     /// The selection and its content-space caret line last revealed by the editor.
     pub revealed_caret: Option<(usize, usize, f32)>,
+    /// The timeline whose draft this composer holds; `State::follow_drafts` swaps drafts as
+    /// the timeline on screen changes.
+    pub owner: Option<(AccountId, TimelineKey)>,
 }
 
 impl Default for Composer {
@@ -131,6 +134,7 @@ impl Default for Composer {
             reply_to: None,
             editing: None,
             revealed_caret: None,
+            owner: None,
         }
     }
 }
@@ -167,12 +171,48 @@ pub struct Editing {
     draft: Box<Draft>,
 }
 
-/// What a composer held before an edit took the field.
+/// A message being written: the field, the message it answers and its attachments. It is set
+/// aside while an edit takes the field, and kept per timeline while another one shows.
 #[derive(Debug)]
-struct Draft {
+pub struct Draft {
     edit: TextEdit,
     reply_to: Option<ReplyTarget>,
     attachments: Vec<Upload>,
+}
+
+impl Draft {
+    /// Nothing written, answered or attached.
+    pub fn is_empty(&self) -> bool {
+        self.edit.text.trim().is_empty() && self.reply_to.is_none() && self.attachments.is_empty()
+    }
+
+    /// What of it this device's store keeps: the text and its formatting, unless blank.
+    pub fn stored(&self) -> Option<matrix_core::Draft> {
+        stored_draft(&self.edit)
+    }
+
+    /// Takes a draft read from the store as its text, the caret at its end.
+    pub fn restore(&mut self, draft: &matrix_core::Draft) {
+        self.edit = field_of(draft);
+    }
+}
+
+/// A field holding a draft read from the store, the caret at its end.
+fn field_of(draft: &matrix_core::Draft) -> TextEdit {
+    let mut field = new_edit();
+    match &draft.html {
+        Some(html) => {
+            let _ = field.paste_html(html, &draft.body);
+        }
+        None => field.insert(&draft.body),
+    }
+    field.clear_history();
+    field
+}
+
+/// A field's text and formatting as the store keeps a draft, unless blank.
+fn stored_draft(edit: &TextEdit) -> Option<matrix_core::Draft> {
+    (!edit.text.trim().is_empty()).then(|| matrix_core::Draft { body: edit.text.clone(), html: html_of(edit) })
 }
 
 /// An edit on its way: the message, its new text and formatting, and the field as the user left
@@ -307,6 +347,55 @@ impl Composer {
     /// Takes an edit that failed back into the field, as the user left it, to try again.
     pub fn resume_edit(&mut self, edit: Edit) {
         self.edit_with(edit.target, edit.field, edit.original);
+    }
+
+    /// The draft written here, taken out: the composer is left empty, its field as focused as
+    /// it was. Call with no edit under way (`set_aside_edit` first).
+    pub fn take_draft(&mut self) -> Draft {
+        let mut field = new_edit();
+        field.focused = self.edit.focused;
+        self.link = None;
+        self.fresh = None;
+        self.revealed_caret = None;
+        Draft {
+            edit: std::mem::replace(&mut self.edit, field),
+            reply_to: self.reply_to.take(),
+            attachments: std::mem::take(&mut self.attachments),
+        }
+    }
+
+    /// Takes back a draft written here before, keeping the field as focused as it is.
+    pub fn put_draft(&mut self, draft: Draft) {
+        let focused = self.edit.focused;
+        let Draft { edit, reply_to, attachments } = draft;
+        self.edit = edit;
+        self.edit.focused = focused;
+        self.reply_to = reply_to;
+        self.attachments = attachments;
+        self.link = None;
+        self.fresh = None;
+        self.revealed_caret = None;
+    }
+
+    /// The draft's text as the store keeps it: the draft set aside while an edit holds the field.
+    pub fn stored_draft(&self) -> Option<matrix_core::Draft> {
+        match &self.editing {
+            Some(editing) => editing.draft.stored(),
+            None => stored_draft(&self.edit),
+        }
+    }
+
+    /// Puts a draft read from the store into the draft's text, the caret at its end: the field,
+    /// or the draft set aside under an edit. A reply and attachments stay.
+    pub fn restore_draft(&mut self, draft: &matrix_core::Draft) {
+        match &mut self.editing {
+            Some(editing) => editing.draft.restore(draft),
+            None => {
+                let focused = self.edit.focused;
+                self.edit = field_of(draft);
+                self.edit.focused = focused;
+            }
+        }
     }
 
     /// Before a key reaches the field: typing straight on from a freshly formatted selection

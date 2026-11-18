@@ -1,5 +1,5 @@
 //! The menu behind the user's avatar: the account's status, every signed-in account, then
-//! adding one, settings and signing out.
+//! adding one, the account's saved messages, profile, settings and signing out.
 
 use rune::{Align, El, Side, col, el, icon, row, text, text_input};
 
@@ -13,7 +13,9 @@ use crate::i18n::{t, tf};
 use crate::state::{AccountData, EmojiFor, Popover, Scope, State, leading_emoji, status_suggestions};
 use matrix_core::{AccountId, Status};
 
-pub fn account_menu(s: &State, p: &Palette) -> El {
+/// The menu, at most as tall as the `window` leaves room for: in a short window it scrolls, so
+/// Settings and Sign out stay reachable.
+pub fn account_menu(s: &State, window: [f32; 2], p: &Palette) -> El {
     let mut panel = popover_panel(p).key("account-menu");
     if let Some(account) = s.active_account() {
         // Writing a status message, the menu is only that: it stays short and on screen.
@@ -69,6 +71,11 @@ pub fn account_menu(s: &State, p: &Palette) -> El {
                 .on_press_tx(crate::state::navigate(State::start_adding_account)),
         )
         .children(s.active_account().map(|_| {
+            menu_row(menu_icon(&icons::BOOKMARK, p), t!("saved.title"), None, None, p)
+                .key("menu-saved")
+                .on_press(State::open_saved)
+        }))
+        .children(s.active_account().map(|_| {
             menu_row(menu_icon(&icons::USER, p), t!("settings.profile"), None, None, p)
                 .key("menu-profile")
                 .on_press(State::open_profile)
@@ -92,6 +99,7 @@ pub fn account_menu(s: &State, p: &Palette) -> El {
             .on_press(move |s: &mut State| s.sign_out(&id)),
         );
     }
+    let panel = panel.max_h((window[1] - 16.0).max(100.0)).scroll(rune::ScrollSpec { stick_bottom: false });
     col().child(panel).anchored(ACCOUNT_BUTTON, Side::Right, Align::End, 10.0)
 }
 

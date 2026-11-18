@@ -106,7 +106,7 @@ see who is typing there.
   than the newest sent of the same message is ignored. A failed delete has its own notice.
 - **Message utilities:** More and right-click use the same menu on desktop; long press opens
   the corresponding phone sheet. Conversation actions (reply, thread, forward, edit) come first,
-  followed by copy link, pin/unpin, copy text and translate; deletion stays last and separate.
+  followed by copy link, pin/unpin, save/remove from saved, copy text and translate; deletion stays last and separate.
   Permissions, local echoes and content type determine availability. Attachment messages start
   with the shared file actions (copy image for images, download and open in the default app);
   they offer no copy-text action for their filename. Empty text has no copy action either.
@@ -132,6 +132,24 @@ see who is typing there.
   preserve cached content on failure and offer retry. Opening a pin uses the shared message jump
   to its room or containing thread, loading history
   as needed (desktop `State::open_message`, phone route `eventId`).
+- **Saved messages:** a private list of messages per user, offered for every readable sent
+  message. Matrix has no ratified feature for it; MSC2437's tagged events are used, under the
+  unstable type `org.matrix.msc2437.tagged_events` (tag `m.favourite`, with `tagged_at`), in each
+  room's account data: private to the user, following them to every session, gone with a room
+  they leave, and other tags and fields are kept. `Command::SetSaved` reads the server's copy and
+  writes it back, one change per account at a time (`Account::saved_changes`), so quick changes
+  in a row or another session's aren't lost before sync; summaries (`RoomSummary::saved`) follow
+  through sync. Two sessions changing the same room's saved messages at the same moment can still
+  lose one change (last write wins): room account data has no conditional write, as MSC2437
+  itself notes, and a format of our own would give up the shared one. `ListSavedMessages` reads each saved event from the event cache, else fetches it,
+  most recently saved first; unreadable ones keep a placeholder. Its text is the event's as sent:
+  a later edit shows once the message is opened (fetching every message's relations would cost a
+  request each). The account menu opens the list: a dialog on desktop (`Modal::Saved`), a pushed
+  screen on phones (`app/saved-messages.tsx`). Rows show sender, room, excerpt and time; one no
+  longer saved leaves at once, and one saved meanwhile reloads the open list (checked again when
+  a list request finishes; phones run list requests one at a time). Opening a row uses the shared
+  message jump; its bookmark button stops saving it. The desktop's rows act on the dialog's
+  account, which need not be the one on screen.
 - **Reactions, replies, threads:**
   - `Command::React` toggles the user's reaction (`toggle_reaction`). Messages carry each
     reaction's count and whether the user is among them. The picker offers quick reactions,
@@ -302,7 +320,9 @@ see who is typing there.
   - A changed, non-empty draft says "typing" at most every 3 s (`REPEAT`); the SDK repeats it
     only near the 4 s expiry.
   - An emptied draft or leaving the room says "stopped"; an idle draft lets the notice lapse.
-  - Opening a room with an old draft isn't typing.
+  - Opening a room or thread with an old draft isn't typing, nor is a draft coming back
+    ([0007](0007-composer-and-media.md)). Typing belongs to the composer typed in: it stops when
+    that composer empties, closes or moves to another thread, whatever the other one holds.
 - **Times:** times and date dividers use the local time zone at that moment, so summer time
   applies to summer dates (`local_ms`).
 

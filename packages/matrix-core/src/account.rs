@@ -80,6 +80,10 @@ pub struct Account {
     pub(crate) status: Arc<tokio::sync::Mutex<crate::status::Known>>,
     /// Held while a status is saved: one save at a time, apart from the lock syncs take.
     pub(crate) status_saves: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a room's saved messages change: one change at a time (`crate::saved`).
+    pub(crate) saved_changes: Arc<tokio::sync::Mutex<()>>,
+    /// Draft reads and writes, in the order they were asked for (`crate::drafts`).
+    pub(crate) drafts: crate::drafts::DraftQueue,
 }
 
 /// Where the browser comes back to after an OAuth sign-in.
@@ -260,6 +264,8 @@ impl Account {
             rtc: Arc::new(Mutex::new(None)),
             status: Arc::default(),
             status_saves: Arc::default(),
+            saved_changes: Arc::default(),
+            drafts: crate::drafts::DraftQueue::default(),
         }
     }
 
@@ -371,6 +377,8 @@ impl Account {
             rtc: Arc::default(),
             status: Arc::default(),
             status_saves: Arc::default(),
+            saved_changes: Arc::default(),
+            drafts: crate::drafts::DraftQueue::default(),
         })
     }
 
@@ -954,6 +962,8 @@ mod tests {
             rtc: Arc::new(Mutex::new(None)),
             status: Arc::default(),
             status_saves: Arc::default(),
+            saved_changes: Arc::default(),
+            drafts: crate::drafts::DraftQueue::default(),
         }
     }
 
