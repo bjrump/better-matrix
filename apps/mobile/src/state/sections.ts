@@ -3,18 +3,22 @@
 // which always exist and list the latest conversation first, and the user's own sections, which
 // hold the rooms and chats moved into them in the order they were placed. Also which rooms a
 // scope shows, which "want attention", and the edits to a `SidebarLayout` the user can make.
-// Pure: every function takes what it needs and returns new values.
+// Pure: every function takes what it needs; layout edits return new values, and what the scope
+// helpers derive is kept per list (`newestMessages`, per account) and must not be changed.
 
 import type {
+  AccountId,
   Message,
   RoomKind,
   RoomSummary,
   ScopeLayout,
   SidebarLayout,
   SpaceSummary,
+  TimelineEntry,
 } from '@better-matrix/matrix-native/types';
 
-import { roomKey, timelineId } from './timeline';
+import { sameJson } from './json';
+import { isRoomTimeline, roomKey, timelineId } from './timeline';
 import type { AccountData, Scope } from './types';
 
 /** The built-in sections' IDs: they can be collapsed, never removed. */
@@ -44,9 +48,38 @@ export function wantsAttention(room: RoomSummary): boolean {
   return room.notifications === 'AllMessages' ? room.unread > 0 : room.mentions > 0;
 }
 
+// What the room lists derive from the spaces and rooms is kept per array: state is never changed
+// in place, so it stays true while the reducer keeps the array, and the selectors asking on every
+// store change (the dots of the space picker, the tab header and the account menu) find it ready.
+
+/** The spaces by ID and what was found under each, per spaces list. */
+interface SpaceIndex {
+  byId: Map<string, SpaceSummary>;
+  /** Each space's rooms, as `spaceRooms` found them. */
+  rooms: Map<string, ReadonlySet<string>>;
+  /** Every room in some space, once Home asked. */
+  inSpaces: ReadonlySet<string> | null;
+}
+
+const spaceIndexes = new WeakMap<readonly SpaceSummary[], SpaceIndex>();
+
+function spaceIndex(spaces: readonly SpaceSummary[]): SpaceIndex {
+  let index = spaceIndexes.get(spaces);
+
+  if (!index) {
+    index = { byId: new Map(spaces.map((s) => [s.room_id, s])), rooms: new Map(), inSpaces: null };
+    spaceIndexes.set(spaces, index);
+  }
+
+  return index;
+}
+
 /** Every room ID under a space, following subspaces; safe against cycles. */
-export function spaceRooms(spaces: readonly SpaceSummary[], spaceId: string): Set<string> {
-  const byId = new Map(spaces.map((s) => [s.room_id, s]));
+export function spaceRooms(spaces: readonly SpaceSummary[], spaceId: string): ReadonlySet<string> {
+  const index = spaceIndex(spaces);
+  const known = index.rooms.get(spaceId);
+
+  if (known) return known;
   const rooms = new Set<string>();
   const seen = new Set<string>();
   const pending = [spaceId];
@@ -54,35 +87,74 @@ export function spaceRooms(spaces: readonly SpaceSummary[], spaceId: string): Se
   for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
     if (seen.has(id)) continue;
     seen.add(id);
-    const space = byId.get(id);
+    const space = index.byId.get(id);
 
     if (!space) continue;
 
     for (const child of space.children) {
-      if (byId.has(child)) pending.push(child);
+      if (index.byId.has(child)) pending.push(child);
       else rooms.add(child);
     }
   }
 
+  index.rooms.set(spaceId, rooms);
+
   return rooms;
 }
 
-/**
- * The rooms a scope shows. Home: every direct chat, and the group rooms in no space. A space:
- * its rooms (subspaces included), and direct chats in it or with its members.
- */
-export function roomsInScope(
+/** Every room in some space: what Home leaves out of its group rooms. */
+function roomsInSpaces(spaces: readonly SpaceSummary[]): ReadonlySet<string> {
+  const index = spaceIndex(spaces);
+
+  if (!index.inSpaces) {
+    const inSpaces = new Set<string>();
+
+    for (const space of spaces)
+      for (const id of spaceRooms(spaces, space.room_id)) inSpaces.add(id);
+    index.inSpaces = inSpaces;
+  }
+
+  return index.inSpaces;
+}
+
+/** What was worked out for one rooms and spaces list, by scope (and kind). */
+interface ScopeIndex {
+  rooms: Map<string, readonly RoomSummary[]>;
+  unread: Map<string, boolean>;
+}
+
+const scopeIndexes = new WeakMap<
+  readonly RoomSummary[],
+  WeakMap<readonly SpaceSummary[], ScopeIndex>
+>();
+
+function scopeIndex(account: Pick<AccountData, 'rooms' | 'spaces'>): ScopeIndex {
+  let bySpaces = scopeIndexes.get(account.rooms);
+
+  if (!bySpaces) {
+    bySpaces = new WeakMap();
+    scopeIndexes.set(account.rooms, bySpaces);
+  }
+
+  let index = bySpaces.get(account.spaces);
+
+  if (!index) {
+    index = { rooms: new Map(), unread: new Map() };
+    bySpaces.set(account.spaces, index);
+  }
+
+  return index;
+}
+
+function findRoomsInScope(
   account: Pick<AccountData, 'rooms' | 'spaces'>,
   scope: Scope,
-  kind?: RoomKind,
+  kind: RoomKind | undefined,
 ): RoomSummary[] {
   const ofKind = kind ? account.rooms.filter((r) => r.kind === kind) : account.rooms;
 
   if (scope === 'home') {
-    const inSpaces = new Set<string>();
-
-    for (const space of account.spaces)
-      for (const id of spaceRooms(account.spaces, space.room_id)) inSpaces.add(id);
+    const inSpaces = roomsInSpaces(account.spaces);
 
     return ofKind.filter((room) => room.kind === 'Direct' || !inSpaces.has(room.room_id));
   }
@@ -97,26 +169,147 @@ export function roomsInScope(
   );
 }
 
+/**
+ * The rooms a scope shows. Home: every direct chat, and the group rooms in no space. A space:
+ * its rooms (subspaces included), and direct chats in it or with its members. The same list
+ * while the account's rooms and spaces are.
+ */
+export function roomsInScope(
+  account: Pick<AccountData, 'rooms' | 'spaces'>,
+  scope: Scope,
+  kind?: RoomKind,
+): readonly RoomSummary[] {
+  const index = scopeIndex(account);
+  const key = kind === undefined ? scopeKey(scope) : `${kind} ${scopeKey(scope)}`;
+  let rooms = index.rooms.get(key);
+
+  if (!rooms) {
+    rooms = findRoomsInScope(account, scope, kind);
+    index.rooms.set(key, rooms);
+  }
+
+  return rooms;
+}
+
 /** Whether any room in the scope wants attention, for the dots in the space picker and account menu. */
 export function hasUnread(account: Pick<AccountData, 'rooms' | 'spaces'>, scope: Scope): boolean {
-  return roomsInScope(account, scope).some(wantsAttention);
+  const index = scopeIndex(account);
+  const key = scopeKey(scope);
+  let unread = index.unread.get(key);
+
+  if (unread === undefined) {
+    unread = roomsInScope(account, scope).some(wantsAttention);
+    index.unread.set(key, unread);
+  }
+
+  return unread;
+}
+
+/** Each room's newest message in the timelines the store keeps (threads left out), by room ID. */
+export type NewestMessages = Readonly<Record<string, Message>>;
+
+/**
+ * Where a room's newest message in its timeline is read from: the timelines, or what
+ * `newestMessages` made of them (which changes less often, so a list selecting it redraws less).
+ */
+export type TimelineSource = Pick<AccountData, 'timelines'> | { newest: NewestMessages };
+
+/** What orders rooms by recency: their timelines' and sync's newest messages, and when heard. */
+export type RecencySource = TimelineSource & Pick<AccountData, 'latest' | 'heardAt'>;
+
+/** The newest message of each entries array, once looked for (`null`: it has none). */
+const newestByEntries = new WeakMap<readonly TimelineEntry[], Message | null>();
+
+function newestIn(entries: readonly TimelineEntry[]): Message | undefined {
+  let newest = newestByEntries.get(entries);
+
+  if (newest === undefined) {
+    newest = null;
+
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const kind = entries[i]?.kind;
+
+      if (kind?.type === 'Message') {
+        newest = kind.data;
+        break;
+      }
+    }
+
+    newestByEntries.set(entries, newest);
+  }
+
+  return newest ?? undefined;
+}
+
+/** Whether two messages look the same in a room list: its place, time, sender and text. */
+function samePreview(a: Message, b: Message): boolean {
+  return (
+    a === b ||
+    (a.event_id === b.event_id &&
+      a.timestamp_ms === b.timestamp_ms &&
+      a.sender_name === b.sender_name &&
+      sameJson(a.content, b.content))
+  );
+}
+
+/** What `newestMessages` last made for each account, and from which timelines. */
+const newestKept = new Map<
+  AccountId,
+  { timelines: AccountData['timelines']; newest: NewestMessages }
+>();
+
+/**
+ * Each room's newest message in an account's kept timelines. The same object comes back until
+ * some room's newest message changes how the room list shows it (another message, time, sender
+ * or text), so a timeline growing older history, reactions or receipts leave room lists alone.
+ */
+export function newestMessages(
+  account: Pick<AccountData, 'summary' | 'timelines'>,
+): NewestMessages {
+  const { timelines } = account;
+  const kept = newestKept.get(account.summary.id);
+
+  if (kept?.timelines === timelines) return kept.newest;
+
+  const next: Record<string, Message> = {};
+  let changed = false;
+  let count = 0;
+
+  for (const [id, timeline] of Object.entries(timelines)) {
+    if (!isRoomTimeline(id)) continue;
+    const message = newestIn(timeline.entries);
+
+    if (!message) continue;
+    const before = kept?.newest[id];
+
+    if (before && samePreview(before, message)) {
+      next[id] = before;
+    } else {
+      next[id] = message;
+      changed = true;
+    }
+
+    count++;
+  }
+
+  const newest = kept && !changed && count === Object.keys(kept.newest).length ? kept.newest : next;
+  newestKept.set(account.summary.id, { timelines, newest });
+
+  return newest;
 }
 
 /** The newest message in a room: from its timeline when open, else from sync. */
 export function lastMessage(
-  account: Pick<AccountData, 'timelines' | 'latest'>,
+  account: TimelineSource & Pick<AccountData, 'latest'>,
   roomId: string,
 ): Message | undefined {
-  const entries = account.timelines[timelineId(roomKey(roomId))]?.entries ?? [];
   let fromTimeline: Message | undefined;
 
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const kind = entries[i]?.kind;
-
-    if (kind?.type === 'Message') {
-      fromTimeline = kind.data;
-      break;
-    }
+  if ('newest' in account) {
+    fromTimeline = account.newest[roomId];
+  } else {
+    const entries = account.timelines[timelineId(roomKey(roomId))]?.entries;
+    fromTimeline = entries && newestIn(entries);
   }
 
   const synced = account.latest[roomId];
@@ -136,11 +329,7 @@ const DRIFT_MS = 5 * 60_000;
  * than clocks drift doesn't count, so a misdated event can't hold a room at the top: a message
  * heard this session counts from when it was heard instead.
  */
-export function activity(
-  account: Pick<AccountData, 'timelines' | 'latest' | 'heardAt'>,
-  room: RoomSummary,
-  now: number,
-): number {
+export function activity(account: RecencySource, room: RoomSummary, now: number): number {
   const plausible = (at: number) => at <= now + DRIFT_MS;
   const message = lastMessage(account, room.room_id);
 
@@ -158,7 +347,7 @@ export function activity(
 
 /** Rooms latest conversation first; rooms with nothing known yet after them, by name. */
 export function byRecency(
-  account: Pick<AccountData, 'timelines' | 'latest' | 'heardAt'>,
+  account: RecencySource,
   rooms: readonly RoomSummary[],
   now: number,
 ): RoomSummary[] {
@@ -190,7 +379,11 @@ function scopeLayout(layout: SidebarLayout, scope: Scope): ScopeLayout | undefin
  * A scope's sections in order: the user's own, then Rooms and Direct messages with whatever isn't
  * in one of the user's; sections the saved order names come first, in its order.
  */
-export function sections(account: AccountData, scope: Scope, now: number): SectionView[] {
+export function sections(
+  account: Pick<AccountData, 'sidebar' | 'rooms' | 'spaces'> & RecencySource,
+  scope: Scope,
+  now: number,
+): SectionView[] {
   const kept = scopeLayout(account.sidebar, scope);
   const collapsed = new Set(kept?.collapsed ?? []);
   const inScope = roomsInScope(account, scope);
@@ -234,14 +427,20 @@ export function sections(account: AccountData, scope: Scope, now: number): Secti
 }
 
 /** The rooms of a scope wanting attention: mentions first, then by unread count. */
-export function unreadRooms(account: AccountData, scope: Scope): RoomSummary[] {
+export function unreadRooms(
+  account: Pick<AccountData, 'rooms' | 'spaces'>,
+  scope: Scope,
+): RoomSummary[] {
   return roomsInScope(account, scope)
     .filter(wantsAttention)
     .sort((a, b) => b.mentions - a.mentions || b.unread - a.unread);
 }
 
 /** Every direct chat of an account, latest first. */
-export function directChats(account: AccountData, now: number): RoomSummary[] {
+export function directChats(
+  account: Pick<AccountData, 'rooms'> & RecencySource,
+  now: number,
+): RoomSummary[] {
   return byRecency(
     account,
     account.rooms.filter((r) => r.kind === 'Direct'),

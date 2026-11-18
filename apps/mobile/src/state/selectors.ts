@@ -9,6 +9,7 @@ import type {
 } from '@better-matrix/matrix-native/types';
 
 import { EMPTY_TIMELINE, mediaKey } from './reducer';
+import { newestMessages, type NewestMessages } from './sections';
 import { timelineId } from './timeline';
 import type { AccountData, State, Timeline } from './types';
 
@@ -19,6 +20,47 @@ export function account(state: State, id: AccountId | null): AccountData | undef
 /** The account on screen. */
 export function activeAccount(state: State): AccountData | undefined {
   return account(state, state.active);
+}
+
+/**
+ * What the room lists (the Home and DMs tabs) draw from an account: of its timelines, only each
+ * room's newest message (`newestMessages`).
+ */
+export type RoomListData = Pick<
+  AccountData,
+  | 'summary'
+  | 'rooms'
+  | 'spaces'
+  | 'invitations'
+  | 'roomsLoaded'
+  | 'scope'
+  | 'sidebar'
+  | 'latest'
+  | 'heardAt'
+> & { newest: NewestMessages };
+
+/**
+ * The account on screen as the room lists draw it. Compared with `shallow`, it changes only when
+ * one of these fields does: typing, members, threads and the like leave the lists alone, and so
+ * does a timeline changing anything but a room's newest message as the list shows it.
+ */
+export function activeRoomList(state: State): RoomListData | undefined {
+  const data = activeAccount(state);
+
+  if (!data) return undefined;
+
+  return {
+    summary: data.summary,
+    rooms: data.rooms,
+    spaces: data.spaces,
+    invitations: data.invitations,
+    roomsLoaded: data.roomsLoaded,
+    scope: data.scope,
+    sidebar: data.sidebar,
+    newest: newestMessages(data),
+    latest: data.latest,
+    heardAt: data.heardAt,
+  };
 }
 
 export function timeline(state: State, id: AccountId, key: TimelineKey): Timeline {

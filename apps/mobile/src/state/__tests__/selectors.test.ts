@@ -1,8 +1,11 @@
 import type { SavedMessage } from '@better-matrix/matrix-native/types';
 
 import { apply, initialState } from '../reducer';
-import { savedMessages, savedSignature } from '../selectors';
-import { ADA, roomSummary, summary } from '../../test/fixtures';
+import { shallow } from '../react';
+import { activeRoomList, savedMessages, savedSignature } from '../selectors';
+import type { TimelineDiff } from '@better-matrix/matrix-native/types';
+
+import { ADA, messageEntry, person, roomSummary, summary } from '../../test/fixtures';
 
 function saved(room_id: string, event_id: string): SavedMessage {
   return {
@@ -49,5 +52,54 @@ describe('saved messages', () => {
     expect(savedSignature(withSaved(['$a']), ADA)).not.toBe(
       savedSignature(withSaved(['$a', '$c']), ADA),
     );
+  });
+});
+
+describe('activeRoomList', () => {
+  it('should stay the same while someone types', () => {
+    const before = withSaved([]);
+
+    const after = apply(before, {
+      type: 'Typing',
+      data: { account: ADA, room_id: '!r:x', people: [person('@grace:x')] },
+    });
+
+    expect(shallow(activeRoomList(before), activeRoomList(after))).toBe(true);
+  });
+
+  it('should change with the rooms', () => {
+    const before = withSaved([]);
+
+    const after = apply(before, {
+      type: 'RoomsUpdated',
+      data: { account: ADA, list: { rooms: [], spaces: [], invitations: [] } },
+    });
+
+    expect(shallow(activeRoomList(before), activeRoomList(after))).toBe(false);
+  });
+
+  const changed = (state: ReturnType<typeof withSaved>, diffs: TimelineDiff[], thread?: string) =>
+    apply(state, {
+      type: 'TimelineChanged',
+      data: { account: ADA, key: { room_id: '!r:x', thread: thread ?? null }, diffs },
+    });
+
+  it('should stay the same while older history loads into a timeline', () => {
+    const before = changed(withSaved([]), [{ type: 'Reset', data: [messageEntry('$new')] }]);
+    const after = changed(before, [{ type: 'PushFront', data: messageEntry('$old') }]);
+    expect(shallow(activeRoomList(before), activeRoomList(after))).toBe(true);
+  });
+
+  it('should stay the same while a thread changes', () => {
+    const before = withSaved([]);
+    const after = changed(before, [{ type: 'Reset', data: [messageEntry('$reply')] }], '$root');
+    expect(shallow(activeRoomList(before), activeRoomList(after))).toBe(true);
+  });
+
+  it('should change when a room newest message changes', () => {
+    const before = changed(withSaved([]), [{ type: 'Reset', data: [messageEntry('$old')] }]);
+    const after = changed(before, [{ type: 'PushBack', data: messageEntry('$new') }]);
+    expect(shallow(activeRoomList(before), activeRoomList(after))).toBe(false);
+    expect(activeRoomList(after)?.newest['!r:x']?.event_id).toBe('$new');
   });
 });

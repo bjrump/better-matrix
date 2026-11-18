@@ -1,9 +1,10 @@
-// Media for views: fetched once when a view first needs it, shown once its file is there.
+// Media for views: fetched once when a view first needs it, shown once its file is there. A fetch
+// that failed is tried again by the store while a view still wants it (`Store.want`).
 
 import type { AccountId, MediaRef, MediaSize } from '@better-matrix/matrix-native/types';
 import { useEffect } from 'react';
 
-import { fetchMedia } from '../state/actions/core';
+import { wantMedia } from '../state/actions/core';
 import { useAppStore, useStore } from '../state/react';
 import { mediaUri } from '../state/selectors';
 
@@ -24,7 +25,9 @@ export function useMedia(
   const store = useAppStore();
   const uri = useStore((s) => (media ? mediaUri(s, media, size) : undefined));
   useEffect(() => {
-    if (account && media && !uri) fetchMedia(store, account, media, size);
+    if (!account || !media || uri) return;
+
+    return wantMedia(store, account, media, size);
     // `size` is a constant per call site; comparing its fields keeps the effect stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [store, account, media, uri, size.type === 'Thumbnail' ? size.data.width : 0]);

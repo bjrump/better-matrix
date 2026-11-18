@@ -694,19 +694,21 @@ const uniffiTypeBridgeObjectFactory: UniffiObjectFactory<BridgeLike> = (() => {
 const FfiConverterTypeBridge = new FfiConverterObject(uniffiTypeBridgeObjectFactory);
 
 /**
- * Hears the engine's events, one JSON object each: an `Event` or a [`BridgeEvent`].
+ * Hears the engine's events as JSON: an `Event` or a [`BridgeEvent`], or an array of those that
+ * were waiting together (`events::next_batch`).
  */
 export interface EventListener {
     
 /**
- * Handles one event.
+ * Handles one event, or a batch of them in order.
  */
     onEvent(event: string): void;
 }
 
 
 /**
- * Hears the engine's events, one JSON object each: an `Event` or a [`BridgeEvent`].
+ * Hears the engine's events as JSON: an `Event` or a [`BridgeEvent`], or an array of those that
+ * were waiting together (`events::next_batch`).
  */
 export class EventListenerImpl extends UniffiAbstractObject implements EventListener {
 
@@ -724,7 +726,7 @@ private constructor(pointer: UniffiHandle) {
 
     
 /**
- * Handles one event.
+ * Handles one event, or a batch of them in order.
  */
     onEvent(event: string): void {uniffiCaller.rustCall(
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_matrix_ffi_fn_method_eventlistener_on_event(
@@ -1567,7 +1569,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_matrix_ffi_checksum_method_bridge_send() !== 26676) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_matrix_ffi_checksum_method_bridge_send");
     }
-    if (nativeModule().ubrn_uniffi_matrix_ffi_checksum_method_eventlistener_on_event() !== 25636) {
+    if (nativeModule().ubrn_uniffi_matrix_ffi_checksum_method_eventlistener_on_event() !== 49812) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_matrix_ffi_checksum_method_eventlistener_on_event");
     }
     if (nativeModule().ubrn_uniffi_matrix_ffi_checksum_method_nativecamera_cameras() !== 2332) {

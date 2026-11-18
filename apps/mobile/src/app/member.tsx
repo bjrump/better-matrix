@@ -4,12 +4,12 @@
 
 import type { MemberRole, Moderation } from '@better-matrix/matrix-native/types';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useState } from 'react';
-import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useEffect, useState } from 'react';
+import { ActivityIndicator, Alert, FlatList, StyleSheet, Text, View } from 'react-native';
 
 import { t } from '../i18n';
 import { routes } from '../routes';
-import { invite, moderate, openDirectChat } from '../state/actions/people';
+import { invite, listAllMembers, moderate, openDirectChat } from '../state/actions/people';
 import { asksFirst, inviteTargets, may, memberOf, rolesOffered, ROLES } from '../state/people';
 import { shallow, useAppStore, useStore } from '../state/react';
 import { account as accountOf } from '../state/selectors';
@@ -37,6 +37,8 @@ export default function MemberScreen() {
   const rooms = useStore((s) => inviteTargets(accountOf(s, account)?.rooms ?? [], roomId), shallow);
   const [open, setOpen] = useState<Open>('none');
   const [busy, setBusy] = useState<'chat' | MemberRole | null>(null);
+  // A mention opens this sheet straight from the timeline, before anything listed the members.
+  useEffect(() => listAllMembers(store, account, roomId), [store, account, roomId]);
   const member = memberOf(members, userId);
 
   if (!members || !member) return null;
@@ -160,32 +162,34 @@ export default function MemberScreen() {
               chevron={false}
             />
             {open === 'invite' ? (
-              <ScrollView style={styles.nested} nestedScrollEnabled>
-                {rooms.length === 0 ? (
+              <FlatList
+                style={styles.nested}
+                nestedScrollEnabled
+                data={rooms}
+                keyExtractor={(r) => r.room_id}
+                ListEmptyComponent={
                   <Text style={[font.body, styles.note, { color: palette.textMuted }]}>
                     {t('mobile.people.no_rooms')}
                   </Text>
-                ) : (
-                  rooms.map((r) => (
-                    <ListRow
-                      key={r.room_id}
-                      testID={`member-invite-${r.room_id}`}
-                      leading={
-                        <Avatar
-                          account={account}
-                          id={r.room_id}
-                          name={r.name}
-                          media={r.avatar}
-                          size={28}
-                        />
-                      }
-                      title={r.name}
-                      onPress={() => inviteTo(r.room_id, r.name)}
-                      chevron={false}
-                    />
-                  ))
+                }
+                renderItem={({ item: r }) => (
+                  <ListRow
+                    testID={`member-invite-${r.room_id}`}
+                    leading={
+                      <Avatar
+                        account={account}
+                        id={r.room_id}
+                        name={r.name}
+                        media={r.avatar}
+                        size={28}
+                      />
+                    }
+                    title={r.name}
+                    onPress={() => inviteTo(r.room_id, r.name)}
+                    chevron={false}
+                  />
                 )}
-              </ScrollView>
+              />
             ) : null}
           </ListSection>
           {roles.length > 0 || mayKick || mayBan ? (

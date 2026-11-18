@@ -13,6 +13,7 @@ import { apply, initialState } from '../reducer';
 import {
   activity,
   addSection,
+  byRecency,
   DIRECT,
   deleteSection,
   directChats,
@@ -21,6 +22,7 @@ import {
   moveRoom,
   moveSection,
   moveSpace,
+  newestMessages,
   orderedSpaces,
   ROOMS,
   roomsInScope,
@@ -59,7 +61,7 @@ function dm(id: string, with_: string, change: Partial<RoomSummary> = {}): RoomS
   return { ...roomSummary(id, id, 'Direct'), dm_users: [with_], ...change };
 }
 
-const ids = (rooms: RoomSummary[]) => rooms.map((r) => r.room_id);
+const ids = (rooms: readonly RoomSummary[]) => rooms.map((r) => r.room_id);
 
 describe('wantsAttention', () => {
   it('a room notifying for all messages should want attention while it has unread ones', () => {
@@ -118,6 +120,22 @@ describe('roomsInScope', () => {
 
     expect(ids(roomsInScope(looped, { space: '!b' }))).toEqual(['!r']);
   });
+
+  it('the same rooms and spaces should give the same list', () => {
+    expect(roomsInScope({ ...account }, 'home')).toBe(roomsInScope(account, 'home'));
+  });
+
+  it('a new rooms list should be listed afresh', () => {
+    const changed = { ...account, rooms: [...account.rooms, room('!new')] };
+
+    expect(ids(roomsInScope(changed, 'home', 'Group'))).toEqual(['!outside', '!new']);
+  });
+
+  it('a new spaces list should be listed afresh', () => {
+    const changed = { ...account, spaces: [spaceSummary('!space', ['!outside'])] };
+
+    expect(ids(roomsInScope(changed, { space: '!space' }, 'Group'))).toEqual(['!outside']);
+  });
 });
 
 describe('hasUnread', () => {
@@ -130,6 +148,13 @@ describe('hasUnread', () => {
     const account = accountWith([room('!a', { unread: 1 })], [spaceSummary('!s', ['!a'])]);
     expect(hasUnread(account, 'home')).toBe(false);
   });
+
+  it('a scope should have unread activity once its rooms list changes to some', () => {
+    const account = accountWith([room('!a')]);
+    hasUnread(account, 'home');
+
+    expect(hasUnread({ ...account, rooms: [room('!a', { unread: 1 })] }, 'home')).toBe(true);
+  });
 });
 
 describe('lastMessage', () => {
@@ -140,6 +165,88 @@ describe('lastMessage', () => {
     });
 
     expect(lastMessage(account, '!a')?.event_id).toBe('$new');
+  });
+});
+
+describe('newestMessages', () => {
+  const withTimelines = (timelines: AccountData['timelines']) =>
+    accountWith([room('!a')], [], { timelines });
+
+  it('should hold each room newest message in its timeline', () => {
+    const account = withTimelines({
+      '!a': timelineOf([messageEntry('$old'), messageEntry('$new')]),
+    });
+
+    expect(newestMessages(account)['!a']?.event_id).toBe('$new');
+  });
+
+  it('should leave threads out', () => {
+    const account = withTimelines({ '!a|$root': timelineOf([messageEntry('$reply')]) });
+    expect(newestMessages(account)).toEqual({});
+  });
+
+  it('should stay the same while older history loads', () => {
+    const before = newestMessages(withTimelines({ '!a': timelineOf([messageEntry('$new')]) }));
+
+    const after = newestMessages(
+      withTimelines({ '!a': timelineOf([messageEntry('$old'), messageEntry('$new')]) }),
+    );
+
+    expect(after).toBe(before);
+  });
+
+  it('should stay the same when someone reacts to the newest message', () => {
+    const before = newestMessages(withTimelines({ '!a': timelineOf([messageEntry('$new')]) }));
+
+    const reaction = { key: '👍', count: 1, mine: false };
+
+    const after = newestMessages(
+      withTimelines({ '!a': timelineOf([messageEntry('$new', { reactions: [reaction] })]) }),
+    );
+
+    expect(after).toBe(before);
+  });
+
+  it('should change when a newer message arrives', () => {
+    const before = newestMessages(withTimelines({ '!a': timelineOf([messageEntry('$old')]) }));
+
+    const after = newestMessages(
+      withTimelines({ '!a': timelineOf([messageEntry('$old'), messageEntry('$new')]) }),
+    );
+
+    expect(after).not.toBe(before);
+    expect(after['!a']?.event_id).toBe('$new');
+  });
+
+  it('should change when the newest message is edited', () => {
+    const before = newestMessages(withTimelines({ '!a': timelineOf([messageEntry('$m')]) }));
+
+    const edited = newestMessages(
+      withTimelines({
+        '!a': timelineOf([
+          messageEntry('$m', { content: { type: 'Text', data: { body: 'fixed', html: null } } }),
+        ]),
+      }),
+    );
+
+    expect(lastMessage({ newest: edited, latest: {} }, '!a')?.content).toEqual({
+      type: 'Text',
+      data: { body: 'fixed', html: null },
+    });
+    expect(edited).not.toBe(before);
+  });
+
+  it('should order rooms as their timelines do', () => {
+    const account = accountWith([room('!a'), room('!b')], [], {
+      timelines: {
+        '!a': timelineOf([messageEntry('$a', { timestamp_ms: NOW - 20 })]),
+        '!b': timelineOf([messageEntry('$b', { timestamp_ms: NOW - 10 })]),
+      },
+    });
+
+    const fromNewest = { ...account, newest: newestMessages(account) };
+    expect(ids(byRecency(fromNewest, account.rooms, NOW))).toEqual(['!b', '!a']);
+    expect(ids(byRecency(account, account.rooms, NOW))).toEqual(['!b', '!a']);
   });
 });
 
