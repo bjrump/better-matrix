@@ -13,7 +13,9 @@ use matrix_core::{
 };
 use rune::{Color, El, ScrollSpec, SurfaceFit, col, el, icon, row, row as row_el, text};
 
-use super::components::{ButtonKind, button, clock_time, local_ms, media_avatar, presence_text, with_presence};
+use super::components::{
+    ButtonKind, PRESENCE_OVERHANG, button, clock_time, local_ms, media_avatar, presence_text, with_presence,
+};
 use super::icons;
 use super::room::{display_name, inline_name};
 use super::theme::{Palette, font};
@@ -410,9 +412,15 @@ fn build_row(cx: &Context<'_>, timeline: &RoomTimeline, key: &str, row: &Row, p:
             }
             _ => el().key(key.to_owned()),
         },
-        Row::ReadMarker(id) => rule_with_label(key, t!("timeline.new"), p.mention, p)
-            .opacity(timeline.read_marker_opacity(id))
-            .opacity_motion(rune::Spring::new(crate::state::READ_MARKER_FADE, 0.0)),
+        Row::ReadMarker(id) => {
+            let opacity = timeline.read_marker_opacity(id);
+            let divider = rule_with_label(key, t!("timeline.new"), p.mention, p)
+                .opacity(opacity)
+                .opacity_motion(rune::Spring::new(crate::state::READ_MARKER_FADE, 0.0));
+            // A fade runs on through history landing around it; a divider a page brings lands
+            // with the page.
+            if opacity < 1.0 { divider.animated_changes() } else { divider }
+        }
     }
 }
 
@@ -507,7 +515,7 @@ pub fn timeline(
     let bottom = at_bottom.map(Arc::clone);
     // Short timelines sit at the bottom, by the composer, as in chat apps: the frame takes the
     // space and pushes the viewport down; the viewport is as tall as its content, up to all of it.
-    let viewport = col()
+    let mut viewport = col()
         .key(view_key.to_owned())
         .w_full()
         .shrink()
@@ -525,6 +533,12 @@ pub fn timeline(
             }
         })
         .child(list);
+    // History lands whole, in this timeline only, and the viewport with it: a short timeline's
+    // viewport easing taller would uncover the rows from the bottom. News elsewhere in the
+    // window keeps its motion.
+    if timeline.is_some_and(|t| t.landing != crate::state::Landing::Idle) {
+        viewport = viewport.instant_changes();
+    }
     col().key(format!("{view_key}-frame")).w_full().grow(1.0).min_h(0.0).justify_end().child(viewport)
 }
 
@@ -628,7 +642,8 @@ fn status_emoji(event_id: &str, message: Option<&str>) -> Option<El> {
 
 /// One message: avatar and name (unless it continues the sender's run), the quoted message it
 /// answers, its content, a linked GIF, reactions and thread; the toolbar shows on hover.
-/// Clicking a room message opens its thread.
+/// Clicking a room message opens its thread; clicking the sender's name or picture, their
+/// person panel.
 fn message_row(
     cx: &Context<'_>,
     key: &str,
@@ -695,11 +710,17 @@ fn message_row(
         content
     } else {
         // A long name is cut short, keeping the time beside it within the message's width.
+        let name = text(message.sender_name.clone())
+            .key(format!("{key}-sender-name"))
+            .font(font::BODY_STRONG)
+            .color(p.text)
+            .shrink()
+            .truncate();
         let mut meta = row()
             .gap(8.0)
             .center_y()
             .min_w(0.0)
-            .child(text(message.sender_name.clone()).font(font::BODY_STRONG).color(p.text).shrink().truncate())
+            .child(opens_person(name, message).focusable(true))
             .children(status_emoji(&message.event_id, cx.data.status_message_of(&message.sender_id)))
             .child(text(clock_time(local_ms(message.timestamp_ms))).font(font::META).color(p.text_muted));
         if let Some(status) = status {
@@ -731,11 +752,19 @@ fn message_row(
         let shown = cx.data.presence.get(&message.sender_id);
         let face =
             media_avatar(&message.sender_id, &message.sender_name, message.sender_avatar.as_ref(), cx.media, AVATAR);
-        let face = with_presence(face, AVATAR, shown, p.bg, p);
-        match shown.and_then(presence_text) {
-            Some(words) => face.key(format!("presence-{}", message.event_id)).help(words),
+        // Pressable out to the dot's overhang, which the layout doesn't count.
+        let reach = AVATAR + PRESENCE_OVERHANG;
+        let face = el()
+            .key(format!("{key}-sender-face"))
+            .size(reach, reach)
+            .mr(-PRESENCE_OVERHANG)
+            .mb(-PRESENCE_OVERHANG)
+            .child(with_presence(face, AVATAR, shown, p.bg, p));
+        let face = match shown.and_then(presence_text) {
+            Some(words) => face.help(words),
             None => face,
-        }
+        };
+        opens_person(face, message)
     };
     let mut row = row()
         .key(key.to_owned())
@@ -783,6 +812,21 @@ fn message_row(
         }
     }
     row
+}
+
+/// The sender's name or picture on a message, opening their person panel rather than the thread.
+/// The name is the keyboard's stop for it; the picture is the same action for the pointer.
+fn opens_person(sender: El, message: &Message) -> El {
+    let person = matrix_core::Person {
+        id: message.sender_id.clone(),
+        name: message.sender_name.clone(),
+        avatar: message.sender_avatar.clone(),
+    };
+    sender
+        .role("button")
+        .label(message.sender_name.clone())
+        .cursor(rune::Cursor::Pointer)
+        .on_press(move |s: &mut State| s.show_side(crate::state::SidePanel::Person(person.clone())))
 }
 
 /// The message toolbar's distance from its row's right edge.
@@ -1053,18 +1097,21 @@ fn call_card(cx: &Context<'_>, event_id: &str, card: &CallCard, latest_call: boo
 fn text_body(event_id: &str, plain: &str, rich: Option<&rune::TextEdit>, p: &Palette) -> El {
     match rich {
         Some(rich) => super::message_text::formatted(&format!("rich-{event_id}"), rich, p),
-        // Its own handler keeps the clicks: a double-click takes a word, a triple-click the
-        // paragraph, rather than opening the thread.
-        None => text(plain.to_owned())
-            .key(format!("text-{event_id}"))
-            .font(font::BODY)
-            .color(p.text)
-            .self_start()
-            // A word longer than the line (a hash, say) breaks rather than runs out of the message.
-            .wrap_anywhere()
-            .selectable(true)
-            .cursor(rune::Cursor::Text)
-            .on_press(|_: &mut State| {}),
+        // Its own handler keeps the clicks, and those just beside it: a double-click takes a
+        // word, a triple-click the paragraph, rather than opening the thread.
+        None => super::message_text::reach(
+            text(plain.to_owned())
+                .key(format!("text-{event_id}"))
+                .font(font::BODY)
+                .color(p.text)
+                .self_start()
+                // A word longer than the line (a hash, say) breaks rather than runs out of the
+                // message.
+                .wrap_anywhere()
+                .selectable(true)
+                .cursor(rune::Cursor::Text)
+                .on_press(|_: &mut State| {}),
+        ),
     }
 }
 

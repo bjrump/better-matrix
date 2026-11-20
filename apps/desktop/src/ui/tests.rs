@@ -1710,3 +1710,371 @@ fn changing_the_member_search_should_change_the_list_shown() {
     rt.frame(1.0 / 60.0);
     assert!(rt.find("member-@kai:example.org").is_some());
 }
+
+/// The demo room holding only `count` short messages from Grace, all on screen.
+fn short_room(s: &mut State, count: u64) {
+    s.select_room(demo::DEMO_THREAD.0);
+    let entries = (0..count).map(|i| short_message(&format!("short-{i}"), i)).collect();
+    s.apply(
+        Event::TimelineChanged {
+            account: AccountId::new(demo::ADA),
+            key: TimelineKey::room(demo::DEMO_THREAD.0),
+            diffs: vec![TimelineDiff::Reset(entries)],
+        },
+        &mut rune::Tx::default(),
+    );
+}
+
+fn short_message(id: &str, minute: u64) -> TimelineEntry {
+    TimelineEntry {
+        id: id.to_owned(),
+        kind: EntryKind::Message(Box::new(Message {
+            event_id: format!("${id}"),
+            sender_id: "@grace:example.org".into(),
+            sender_name: "Grace Hopper".into(),
+            timestamp_ms: demo::DEMO_DAY_MS + minute * 600_000,
+            content: MessageContent::Text { body: "Short".into(), html: None },
+            ..Message::default()
+        })),
+    }
+}
+
+fn element_rect(rt: &Runtime<State>, key: &str) -> [f32; 4] {
+    rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("no {key}")).rect
+}
+
+#[test]
+fn a_press_just_left_of_message_text_should_not_open_the_thread() {
+    let mut rt = runtime(|s| short_room(s, 1));
+    // The words start where the sender's name does.
+    let words = element_rect(&rt, "msg-short-0-sender-name")[0];
+    let text = element_rect(&rt, "text-$short-0");
+    rt.pointer_down(words - 5.0, text[1] + text[3] / 2.0);
+    rt.pointer_up(words - 5.0, text[1] + text[3] / 2.0);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.active_thread().is_none());
+}
+
+#[test]
+fn a_drag_from_beside_message_text_should_select_it() {
+    let mut rt = runtime(|s| short_room(s, 3));
+    let text = element_rect(&rt, "text-$short-2");
+    let y = text[1] + text[3] / 2.0;
+    // Past the last glyph: the box ends `REACH` beyond the words.
+    let beside = text[0] + text[2] - super::message_text::REACH + 4.0;
+    rt.pointer_move(beside, y);
+    rt.pointer_down(beside, y);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(text[0] - 20.0, y);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(text[0] - 20.0, y);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.selected_text().as_deref(), Some("Short"));
+    assert!(rt.state.active_thread().is_none());
+}
+
+#[test]
+fn pressing_a_message_beside_its_text_should_still_open_the_thread() {
+    let mut rt = runtime(|s| short_room(s, 3));
+    let text = element_rect(&rt, "text-$short-2");
+    rt.pointer_down(text[0] + text[2] + 40.0, text[1] + text[3] / 2.0);
+    rt.pointer_up(text[0] + text[2] + 40.0, text[1] + text[3] / 2.0);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.active_thread(), Some("$short-2"));
+}
+
+#[test]
+fn pressing_a_senders_name_should_open_their_profile_rather_than_the_thread() {
+    let mut rt = runtime(|s| short_room(s, 1));
+    press(&mut rt, "msg-short-0-sender-name");
+    assert!(rt.state.active_thread().is_none());
+    assert!(matches!(&rt.state.side, Some(SidePanel::Person(person)) if person.id == "@grace:example.org"));
+    assert!(rt.find("person-panel").is_some());
+}
+
+#[test]
+fn pressing_a_senders_picture_should_open_their_profile_rather_than_the_thread() {
+    let mut rt = runtime(|s| short_room(s, 1));
+    press(&mut rt, "msg-short-0-sender-face");
+    assert!(rt.state.active_thread().is_none());
+    assert!(matches!(&rt.state.side, Some(SidePanel::Person(person)) if person.id == "@grace:example.org"));
+}
+
+#[test]
+fn a_profile_should_offer_the_member_menu_beside_its_more_button() {
+    let mut rt = runtime(|s| short_room(s, 1));
+    press(&mut rt, "msg-short-0-sender-name");
+    press(&mut rt, "person-more");
+    assert!(rt.find("member-menu").is_some());
+    assert!(rt.find("member-menu-invite").is_some());
+}
+
+/// As [`runtime`], built the way a window builds it: a change no input in its frame caused
+/// lands at once unless something in that frame asks for motion.
+fn window_runtime(scene: impl FnOnce(&mut State)) -> Runtime<State> {
+    let mut state = State::detached();
+    demo::seed(&mut state);
+    scene(&mut state);
+    let mut rt =
+        rune::App::new(crate::spec()).init(move || state).headless_runtime((1200.0, 760.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    for _ in 0..60 {
+        rt.frame(1.0 / 60.0);
+    }
+    rt
+}
+
+/// The heights `entries` show at in a window on the first frame after `diffs` bring them,
+/// each beside its settled height, in a frame that asked for motion (as the read marker's
+/// fade does when a room switch shows it). `also` runs in that frame too.
+fn arriving_in_a_window(
+    scene: impl FnOnce(&mut State),
+    key: TimelineKey,
+    diffs: Vec<TimelineDiff>,
+    also: impl FnOnce(&mut State, &mut rune::Tx),
+    entries: &[&str],
+) -> Vec<(f32, f32)> {
+    let mut rt = window_runtime(scene);
+    rt.update(|_, tx| tx.animated());
+    rt.update(|s, tx| {
+        s.apply(Event::TimelineChanged { account: AccountId::new(demo::ADA), key, diffs }, tx);
+        also(s, tx);
+    });
+    rt.frame(1.0 / 60.0);
+    let first: Vec<f32> = entries.iter().map(|entry| rt.presented(entry).expect(entry).0[3]).collect();
+    for _ in 0..60 {
+        rt.frame(1.0 / 60.0);
+    }
+    entries.iter().zip(first).map(|(entry, first)| (first, rt.presented(entry).unwrap().0[3])).collect()
+}
+
+/// Whether `entry`'s row shows whole inside the room's viewport on the first frame after
+/// `diffs` bring it, in a window frame that asked for motion.
+fn shown_whole_at_once(scene: impl FnOnce(&mut State), diffs: Vec<TimelineDiff>, entry: &str) -> bool {
+    let mut rt = window_runtime(scene);
+    rt.update(|_, tx| tx.animated());
+    rt.update(|s, tx| {
+        s.apply(Event::TimelineChanged { account: AccountId::new(demo::ADA), key: room_key(), diffs }, tx);
+    });
+    rt.frame(1.0 / 60.0);
+    let (row, viewport) = (rt.presented(entry).expect(entry).0, rt.presented("timeline").expect("viewport").0);
+    row[1] >= viewport[1] - 0.5 && row[1] + row[3] <= viewport[1] + viewport[3] + 0.5
+}
+
+#[test]
+fn older_messages_in_a_short_room_should_show_whole_on_their_first_frame() {
+    let page = (0..3).map(|i| TimelineDiff::PushFront(short_message(&format!("older-{i}"), 0))).collect();
+    assert!(shown_whole_at_once(|s| short_room(s, 2), page, "msg-older-2"), "the viewport uncovered the page");
+}
+
+fn room_key() -> TimelineKey {
+    TimelineKey::room(demo::DEMO_THREAD.0)
+}
+
+#[test]
+fn a_page_of_older_messages_in_a_window_should_land_at_once() {
+    let page = (0..3).map(|i| TimelineDiff::PushFront(short_message(&format!("older-{i}"), 0))).collect();
+    for (arriving, settled) in arriving_in_a_window(
+        |s| short_room(s, 2),
+        room_key(),
+        page,
+        |_, _| {},
+        &["msg-older-0", "msg-older-1", "msg-older-2"],
+    ) {
+        assert!((arriving - settled).abs() < 0.5, "it eased in: {arriving} of {settled}");
+    }
+}
+
+#[test]
+fn older_messages_should_land_at_once_when_their_page_ends_in_the_same_frame() {
+    let page = vec![TimelineDiff::PushFront(short_message("older", 0))];
+    let loaded = |s: &mut State, tx: &mut rune::Tx| {
+        s.apply(Event::HistoryLoaded { account: AccountId::new(demo::ADA), key: room_key(), reached_start: false }, tx);
+    };
+    let [(arriving, settled)] =
+        arriving_in_a_window(|s| short_room(s, 2), room_key(), page, loaded, &["msg-older"])[..]
+    else {
+        unreachable!()
+    };
+    assert!((arriving - settled).abs() < 0.5, "it eased in: {arriving} of {settled}");
+}
+
+#[test]
+fn a_new_message_in_a_window_frame_that_asked_for_motion_should_ease_in() {
+    let news = vec![TimelineDiff::PushBack(short_message("new", 30))];
+    let [(arriving, settled)] =
+        arriving_in_a_window(|s| short_room(s, 2), room_key(), news, |_, _| {}, &["msg-new"])[..]
+    else {
+        unreachable!()
+    };
+    assert!(arriving < settled - 10.0, "it landed at once: {arriving} of {settled}");
+}
+
+#[test]
+fn a_threads_history_should_leave_news_in_the_room_easing_in() {
+    let scene = |s: &mut State| {
+        short_room(s, 2);
+        s.open_thread("$short-1");
+    };
+    let thread = TimelineKey::thread(demo::DEMO_THREAD.0, "$short-1");
+    let page = vec![TimelineDiff::PushFront(short_message("reply", 0))];
+    let news = |s: &mut State, tx: &mut rune::Tx| {
+        let diffs = vec![TimelineDiff::PushBack(short_message("new", 30))];
+        s.apply(Event::TimelineChanged { account: AccountId::new(demo::ADA), key: room_key(), diffs }, tx);
+    };
+    let [(arriving, settled)] = arriving_in_a_window(scene, thread, page, news, &["msg-new"])[..] else {
+        unreachable!()
+    };
+    assert!(arriving < settled - 10.0, "the room's news landed with the thread's history: {arriving} of {settled}");
+}
+
+/// The demo room holding one message, from `sender`, with `html` formatting when given.
+fn one_message_from(s: &mut State, sender: &str, html: Option<&str>) {
+    s.select_room(demo::DEMO_THREAD.0);
+    let mut entry = short_message("only", 0);
+    if let EntryKind::Message(message) = &mut entry.kind {
+        message.sender_id = sender.to_owned();
+        message.sender_name = sender.to_owned();
+        message.content = MessageContent::Text { body: "Short".into(), html: html.map(str::to_owned) };
+    }
+    s.apply(
+        Event::TimelineChanged {
+            account: AccountId::new(demo::ADA),
+            key: TimelineKey::room(demo::DEMO_THREAD.0),
+            diffs: vec![TimelineDiff::Reset(vec![entry])],
+        },
+        &mut rune::Tx::default(),
+    );
+}
+
+#[test]
+fn the_right_edge_of_a_senders_picture_should_open_their_profile() {
+    let mut rt = runtime(|s| short_room(s, 1));
+    let face = element_rect(&rt, "msg-short-0-sender-face");
+    let (x, y) = (face[0] + face[2] - 1.0, face[1] + face[3] - 4.0);
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(1.0 / 60.0);
+    assert!(matches!(&rt.state.side, Some(SidePanel::Person(_))), "{:?}", rt.state.side);
+}
+
+#[test]
+fn a_press_just_left_of_formatted_text_should_not_open_the_thread() {
+    let mut rt = runtime(|s| one_message_from(s, "@grace:example.org", Some("<b>Short</b>")));
+    let words = element_rect(&rt, "msg-only-sender-name")[0];
+    let text = element_rect(&rt, "rich-$only-0");
+    rt.pointer_down(words - 5.0, text[1] + text[3] / 2.0);
+    rt.pointer_up(words - 5.0, text[1] + text[3] / 2.0);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.active_thread().is_none());
+}
+
+#[test]
+fn the_users_own_profile_should_offer_editing_instead_of_a_chat() {
+    let mut rt = runtime(|s| one_message_from(s, demo::ADA, None));
+    press(&mut rt, "msg-only-sender-name");
+    assert!(rt.find("person-edit").is_some());
+    assert!(rt.find("person-chat").is_none());
+    assert!(rt.find("person-more").is_none());
+}
+
+#[test]
+fn the_profile_of_someone_the_member_list_lacks_should_still_offer_the_member_menu() {
+    let mut rt = runtime(|s| one_message_from(s, "@stranger:example.org", None));
+    press(&mut rt, "msg-only-sender-name");
+    press(&mut rt, "person-more");
+    assert!(rt.find("member-menu-chat").is_some());
+}
+
+#[test]
+fn history_landing_while_the_new_marker_fades_should_keep_the_fade() {
+    let mut rt = window_runtime(unread_timeline);
+    rt.update(|s, _| s.focus_changed(true));
+    for _ in 0..10 {
+        rt.frame(1.0 / 60.0);
+    }
+    let before = rt.presented("new-marker").expect("the divider").1;
+    assert!(before > 0.1 && before < 0.95, "the fade should be under way: {before}");
+    // In a frame that asked for motion, where the landing would otherwise take the fade along.
+    rt.update(|_, tx| tx.animated());
+    rt.update(|s, tx| marker_changed(s, tx, vec![TimelineDiff::PushFront(short_message("older", 0))]));
+    rt.frame(1.0 / 60.0);
+    let after = rt.presented("new-marker").expect("the divider").1;
+    assert!(after > before - 0.2, "the fade jumped from {before} to {after}");
+}
+
+#[test]
+fn history_landing_as_the_new_marker_starts_fading_should_keep_the_fade() {
+    let mut rt = window_runtime(unread_timeline);
+    rt.update(|s, tx| {
+        s.focus_changed(true);
+        marker_changed(s, tx, vec![TimelineDiff::PushFront(short_message("older", 0))]);
+    });
+    rt.frame(1.0 / 60.0);
+    let older = rt.presented("msg-older").expect("the older message").0[3];
+    let mut seen = Vec::new();
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+        seen.push(rt.presented("new-marker").expect("the divider should still be fading").1);
+    }
+    let settled = rt.presented("msg-older").unwrap().0[3];
+    assert!((older - settled).abs() < 0.5, "the history eased in: {older} of {settled}");
+    assert!(seen.iter().any(|opacity| *opacity > 0.05 && *opacity < 0.95), "the fade was cut: {seen:?}");
+}
+
+#[test]
+fn the_presence_dots_overhang_should_open_the_profile() {
+    let mut rt = runtime(|s| short_room(s, 1));
+    let face = element_rect(&rt, "msg-short-0-sender-face");
+    // One point past the 36 pt picture, on the part of the dot that reaches beyond it.
+    let (x, y) = (face[0] + 37.0, face[1] + 32.0);
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.active_thread().is_none());
+    assert!(matches!(&rt.state.side, Some(SidePanel::Person(_))), "{:?}", rt.state.side);
+}
+
+#[test]
+fn the_users_own_profile_should_show_a_saved_name_before_the_member_list_has_it() {
+    let mut rt = runtime(|s| {
+        one_message_from(s, demo::ADA, None);
+        let mut summary = s.active_account().unwrap().summary.clone();
+        summary.display_name = "Ada, renamed".into();
+        s.apply(Event::AccountChanged(summary), &mut rune::Tx::default());
+    });
+    press(&mut rt, "msg-only-sender-name");
+    let shown = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("person-name")).and_then(|e| e.text);
+    assert_eq!(shown.as_deref(), Some("Ada, renamed"));
+}
+
+#[test]
+fn switching_to_a_room_should_show_its_first_page_whole_on_its_first_frame() {
+    let mut rt = window_runtime(|s| s.select_room(demo::DEMO_THREAD.0));
+    press(&mut rt, "room-!dm-grace:example.org");
+    let key = TimelineKey::room("!dm-grace:example.org");
+    let cached = vec![TimelineDiff::Reset(vec![short_message("cached-0", 10), short_message("cached-1", 11)])];
+    rt.update(|s, tx| {
+        s.apply(Event::TimelineChanged { account: AccountId::new(demo::ADA), key: key.clone(), diffs: cached }, tx)
+    });
+    rt.frame(1.0 / 60.0);
+    // The page arrives in a frame that asked for motion, as the New divider's fade does.
+    rt.update(|_, tx| tx.animated());
+    let page = (0..3).map(|i| TimelineDiff::PushFront(short_message(&format!("page-{i}"), 0))).collect();
+    rt.update(|s, tx| s.apply(Event::TimelineChanged { account: AccountId::new(demo::ADA), key, diffs: page }, tx));
+    rt.frame(1.0 / 60.0);
+    let entries = ["msg-page-0", "msg-page-1", "msg-page-2"];
+    let viewport = rt.presented("timeline").expect("viewport").0;
+    let first: Vec<[f32; 4]> = entries.iter().map(|entry| rt.presented(entry).expect(entry).0).collect();
+    for _ in 0..60 {
+        rt.frame(1.0 / 60.0);
+    }
+    for (entry, row) in entries.iter().zip(first) {
+        let settled = rt.presented(entry).unwrap().0[3];
+        assert!((row[3] - settled).abs() < 0.5, "{entry} eased in: {} of {settled}", row[3]);
+        assert!(
+            row[1] >= viewport[1] - 0.5 && row[1] + row[3] <= viewport[1] + viewport[3] + 0.5,
+            "{entry} {row:?} outside {viewport:?}"
+        );
+    }
+}

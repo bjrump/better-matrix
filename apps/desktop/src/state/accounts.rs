@@ -186,9 +186,24 @@ pub struct RoomTimeline {
     /// Changes whenever the timeline may have, and is never the same for two timelines: the
     /// view replans its rows only when it does. 0 for one never changed.
     pub revision: u64,
+    /// Whether the view lands this frame's rows whole rather than easing them in: history and
+    /// a timeline's first content do ([`RoomTimeline::adds_history`]).
+    pub landing: Landing,
     /// Each sender's latest name and picture, for read indicators, at the revision it was
     /// built for.
     senders: std::sync::Mutex<Option<(u64, SenderIndex)>>,
+}
+
+/// Where a timeline's whole-landing change stands, frame by frame: it lands in the view of the
+/// frame after it arrives, and only that one, so news after it eases in again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Landing {
+    #[default]
+    Idle,
+    /// Arrived since the last frame began.
+    Due,
+    /// Landing in this frame's view.
+    Now,
 }
 
 /// Senders by user ID, as [`RoomTimeline::sender`] keeps them.
@@ -236,10 +251,17 @@ impl RoomTimeline {
         }
     }
 
-    fn poll_read_marker(&mut self, tx: &mut Tx, reduced_motion: bool) -> bool {
+    /// Starts or ends the "New" divider's fade. `hold` keeps a fade from starting in a frame
+    /// whose change lands at once, which would land the fade too: it starts the next frame.
+    fn poll_read_marker(&mut self, tx: &mut Tx, reduced_motion: bool, hold: bool) -> bool {
         let Some(fade) = self.read_marker_fade.take() else { return false };
         let mut started = false;
         let (marker, until) = match fade {
+            ReadMarkerFade::Pending(marker) if hold => {
+                self.read_marker_fade = Some(ReadMarkerFade::Pending(marker));
+                tx.wake_at(tx.clock());
+                return false;
+            }
             ReadMarkerFade::Pending(marker) => {
                 // Viewport reports are not input. Explicitly animate this acknowledgement,
                 // including when the marker was visible on the room's first frame.
@@ -330,6 +352,76 @@ impl RoomTimeline {
         if let Some(id) = id {
             self.see_read_marker(&id);
         }
+    }
+
+    /// Whether `diffs` bring history rather than news: a message or room event above all the
+    /// timeline holds (a page of older messages), or its first one. A timeline fills with these
+    /// as it opens; they land as they are rather than easing in one by one. Dividers and
+    /// markers count for neither.
+    pub fn adds_history(&self, diffs: &[TimelineDiff]) -> bool {
+        let content = |kind: &EntryKind| matches!(kind, EntryKind::Message(_) | EntryKind::RoomEvent(_));
+        // News at the end of a timeline holding content, the usual change, needs no more look.
+        let appends = diffs.iter().all(|diff| matches!(diff, TimelineDiff::PushBack(_) | TimelineDiff::Append(_)));
+        if appends
+            && self.entries.iter().any(|entry| matches!(entry.kind, EntryView::Message(_) | EntryView::RoomEvent(_)))
+        {
+            return false;
+        }
+        if !diffs.iter().any(|diff| match diff {
+            TimelineDiff::PushFront(entry) | TimelineDiff::PushBack(entry) | TimelineDiff::Insert { entry, .. } => {
+                content(&entry.kind)
+            }
+            TimelineDiff::Append(entries) => entries.iter().any(|entry| content(&entry.kind)),
+            _ => false,
+        }) {
+            return false;
+        }
+        // Which entries are content, followed through the diffs as `apply` takes them.
+        let mut shown: Vec<bool> = self
+            .entries
+            .iter()
+            .map(|entry| matches!(entry.kind, EntryView::Message(_) | EntryView::RoomEvent(_)))
+            .collect();
+        let above_all = |shown: &[bool], index: usize| !shown[..index].contains(&true);
+        for diff in diffs {
+            match diff {
+                TimelineDiff::PushFront(entry) if content(&entry.kind) => return true,
+                TimelineDiff::PushFront(_) => shown.insert(0, false),
+                TimelineDiff::Insert { index, entry } if *index <= shown.len() => {
+                    if content(&entry.kind) && above_all(&shown, *index) {
+                        return true;
+                    }
+                    shown.insert(*index, content(&entry.kind));
+                }
+                TimelineDiff::PushBack(entry) => {
+                    if content(&entry.kind) && above_all(&shown, shown.len()) {
+                        return true;
+                    }
+                    shown.push(content(&entry.kind));
+                }
+                TimelineDiff::Append(entries) => {
+                    if entries.iter().any(|entry| content(&entry.kind)) && above_all(&shown, shown.len()) {
+                        return true;
+                    }
+                    shown.extend(entries.iter().map(|entry| content(&entry.kind)));
+                }
+                TimelineDiff::Set { index, entry } if *index < shown.len() => shown[*index] = content(&entry.kind),
+                TimelineDiff::Remove { index } if *index < shown.len() => {
+                    shown.remove(*index);
+                }
+                TimelineDiff::PopFront if !shown.is_empty() => {
+                    shown.remove(0);
+                }
+                TimelineDiff::PopBack => {
+                    shown.pop();
+                }
+                TimelineDiff::Truncate { length } => shown.truncate(*length),
+                TimelineDiff::Clear => shown.clear(),
+                TimelineDiff::Reset(entries) => shown = entries.iter().map(|entry| content(&entry.kind)).collect(),
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Applies the engine's diffs, in order. Indices outside the list are ignored rather than
@@ -944,11 +1036,18 @@ pub struct Accounts {
 }
 
 impl Accounts {
-    pub fn poll_read_markers(&mut self, tx: &mut Tx, reduced_motion: bool) -> bool {
+    /// Moves each timeline's [`Landing`] on a frame, and starts or ends read markers' fades: a
+    /// fade waits while a change lands whole, which would land it too.
+    pub fn poll_timelines(&mut self, tx: &mut Tx, reduced_motion: bool) -> bool {
+        let hold = self.list.iter().any(|account| account.timelines.values().any(|t| t.landing == Landing::Due));
         let mut changed = false;
         for account in &mut self.list {
             for timeline in account.timelines.values_mut() {
-                changed |= timeline.poll_read_marker(tx, reduced_motion);
+                timeline.landing = match timeline.landing {
+                    Landing::Due => Landing::Now,
+                    Landing::Now | Landing::Idle => Landing::Idle,
+                };
+                changed |= timeline.poll_read_marker(tx, reduced_motion, hold);
             }
         }
         changed
