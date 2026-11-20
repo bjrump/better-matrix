@@ -95,7 +95,8 @@ Download and run
 [`better-matrix-windows-x86_64-setup.exe`](https://github.com/m43i/better-matrix/releases/latest/download/better-matrix-windows-x86_64-setup.exe).
 It installs for your user only (no administrator rights needed), adds Better Matrix to the Start
 menu, opens `matrix:` links with it and appears in **Settings → Apps** to uninstall. Windows may show
-a SmartScreen warning for a new app: choose **More info**, then **Run anyway**. Installed with the
+a SmartScreen warning for an unsigned release, or a signed one that hasn't been downloaded often
+enough yet: choose **More info**, then **Run anyway**. Installed with the
 earlier PowerShell line? Run the installer once and it takes that install over. Prefer no installer?
 The release's `better-matrix-windows-x86_64.zip` holds the same app to unpack anywhere you can write.
 
@@ -171,6 +172,35 @@ Pushing a tag works too, once `Cargo.toml` carries its version:
 ```sh
 git tag v0.2.0 && git push origin v0.2.0
 ```
+
+Releases are signed with whatever the repository has set up, and build as before without it: a
+Developer ID (and notarization) for macOS, SignPath or a signtool certificate for Windows. The
+secrets and variables are listed at the top of `.github/workflows/release.yml`.
+
+### Code signing policy
+
+Windows releases signed through SignPath get free code signing provided by
+[SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+Only the release workflow
+(`.github/workflows/release.yml`) on GitHub's own runners submits files for signing, built from
+this repository's source: `better-matrix.exe` and its installer. An approver confirms every
+release in SignPath before it is signed.
+
+- Committers and reviewers: the [repository's maintainers](https://github.com/m43i/better-matrix/graphs/contributors)
+  with write access. Every pull request from anyone else is reviewed by one of them before it is
+  merged.
+- Approvers: [Malte Eiting](https://github.com/m43i), the repository's owner.
+
+Everyone in these roles uses multi-factor authentication on GitHub and SignPath.
+
+### Privacy
+
+Better Matrix has no telemetry and collects nothing for the project. It connects only to what you
+choose: the homeservers you sign in to (and the sign-in, media and call servers they point it to)
+and links you open. On macOS and Windows it also asks GitHub for the latest release, on startup and
+every hour, to offer updates (see [Updating and removing](#updating-and-removing)); GitHub sees
+your IP address, as with any download. Your homeservers' own privacy policies apply to what you
+send through them.
 
 ## License
 

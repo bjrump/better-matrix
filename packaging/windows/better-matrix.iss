@@ -23,6 +23,11 @@ AppSupportURL=https://github.com/m43i/better-matrix/issues
 AppUpdatesURL=https://github.com/m43i/better-matrix/releases
 AppCopyright=Copyright (c) 2026 Malte Eiting and the Better Matrix contributors
 VersionInfoVersion={#FileVersion}
+; The text versions keep a pre-release, like the executable's (apps/desktop/build.rs); code
+; signing checks the product name and version (packaging/windows/signpath/installer.xml).
+VersionInfoTextVersion={#Version}
+VersionInfoProductName=Better Matrix
+VersionInfoProductTextVersion={#Version}
 ; Per user, no administrator rights; {autopf} is then %LOCALAPPDATA%\Programs, the folder the
 ; README's earlier install line used, so running the installer adopts such an install.
 PrivilegesRequired=lowest
@@ -43,6 +48,12 @@ Compression=lzma2/max
 SolidCompression=yes
 OutputDir={#Root}\dist\out
 OutputBaseFilename=better-matrix-windows-x86_64-setup
+#ifdef Sign
+; package.ps1 defines Sign and passes the signtool command (/Ssigntool=…) when a certificate is set:
+; the installer and its uninstaller are then signed while they are built.
+SignTool=signtool
+SignedUninstaller=yes
+#endif
 ShowLanguageDialog=auto
 
 ; The app's own languages; the wizard follows the system's.
