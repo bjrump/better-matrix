@@ -9,6 +9,7 @@ mod notify;
 mod secrets;
 pub mod sound;
 pub mod updates;
+pub mod video;
 
 #[cfg(test)]
 mod tests;
@@ -51,6 +52,7 @@ impl std::fmt::Debug for Shell {
 impl Shell {
     /// The real services, delivering results to the app through `app`.
     pub fn native(app: AppHandle<State>, prefs: Prefs, scratch: std::path::PathBuf) -> Self {
+        video::prepare();
         let notifier = notify::system(app.clone());
         Self {
             updates: updates::start(app.clone(), scratch.with_file_name("updates")),
@@ -106,25 +108,26 @@ impl Shell {
     }
 
     /// Renders a PDF's pages on a worker; they arrive through [`State::document_page`], then
-    /// [`State::document_rendered`].
-    pub fn render_document(&self, media: matrix_core::MediaRef, bytes: std::sync::Arc<[u8]>) {
+    /// [`State::document_rendered`], each with the render's number, which this returns: what an
+    /// earlier render of the same file still sends is told apart.
+    pub fn render_document(&self, bytes: std::sync::Arc<[u8]>) -> u64 {
         /// More pages than anyone reads in a preview; the file itself has them all.
         const MAX_PAGES: usize = 60;
         use std::sync::atomic::Ordering;
         let render = self.document.fetch_add(1, Ordering::Relaxed) + 1;
-        let Some(app) = self.app.clone() else { return };
+        let Some(app) = self.app.clone() else { return render };
         let latest = Arc::clone(&self.document);
         let spawned = std::thread::Builder::new().name("pdf".into()).spawn(move || {
             let keep_going = || latest.load(Ordering::Relaxed) == render;
             let result = crate::state::render_document(&bytes, MAX_PAGES, keep_going, |page, size| {
-                let media = media.clone();
-                app.update(move |s: &mut State, _| s.document_page(&media, page, size));
+                app.update(move |s: &mut State, _| s.document_page(render, page, size));
             });
-            app.update(move |s: &mut State, _| s.document_rendered(&media, result));
+            app.update(move |s: &mut State, _| s.document_rendered(render, result));
         });
         if let Err(error) = spawned {
             eprintln!("better-matrix: could not render the document: {error}");
         }
+        render
     }
 
     /// Reads the permalinks later launches leave in `handoff` (see [`launch`]).
@@ -203,6 +206,38 @@ impl Shell {
         } else {
             sound::Player::Rune(rune::Player::audio(path))
         }
+    }
+
+    /// A video player for a saved file on the picked speaker, playing at once; the view runs
+    /// again when it loads, ends or fails. GStreamer's opens on a worker (its first start can
+    /// wait on the plugin scan begun at launch) and arrives through [`State::video_opened`] with
+    /// `visit`: `None` then. Rune's opens here. Headless, a stand-in that plays nothing and
+    /// reports `dimensions` as its size.
+    pub fn open_video(
+        &self,
+        path: std::path::PathBuf,
+        speaker: Option<String>,
+        dimensions: Option<(u32, u32)>,
+        visit: u64,
+    ) -> Option<video::Player> {
+        let Some(app) = self.app.clone() else {
+            return Some(video::Player::Detached(video::Detached::new(None, dimensions)));
+        };
+        let changed: rune::Waker = {
+            let app = app.clone();
+            Arc::new(move || app.update(|_: &mut State, _| {}))
+        };
+        if !video::OPENS_ON_A_WORKER {
+            return Some(video::Player::open(path, speaker.as_deref(), changed));
+        }
+        let spawned = std::thread::Builder::new().name("video-open".into()).spawn(move || {
+            let player = video::Player::open(path, speaker.as_deref(), changed);
+            app.update(move |s: &mut State, _| s.video_opened(visit, player));
+        });
+        if let Err(error) = spawned {
+            eprintln!("better-matrix: could not open the video: {error}");
+        }
+        None
     }
 
     /// A recording from the picked microphone; headless, Rune's recorder and its fake microphone.

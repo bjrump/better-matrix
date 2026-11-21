@@ -1601,7 +1601,11 @@ fn clicking_an_image_should_preview_it_full_size() {
     let (mut s, mut commands) = state();
     with_rooms(&mut s, &AccountId::new("@a:example.org"), &["!one:x"], Vec::new());
     drain(&mut commands);
-    s.open_attachment(&attachment("cat.png", matrix_core::AttachmentKind::Image));
+    s.open_attachment(
+        &TimelineKey::room("!one:x"),
+        "$file",
+        &attachment("cat.png", matrix_core::AttachmentKind::Image),
+    );
     assert!(matches!(
         &s.preview,
         Some(Preview { content: PreviewContent::Image { status: ImageStatus::Downloading, .. }, .. })
@@ -1619,7 +1623,11 @@ fn a_decoded_attachment_preview_should_refresh_without_another_user_action() {
     s.media.attach(Arc::new(|| {}));
     s.poll(&mut Tx::default());
     drain(&mut commands);
-    s.open_attachment(&attachment("cat.png", matrix_core::AttachmentKind::Image));
+    s.open_attachment(
+        &TimelineKey::room("!one:x"),
+        "$file",
+        &attachment("cat.png", matrix_core::AttachmentKind::Image),
+    );
     let (request, _) = commands.try_next().unwrap();
     let bytes: Arc<[u8]> = include_bytes!("../../../../packaging/icons/better-matrix-256.png").as_slice().into();
     apply(
@@ -1646,7 +1654,7 @@ fn opening_an_attachment_should_show_its_cached_thumbnail_while_the_original_loa
     s.media.loaded(file.media.clone().unwrap(), bytes.clone(), Some((256, 256)));
     s.media.decode(bytes).unwrap().wait().unwrap();
     s.media.measure();
-    s.open_attachment(&file);
+    s.open_attachment(&TimelineKey::room("!one:x"), "$file", &file);
     assert!(matches!(
         &s.preview,
         Some(Preview { content: PreviewContent::Image { thumbnail: Some(_), status: ImageStatus::Downloading }, .. })
@@ -1657,7 +1665,11 @@ fn opening_an_attachment_should_show_its_cached_thumbnail_while_the_original_loa
 fn clicking_a_pdf_should_preview_its_pages() {
     let (mut s, _) = state();
     with_rooms(&mut s, &AccountId::new("@a:example.org"), &["!one:x"], Vec::new());
-    s.open_attachment(&attachment("Report.PDF", matrix_core::AttachmentKind::File));
+    s.open_attachment(
+        &TimelineKey::room("!one:x"),
+        "$file",
+        &attachment("Report.PDF", matrix_core::AttachmentKind::File),
+    );
     assert!(matches!(
         &s.preview,
         Some(Preview { content: PreviewContent::Document { status: DocumentStatus::Downloading, .. }, .. })
@@ -1669,7 +1681,11 @@ fn clicking_another_file_should_not_preview_it() {
     let (mut s, mut commands) = state();
     with_rooms(&mut s, &AccountId::new("@a:example.org"), &["!one:x"], Vec::new());
     drain(&mut commands);
-    s.open_attachment(&attachment("notes.zip", matrix_core::AttachmentKind::File));
+    s.open_attachment(
+        &TimelineKey::room("!one:x"),
+        "$file",
+        &attachment("notes.zip", matrix_core::AttachmentKind::File),
+    );
     assert!(s.preview.is_none());
     assert!(commands.try_next().is_none());
 }
@@ -1679,13 +1695,228 @@ fn a_preview_that_failed_to_download_should_say_so() {
     let (mut s, mut commands) = state();
     with_rooms(&mut s, &AccountId::new("@a:example.org"), &["!one:x"], Vec::new());
     drain(&mut commands);
-    s.open_attachment(&attachment("Report.pdf", matrix_core::AttachmentKind::File));
+    s.open_attachment(
+        &TimelineKey::room("!one:x"),
+        "$file",
+        &attachment("Report.pdf", matrix_core::AttachmentKind::File),
+    );
     let (request, _) = commands.try_next().unwrap();
     apply(&mut s, Event::Finished { request, result: Err("gone".into()) });
     assert!(matches!(
         &s.preview,
         Some(Preview { content: PreviewContent::Document { status: DocumentStatus::Failed(e), .. }, .. }) if e == "gone"
     ));
+}
+
+/// Grace's batch in #general (a picture, a video, a recording, a PDF), its `index`th open in the
+/// preview; the commands sent before are drained.
+fn batch_preview(index: usize) -> (State, DetachedCommands) {
+    let (mut s, mut commands) = state();
+    crate::demo::batch_messages(&mut s);
+    drain(&mut commands);
+    let file = crate::demo::batch_attachments().swap_remove(index);
+    s.open_attachment(&TimelineKey::room(crate::demo::DEMO_THREAD.0), &format!("$batch-{index}"), &file);
+    (s, commands)
+}
+
+fn previewed(s: &State) -> (usize, usize) {
+    s.preview.as_ref().map(|preview| (preview.index, preview.batch.len())).unwrap()
+}
+
+#[test]
+fn opening_an_attachment_of_a_batch_should_offer_the_whole_batch() {
+    let (s, _) = batch_preview(1);
+    assert_eq!(previewed(&s), (1, 4));
+}
+
+#[test]
+fn stepping_past_either_end_of_a_batch_should_go_round_to_the_other() {
+    let (mut s, _) = batch_preview(3);
+    s.step_preview(1);
+    assert!(matches!(&s.preview, Some(Preview { index: 0, content: PreviewContent::Image { .. }, .. })));
+    s.step_preview(-1);
+    assert!(matches!(&s.preview, Some(Preview { index: 3, content: PreviewContent::Document { .. }, .. })));
+}
+
+#[test]
+fn opening_a_video_should_save_its_file_and_then_play_it() {
+    let (mut s, mut commands) = batch_preview(1);
+    let sent = drain(&mut commands);
+    let [(request, Command::SaveMedia { .. })] = &sent[..] else { panic!("expected the video to be saved: {sent:?}") };
+    apply(&mut s, Event::Finished { request: *request, result: Ok(()) });
+    let Some(Preview { content: PreviewContent::Video { status: VideoStatus::Open(player), .. }, .. }) = &s.preview
+    else {
+        panic!("the saved video should play")
+    };
+    assert!(player.is_playing());
+}
+
+#[test]
+fn a_video_saved_once_should_play_again_without_downloading_it_again() {
+    let (mut s, mut commands) = batch_preview(1);
+    let (request, _) = commands.try_next().unwrap();
+    apply(&mut s, Event::Finished { request, result: Ok(()) });
+    s.step_preview(1);
+    s.step_preview(-1);
+    drain(&mut commands).iter().for_each(|(_, command)| assert!(!matches!(command, Command::SaveMedia { .. })));
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Video { status: VideoStatus::Open(_), .. }, .. })
+    ));
+}
+
+#[test]
+fn a_video_that_failed_to_download_should_say_so() {
+    let (mut s, mut commands) = batch_preview(1);
+    let (request, _) = commands.try_next().unwrap();
+    apply(&mut s, Event::Finished { request, result: Err("gone".into()) });
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Video { status: VideoStatus::Failed(e), .. }, .. }) if e == "gone"
+    ));
+}
+
+#[test]
+fn pages_of_an_earlier_render_should_not_join_a_pdf_shown_again() {
+    let (mut s, mut commands) = batch_preview(3);
+    let (request, _) = commands.try_next().unwrap();
+    let media = MediaRef::opaque("Release notes.pdf");
+    let bytes: Arc<[u8]> = Arc::from(&b"%PDF"[..]);
+    apply(&mut s, Event::MediaLoaded { request, media, size: MediaSize::Original, bytes });
+    let Some(Preview { content: PreviewContent::Document { status: DocumentStatus::Rendering(earlier), .. }, .. }) =
+        s.preview
+    else {
+        panic!("the PDF should render")
+    };
+    s.step_preview(1);
+    s.step_preview(-1);
+    s.document_page(earlier, rune::Pixels::new(), (10, 10));
+    s.document_rendered(earlier, Ok(()));
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Document { pages, status: DocumentStatus::Downloading }, .. })
+            if pages.is_empty()
+    ));
+}
+
+#[test]
+fn opening_a_batch_should_fetch_the_previews_its_strip_shows() {
+    let (mut s, mut commands) = state();
+    crate::demo::batch_messages(&mut s);
+    // As if the batch's poster had gone from the cache with its row off screen.
+    s.media.forget(&MediaRef::opaque("launch-poster"));
+    drain(&mut commands);
+    let file = crate::demo::batch_attachments().swap_remove(0);
+    s.open_attachment(&TimelineKey::room(crate::demo::DEMO_THREAD.0), "$batch-0", &file);
+    let poster = MediaRef::opaque("launch-poster");
+    assert!(
+        drain(&mut commands).iter().any(|(_, c)| matches!(c, Command::FetchMedia { media, .. } if *media == poster))
+    );
+}
+
+#[test]
+fn a_failed_fetch_from_an_earlier_showing_should_not_fail_the_item_shown_again() {
+    let (mut s, mut commands) = batch_preview(0);
+    let original = |sent: Vec<(RequestId, Command)>| {
+        sent.into_iter()
+            .find(|(_, c)| matches!(c, Command::FetchMedia { size: MediaSize::Original, .. }))
+            .map(|(request, _)| request)
+            .unwrap()
+    };
+    let earlier = original(drain(&mut commands));
+    s.step_preview(1);
+    s.step_preview(-1);
+    let latest = original(drain(&mut commands));
+    apply(&mut s, Event::Finished { request: earlier, result: Err("gone".into()) });
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Image { status: ImageStatus::Downloading, .. }, .. })
+    ));
+    let bytes: Arc<[u8]> = include_bytes!("../../../../packaging/icons/better-matrix-256.png").as_slice().into();
+    let media = MediaRef::opaque("better-matrix.png");
+    apply(&mut s, Event::MediaLoaded { request: latest, media, size: MediaSize::Original, bytes });
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Image { status: ImageStatus::Decoding(_), .. }, .. })
+    ));
+}
+
+#[test]
+fn a_video_starting_should_pause_the_clip_playing() {
+    let (mut s, mut commands) = state();
+    crate::demo::batch_messages(&mut s);
+    s.toggle_audio(&crate::demo::batch_attachments().swap_remove(2));
+    drain(&mut commands);
+    let video = crate::demo::batch_attachments().swap_remove(1);
+    s.open_attachment(&TimelineKey::room(crate::demo::DEMO_THREAD.0), "$batch-1", &video);
+    assert!(s.audio.as_ref().is_some_and(|clip| clip.play), "the clip plays on while the video downloads");
+    let saved = drain(&mut commands).into_iter().find(|(_, c)| matches!(c, Command::SaveMedia { .. }));
+    apply(&mut s, Event::Finished { request: saved.unwrap().0, result: Ok(()) });
+    assert!(s.audio.as_ref().is_some_and(|clip| !clip.play));
+}
+
+#[test]
+fn a_video_sharing_an_upload_with_a_clip_saving_it_should_play_once_it_is_saved() {
+    let (mut s, mut commands) = state();
+    let file = |kind, name: &str| matrix_core::Attachment {
+        media: Some(MediaRef::opaque("shared")),
+        ..attachment(name, kind)
+    };
+    let (clip, video) =
+        (file(matrix_core::AttachmentKind::Audio, "a.mp4"), file(matrix_core::AttachmentKind::Video, "v.mp4"));
+    crate::demo::post_batch(&mut s, vec![clip.clone(), video.clone()]);
+    drain(&mut commands);
+    s.toggle_audio(&clip);
+    let (saving, _) = commands.try_next().unwrap();
+    s.open_attachment(&TimelineKey::room(crate::demo::DEMO_THREAD.0), "$batch-1", &video);
+    assert!(drain(&mut commands).iter().all(|(_, c)| !matches!(c, Command::SaveMedia { .. })), "one download");
+    apply(&mut s, Event::Finished { request: saving, result: Ok(()) });
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Video { status: VideoStatus::Open(_), .. }, .. })
+    ));
+}
+
+#[test]
+fn a_video_player_opened_for_an_earlier_showing_should_be_dropped() {
+    use crate::platform::video;
+    let (mut s, _) = batch_preview(1);
+    let opening = |s: &mut State| {
+        let preview = s.preview.as_mut().unwrap();
+        preview.content = PreviewContent::Video { thumbnail: None, status: VideoStatus::Opening };
+        preview.visit
+    };
+    let earlier = opening(&mut s);
+    s.step_preview(1);
+    s.step_preview(-1);
+    let latest = opening(&mut s);
+    s.video_opened(earlier, video::Player::Detached(video::Detached::default()));
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Video { status: VideoStatus::Opening, .. }, .. })
+    ));
+    s.video_opened(latest, video::Player::Detached(video::Detached::default()));
+    assert!(matches!(
+        &s.preview,
+        Some(Preview { content: PreviewContent::Video { status: VideoStatus::Open(_), .. }, .. })
+    ));
+}
+
+#[test]
+fn moving_on_from_a_clip_playing_in_the_preview_should_pause_it() {
+    let (mut s, _) = batch_preview(2);
+    s.toggle_preview_playback();
+    assert!(s.audio.as_ref().is_some_and(|clip| clip.play));
+    s.step_preview(1);
+    assert!(s.audio.as_ref().is_some_and(|clip| !clip.play));
+}
+
+#[test]
+fn closing_the_preview_should_pause_its_clip() {
+    let (mut s, _) = batch_preview(2);
+    s.toggle_preview_playback();
+    s.close_preview();
+    assert!(s.audio.as_ref().is_some_and(|clip| !clip.play));
 }
 
 #[test]
@@ -2262,7 +2493,11 @@ fn a_thumbnail_of_the_previewed_file_should_not_replace_its_preview() {
     let (mut s, mut commands) = state();
     with_rooms(&mut s, &AccountId::new("@a:example.org"), &["!one:x"], Vec::new());
     drain(&mut commands);
-    s.open_attachment(&attachment("Report.pdf", matrix_core::AttachmentKind::File));
+    s.open_attachment(
+        &TimelineKey::room("!one:x"),
+        "$file",
+        &attachment("Report.pdf", matrix_core::AttachmentKind::File),
+    );
     let media = s.preview.as_ref().map(|preview| preview.media.clone()).unwrap();
     // Another fetch of the same file: a thumbnail for the timeline.
     apply(

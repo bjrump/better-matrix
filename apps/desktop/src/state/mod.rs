@@ -52,7 +52,8 @@ use rune::{TextEdit, Tx};
 
 pub use accounts::READ_MARKER_FADE;
 pub use accounts::{
-    AccountData, Accounts, EntryView, Landing, RoomTimeline, Scope, TimelineItem, now_ms, wants_attention,
+    AccountData, Accounts, EntryView, Landing, RoomTimeline, Scope, TimelineItem, continues_group, now_ms,
+    wants_attention,
 };
 pub use attachments::{AttachmentAction, can_open_attachment};
 pub use call::Call;
@@ -65,7 +66,9 @@ pub use media::MediaCache;
 pub use navigation::{navigate, navigate_now};
 pub use panes::{Pane, PaneLayout, PaneSize, PaneWidths};
 pub use poll::{MAX_ANSWERS, PollForm};
-pub use preview::{DocumentStatus, ImageStatus, Opens, Preview, PreviewContent, render_document};
+pub use preview::{
+    DocumentStatus, ImageStatus, Opens, Preview, PreviewContent, PreviewItem, VideoStatus, render_document,
+};
 pub use profile::{ContactStep, ProfileForm};
 pub use readers::{READER_FACES, ReaderMenu};
 pub use room_discovery::Directory;
@@ -297,9 +300,9 @@ impl AudioClip {
     }
 }
 
-/// A clip's file in the scratch folder.
+/// A clip's or video's file in the scratch folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum AudioFile {
+enum ScratchFile {
     Downloading,
     Saved(std::path::PathBuf),
 }
@@ -580,8 +583,13 @@ enum Purpose {
     /// Sending a phone number's code.
     ContactConfirm(ContactKind),
     AccountPage,
-    /// The full file behind the open preview.
-    Preview(MediaRef),
+    /// The full file behind the open preview, for the showing ([`Preview::visit`]) that asked.
+    Preview(u64),
+    /// Saving a previewed video in scratch to play it.
+    Video {
+        media: MediaRef,
+        path: PathBuf,
+    },
     /// Saving a file the user chose to download.
     Save,
     /// Fetching the original image for a clipboard copy.
@@ -690,15 +698,20 @@ pub struct State {
     /// What playing clips here read from their files, newest last, kept once another clip is
     /// current: the waveform and length of clips whose senders sent neither.
     pub decoded_audio: Vec<DecodedAudio>,
-    /// Clips' files, downloading or saved to play: one download each, and a saved file is played
-    /// again as it is, so a clip played again never writes its file over while it is read.
-    audio_files: HashMap<MediaRef, AudioFile>,
+    /// Clips' and videos' files, downloading or saved to play: one download each, and a saved
+    /// file is played again as it is, so one played again never writes its file over while it
+    /// is read.
+    scratch_files: HashMap<MediaRef, ScratchFile>,
     /// The [`AudioClip::id`] of the clip picked last.
     last_audio_id: u64,
+    /// The [`Preview::visit`] of the item shown last.
+    preview_visits: u64,
+    /// The preview's item changed: the next `poll` scrolls the strip to its thumbnail.
+    reveal_thumbnail: bool,
     /// Accounts whose sidebar layout changed while a save was under way.
     layout_unsaved: HashSet<AccountId>,
     /// What [`State::clock`] read when the view last showed it.
-    clock_shown: Option<(Option<u64>, Option<u64>)>,
+    clock_shown: Option<(Option<u64>, Option<u64>, Option<u64>)>,
     /// The entries of each open timeline its view shows, by ID; one not reported yet counts
     /// its newest entries.
     on_screen: HashMap<(AccountId, TimelineKey), accounts::Shown>,
@@ -825,8 +838,10 @@ impl State {
             chat_search: PeopleSearch::default(),
             audio: None,
             decoded_audio: Vec::new(),
-            audio_files: HashMap::new(),
+            scratch_files: HashMap::new(),
             last_audio_id: 0,
+            preview_visits: 0,
+            reveal_thumbnail: false,
             layout_unsaved: HashSet::new(),
             clock_shown: None,
             typing: typing::Typing::default(),
@@ -1362,7 +1377,10 @@ impl State {
                 }
             }
             Event::MediaLoaded { request, media, bytes, .. } => match self.pending.get(&request) {
-                Some(Purpose::Preview(_)) => self.preview_loaded(&media, bytes),
+                Some(Purpose::Preview(visit)) => {
+                    let visit = *visit;
+                    self.preview_loaded(visit, bytes);
+                }
                 Some(Purpose::CopyImage) => self.shell.copy_image(bytes),
                 Some(Purpose::Media { dimensions, .. }) => {
                     let dimensions = *dimensions;
@@ -1680,11 +1698,14 @@ impl State {
                 Purpose::StatusMessage { account } => {
                     self.accounts.status_message_saved(account, request);
                 }
-                Purpose::Audio { media, path } => {
-                    self.audio_files.insert(media.clone(), AudioFile::Saved(path.clone()));
-                    if self.audio.as_ref().is_some_and(|clip| clip.media == *media) {
+                // Messages of either kind may share one upload: whichever saved it, both wait.
+                Purpose::Audio { media, path } | Purpose::Video { media, path } => {
+                    let (media, path) = (media.clone(), path.clone());
+                    self.scratch_files.insert(media.clone(), ScratchFile::Saved(path.clone()));
+                    if self.audio.as_ref().is_some_and(|clip| clip.media == media) {
                         self.open_audio(path.clone());
                     }
+                    self.open_video(&media, path);
                 }
                 Purpose::Avatar => self.profile.saving_avatar = false,
                 Purpose::OpenFile(path) => self.shell.open_file(path.clone()),
@@ -1806,13 +1827,21 @@ impl State {
                 self.notice = Some(error);
             }
             Purpose::Profile | Purpose::AccountPage => self.notice = Some(error),
-            Purpose::Preview(media) => {
-                if let Some(preview) = self.preview.as_mut().filter(|preview| preview.media == media) {
+            Purpose::Preview(visit) => {
+                if let Some(preview) = self.preview.as_mut().filter(|preview| preview.visit == visit) {
                     match &mut preview.content {
                         PreviewContent::Document { status, .. } => *status = DocumentStatus::Failed(error),
                         PreviewContent::Image { status, .. } => *status = ImageStatus::Failed(error),
+                        PreviewContent::Video { .. } | PreviewContent::Audio => {}
                     }
                 }
+            }
+            Purpose::Video { media, .. } => {
+                self.scratch_files.remove(&media);
+                if self.audio.as_ref().is_some_and(|clip| clip.media == media) {
+                    self.audio_failed(&media, None, error.clone());
+                }
+                self.video_failed(&media, &error);
             }
             Purpose::Save => self.notice = Some(tf!("notice.save", error = error)),
             Purpose::CopyImage => self.notice = Some(tf!("notice.copy_image", error = error)),
@@ -1841,7 +1870,8 @@ impl State {
             Purpose::Create { .. } => self.notice = Some(tf!("notice.create", error = error)),
             Purpose::Rename => self.notice = Some(tf!("notice.rename", error = error)),
             Purpose::Audio { media, .. } => {
-                self.audio_files.remove(&media);
+                self.scratch_files.remove(&media);
+                self.video_failed(&media, &error);
                 self.audio_failed(&media, None, error);
             }
             Purpose::Invite => self.notice = Some(tf!("notice.invite", error = error)),
@@ -2017,6 +2047,12 @@ impl State {
         // Images decoded since the last frame count at their exact size from now on.
         changed |= self.media.measure();
         changed |= self.preview.as_mut().is_some_and(|preview| preview.content.poll());
+        // However the preview moved (a key, an arrow, a thumbnail, opening), its thumbnail shows.
+        if std::mem::take(&mut self.reveal_thumbnail)
+            && let Some(preview) = self.preview.as_ref().filter(|preview| preview.batch.len() > 1)
+        {
+            tx.scroll_into_view_in("preview-strip", format!("preview-thumb-{}", preview.index));
+        }
         changed |= self.call.as_mut().is_some_and(Call::measure_videos);
         self.retry_due(now, tx);
         changed |= self.search_people(now);
@@ -2036,12 +2072,8 @@ impl State {
         // a tick a little faster than either is enough, and the view rebuilds only when what
         // shows changes.
         let clock = self.clock();
-        if clock.is_some() {
-            let playing = self
-                .audio
-                .as_ref()
-                .and_then(|clip| clip.player.as_ref())
-                .is_some_and(crate::platform::sound::Player::is_playing);
+        if let Some((_, audio, video)) = clock {
+            let playing = audio.is_some() || video.is_some();
             tx.wake_after(std::time::Duration::from_millis(if playing { 50 } else { 250 }));
         }
         if clock != self.clock_shown {
@@ -2315,7 +2347,8 @@ impl State {
     }
 
     /// Fetches what the timeline rows on screen show and isn't loaded yet: image previews, and
-    /// the pictures of senders and of the people room events name.
+    /// the pictures of senders and of the people room events name; and the previews of the
+    /// preview strip's batch.
     fn request_timeline_media(&mut self) {
         self.request_timeline_media_at(std::time::Instant::now());
     }
@@ -2356,6 +2389,15 @@ impl State {
             {
                 let dimensions = media::preview_size(LINK_THUMB, *size);
                 wanted.push((account.clone(), media.clone(), LINK_THUMB, dimensions));
+            }
+        }
+        // The preview's strip shows its batch's previews, rows on screen or not.
+        if let Some(preview) = self.preview.as_ref().filter(|preview| preview.batch.len() > 1) {
+            for attachment in preview.batch.iter().map(|item| &item.attachment) {
+                if let Some((media, size)) = attachment.preview() {
+                    let dimensions = media::preview_size(size, attachment.dimensions);
+                    wanted.push((preview.account.clone(), media, size, dimensions));
+                }
             }
         }
         // What shows counts as just used, so making room evicts what was scrolled past first.
@@ -3048,21 +3090,25 @@ impl State {
         // it waits there for play.
         let play = held || start_at.is_none_or(|share| share < 1.0);
         self.audio = Some(AudioClip { id, media: media.clone(), player: None, start_at, play, held, scrub_from: None });
-        match self.audio_files.get(&media).cloned() {
-            Some(AudioFile::Saved(path)) => self.open_audio(path),
-            Some(AudioFile::Downloading) => {}
+        match self.scratch_files.get(&media).cloned() {
+            Some(ScratchFile::Saved(path)) => self.open_audio(path),
+            Some(ScratchFile::Downloading) => {}
             None => {
-                let extension =
-                    std::path::Path::new(&attachment.name).extension().and_then(|e| e.to_str()).unwrap_or("audio");
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                std::hash::Hash::hash(&media, &mut hasher);
-                let name = format!("audio-{:x}.{extension}", std::hash::Hasher::finish(&hasher));
-                let path = self.shell.scratch().join(name);
-                self.audio_files.insert(media.clone(), AudioFile::Downloading);
+                let path = self.scratch_path(attachment, &media, "audio");
+                self.scratch_files.insert(media.clone(), ScratchFile::Downloading);
                 let command = Command::SaveMedia { account, media: media.clone(), path: path.clone() };
                 self.dispatch(command, Purpose::Audio { media, path });
             }
         }
+    }
+
+    /// Where `media`'s file goes in the scratch folder: named by a hash of it, keeping the
+    /// attachment's extension so players recognise the format.
+    fn scratch_path(&self, attachment: &matrix_core::Attachment, media: &MediaRef, kind: &str) -> PathBuf {
+        let extension = std::path::Path::new(&attachment.name).extension().and_then(|e| e.to_str()).unwrap_or(kind);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(media, &mut hasher);
+        self.shell.scratch().join(format!("{kind}-{:x}.{extension}", std::hash::Hasher::finish(&hasher)))
     }
 
     /// Opens the current clip's saved file in a player, unless it has one: at the speed chosen,
@@ -3101,55 +3147,250 @@ impl State {
 
     // ----- preview ---------------------------------------------------------------------------
 
-    /// Clicking an attachment: an image or a PDF opens full size; any other file saves.
-    pub fn open_attachment(&mut self, attachment: &matrix_core::Attachment) {
+    /// Clicking an attachment in `key`'s timeline: an image, PDF, video or audio clip opens
+    /// full size, with the rest of its batch to step through; any other file saves.
+    pub fn open_attachment(&mut self, key: &TimelineKey, event_id: &str, attachment: &matrix_core::Attachment) {
         let (Some(account), Some(media)) = (self.nav.account.clone(), attachment.media.clone()) else { return };
-        let content = match Opens::of(attachment) {
-            Opens::Image => PreviewContent::Image {
-                thumbnail: attachment.preview().and_then(|(media, _)| self.media.image(&media).cloned()),
-                status: ImageStatus::Downloading,
-            },
-            Opens::Document => PreviewContent::Document { pages: Vec::new(), status: DocumentStatus::Downloading },
-            Opens::Download => {
-                self.download(account, media, &attachment.name);
-                return;
+        if !Opens::previews(attachment) {
+            self.download(account, media, &attachment.name);
+            return;
+        }
+        let entries = self.accounts.get(&account).and_then(|data| data.timeline(key)).map(|t| t.entries.as_slice());
+        let mut batch = preview::batch(entries.unwrap_or_default(), event_id);
+        let index = match batch.iter().position(|item| item.event_id == event_id) {
+            Some(index) => index,
+            None => {
+                batch = vec![PreviewItem { event_id: event_id.to_owned(), attachment: attachment.clone() }];
+                0
             }
         };
-        self.popover = None;
-        let command = Command::FetchMedia { account: account.clone(), media: media.clone(), size: MediaSize::Original };
-        self.dispatch(command, Purpose::Preview(media.clone()));
-        self.preview = Some(Preview { account, attachment: attachment.clone(), media, content });
+        self.close_preview();
+        let content = self.preview_content(attachment);
+        let (attachment, item) = (attachment.clone(), batch[index].attachment.clone());
+        self.preview_visits += 1;
+        self.reveal_thumbnail = true;
+        let visit = self.preview_visits;
+        self.preview = Some(Preview { account, attachment, media, content, batch, index, visit });
+        self.load_preview_item(&item);
+        self.request_timeline_media();
     }
 
-    fn preview_loaded(&mut self, media: &MediaRef, bytes: std::sync::Arc<[u8]>) {
-        let Some(preview) = self.preview.as_mut().filter(|preview| preview.media == *media) else { return };
-        match &mut preview.content {
-            PreviewContent::Image { status, .. } => {
-                if let Some(image) = self.media.decode(bytes) {
-                    *status = ImageStatus::Decoding(image);
-                }
+    /// Moves the preview `steps` along its batch (back when negative), round from either end to
+    /// the other.
+    pub fn step_preview(&mut self, steps: i32) {
+        let Some(preview) = &self.preview else { return };
+        let len = preview.batch.len() as i64;
+        if len < 2 {
+            return;
+        }
+        let index = (preview.index as i64 + i64::from(steps)).rem_euclid(len) as usize;
+        self.show_preview_item(index);
+    }
+
+    /// Shows the batch's `index`th attachment in the preview, letting go of what showed: a PDF's
+    /// render stops, a video closes, and a clip played here pauses.
+    pub fn show_preview_item(&mut self, index: usize) {
+        let Some(preview) = &self.preview else { return };
+        let Some(item) = preview.batch.get(index).filter(|_| index != preview.index).cloned() else { return };
+        let Some(media) = item.attachment.media.clone() else { return };
+        self.leave_preview_item();
+        self.popover = None;
+        let content = self.preview_content(&item.attachment);
+        self.preview_visits += 1;
+        self.reveal_thumbnail = true;
+        let Some(preview) = self.preview.as_mut() else { return };
+        preview.visit = self.preview_visits;
+        preview.index = index;
+        preview.attachment = item.attachment.clone();
+        preview.media = media;
+        preview.content = content;
+        self.load_preview_item(&item.attachment);
+    }
+
+    /// What the preview shows of `attachment` before its file is here: the timeline's thumbnail
+    /// for a picture or a video.
+    fn preview_content(&self, attachment: &matrix_core::Attachment) -> PreviewContent {
+        let thumbnail = || attachment.preview().and_then(|(media, _)| self.media.image(&media).cloned());
+        match Opens::of(attachment) {
+            Opens::Image => PreviewContent::Image { thumbnail: thumbnail(), status: ImageStatus::Downloading },
+            Opens::Document => PreviewContent::Document { pages: Vec::new(), status: DocumentStatus::Downloading },
+            Opens::Video => PreviewContent::Video { thumbnail: thumbnail(), status: VideoStatus::Downloading },
+            Opens::Audio | Opens::Download => PreviewContent::Audio,
+        }
+    }
+
+    /// Fetches what the preview's current attachment needs: a picture's or PDF's file, or a
+    /// video's saved to play (once a run, like a clip's). A clip waits for play.
+    fn load_preview_item(&mut self, attachment: &matrix_core::Attachment) {
+        let Some(preview) = &self.preview else { return };
+        let (account, media, visit) = (preview.account.clone(), preview.media.clone(), preview.visit);
+        match preview.content {
+            PreviewContent::Image { .. } | PreviewContent::Document { .. } => {
+                let command = Command::FetchMedia { account, media, size: MediaSize::Original };
+                self.dispatch(command, Purpose::Preview(visit));
             }
-            PreviewContent::Document { status, .. } => {
-                *status = DocumentStatus::Rendering;
-                self.shell.render_document(media.clone(), bytes);
+            PreviewContent::Video { .. } => match self.scratch_files.get(&media).cloned() {
+                Some(ScratchFile::Saved(path)) => self.open_video(&media, path),
+                Some(ScratchFile::Downloading) => {}
+                None => {
+                    let path = self.scratch_path(attachment, &media, "video");
+                    self.scratch_files.insert(media.clone(), ScratchFile::Downloading);
+                    let command = Command::SaveMedia { account, media: media.clone(), path: path.clone() };
+                    self.dispatch(command, Purpose::Video { media, path });
+                }
+            },
+            PreviewContent::Audio => {}
+        }
+    }
+
+    /// Lets go of the preview's current attachment: stops its PDF render, drops its video and
+    /// pauses its clip if it plays.
+    fn leave_preview_item(&mut self) {
+        self.shell.stop_document();
+        let Some(preview) = &mut self.preview else { return };
+        let clip = matches!(preview.content, PreviewContent::Audio)
+            && self.audio.as_ref().is_some_and(|clip| clip.media == preview.media);
+        preview.content = PreviewContent::Audio;
+        if clip {
+            self.pause_audio();
+        }
+    }
+
+    /// A previewed video's file is saved: it plays, if it is still the one shown.
+    fn open_video(&mut self, media: &MediaRef, path: PathBuf) {
+        let Some(preview) = self.preview.as_mut().filter(|preview| preview.media == *media) else { return };
+        let PreviewContent::Video { status, .. } = &mut preview.content else { return };
+        if !matches!(status, VideoStatus::Downloading) {
+            return;
+        }
+        *status = VideoStatus::Opening;
+        let (speaker, dimensions, visit) =
+            (self.settings.devices.speaker.clone(), preview.attachment.dimensions, preview.visit);
+        if let Some(player) = self.shell.open_video(path, speaker, dimensions, visit) {
+            self.video_opened(visit, player);
+        }
+    }
+
+    /// The player for showing `visit` of a video is open, paused: it plays, over no clip, if that
+    /// showing is still on screen; else it is dropped unheard.
+    pub fn video_opened(&mut self, visit: u64, player: crate::platform::video::Player) {
+        let opening = |preview: &Preview| {
+            preview.visit == visit
+                && matches!(preview.content, PreviewContent::Video { status: VideoStatus::Opening, .. })
+        };
+        if !self.preview.as_ref().is_some_and(opening) {
+            return;
+        }
+        self.pause_audio();
+        player.play();
+        if let Some(Preview { content: PreviewContent::Video { status, .. }, .. }) = &mut self.preview {
+            *status = VideoStatus::Open(player);
+        }
+    }
+
+    /// The previewed video's file couldn't be saved: it says why.
+    fn video_failed(&mut self, media: &MediaRef, error: &str) {
+        if let Some(Preview {
+            content: PreviewContent::Video { status: status @ VideoStatus::Downloading, .. }, ..
+        }) = self.preview.as_mut().filter(|preview| preview.media == *media)
+        {
+            *status = VideoStatus::Failed(error.to_owned());
+        }
+    }
+
+    /// Pauses the clip playing, or queued to play once its file comes.
+    fn pause_audio(&mut self) {
+        if let Some(clip) = &mut self.audio {
+            clip.play = false;
+            if let Some(player) = &clip.player {
+                player.pause();
             }
         }
     }
 
+    /// The previewed video's player, once its file is here.
+    fn preview_video(&self) -> Option<&crate::platform::video::Player> {
+        match &self.preview.as_ref()?.content {
+            PreviewContent::Video { status: VideoStatus::Open(player), .. } => Some(player),
+            _ => None,
+        }
+    }
+
+    /// Plays or pauses the previewed video, or its clip; play after the end starts over.
+    pub fn toggle_preview_playback(&mut self) {
+        let Some(preview) = &self.preview else { return };
+        if matches!(preview.content, PreviewContent::Audio) {
+            let attachment = preview.attachment.clone();
+            return self.toggle_audio(&attachment);
+        }
+        match self.preview_video() {
+            Some(player) if player.is_playing() => player.pause(),
+            Some(player) => {
+                player.play();
+                self.pause_audio();
+            }
+            None => {}
+        }
+    }
+
+    /// Moves the previewed video to `share` of the way through.
+    pub fn seek_video(&mut self, share: f64) {
+        if let Some(player) = self.preview_video() {
+            player.seek(share);
+        }
+    }
+
+    /// Moves the previewed video `steps` twentieths along, as the arrow keys do on its bar.
+    pub fn step_video(&mut self, steps: i32) {
+        if let Some(player) = self.preview_video() {
+            player.seek(player.progress() + f64::from(steps) * AUDIO_STEP);
+        }
+    }
+
+    /// Mutes the previewed video, or lets it be heard again.
+    pub fn toggle_video_sound(&mut self) {
+        if let Some(player) = self.preview_video() {
+            player.set_muted(!player.muted());
+        }
+    }
+
+    /// The previewed file is here, for the showing `visit`: a picture decodes, a PDF renders.
+    /// What an earlier showing of the same file asked for is dropped, as is a second answer.
+    fn preview_loaded(&mut self, visit: u64, bytes: std::sync::Arc<[u8]>) {
+        let Some(preview) = self.preview.as_mut().filter(|preview| preview.visit == visit) else { return };
+        match &mut preview.content {
+            PreviewContent::Image { status: status @ ImageStatus::Downloading, .. } => {
+                if let Some(image) = self.media.decode(bytes) {
+                    *status = ImageStatus::Decoding(image);
+                }
+            }
+            PreviewContent::Document { status: status @ DocumentStatus::Downloading, .. } => {
+                *status = DocumentStatus::Rendering(self.shell.render_document(bytes));
+            }
+            _ => {}
+        }
+    }
+
+    /// The previewed PDF's render `render`, if it still is, while it renders.
+    fn rendering(&mut self, render: u64) -> Option<(&mut preview::Pages, &mut DocumentStatus)> {
+        match &mut self.preview.as_mut()?.content {
+            PreviewContent::Document { pages, status } if *status == DocumentStatus::Rendering(render) => {
+                Some((pages, status))
+            }
+            _ => None,
+        }
+    }
+
     /// One more page of the previewed PDF, from the renderer.
-    pub fn document_page(&mut self, media: &MediaRef, page: rune::Pixels, size: (u32, u32)) {
-        if let Some(Preview { content: PreviewContent::Document { pages, .. }, .. }) =
-            self.preview.as_mut().filter(|preview| preview.media == *media)
-        {
+    pub fn document_page(&mut self, render: u64, page: rune::Pixels, size: (u32, u32)) {
+        if let Some((pages, _)) = self.rendering(render) {
             pages.push((page, size));
         }
     }
 
     /// The renderer finished the previewed PDF, or failed.
-    pub fn document_rendered(&mut self, media: &MediaRef, result: Result<(), String>) {
-        if let Some(Preview { content: PreviewContent::Document { status, .. }, .. }) =
-            self.preview.as_mut().filter(|preview| preview.media == *media)
-        {
+    pub fn document_rendered(&mut self, render: u64, result: Result<(), String>) {
+        if let Some((_, status)) = self.rendering(render) {
             *status = match result {
                 Ok(()) => DocumentStatus::Done,
                 Err(error) => DocumentStatus::Failed(error),
@@ -3161,8 +3402,8 @@ impl State {
         if matches!(self.popover, Some(Popover::AttachmentMenu { .. })) {
             self.popover = None;
         }
+        self.leave_preview_item();
         self.preview = None;
-        self.shell.stop_document();
     }
 
     /// Saves the previewed file where the user picks.
@@ -4363,22 +4604,24 @@ impl State {
         self.notice = Some(tf!("notice.audio", error = error));
     }
 
-    /// The second a voice memo's timer shows, and a playing clip's second and progress step,
-    /// while either is counting: the view rebuilds when it changes.
-    fn clock(&self) -> Option<(Option<u64>, Option<u64>)> {
+    /// The second a voice memo's timer shows, and a playing clip's and previewed video's second
+    /// and progress step, while any is counting: the view rebuilds when it changes.
+    fn clock(&self) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
         let recording = [&self.composer, &self.thread_composer]
             .iter()
             .filter_map(|composer| composer.voice.as_ref())
             .map(|memo| memo.recorder.elapsed().max(0.0) as u64)
             .max();
+        // The second shown and the step of the progress, together.
+        let step = |time: f64, progress: f64| (time.max(0.0) as u64) << 16 | (progress * PROGRESS_STEPS) as u64;
         let playing = || {
             let clip = self.audio.as_ref()?;
             let player = clip.player.as_ref().filter(|player| player.is_playing())?;
-            // The second shown and the step of the progress, together.
-            Some((player.time().max(0.0) as u64) << 16 | (clip.progress() * PROGRESS_STEPS) as u64)
+            Some(step(player.time(), clip.progress()))
         };
+        let video = self.preview_video().filter(|player| player.is_playing()).map(|p| step(p.time(), p.progress()));
         let playing = playing();
-        (recording.is_some() || playing.is_some()).then_some((recording, playing))
+        (recording.is_some() || playing.is_some() || video.is_some()).then_some((recording, playing, video))
     }
 
     /// Asks for files with the system dialog for a composer; they arrive through

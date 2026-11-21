@@ -30,8 +30,8 @@ contents:
   - src: LICENSE
     dst: /usr/share/licenses/better-matrix/LICENSE
 
-# What the binary links (ALSA, GLib), and what it loads when there (keyboard maps, Wayland,
-# the GPU through Vulkan, PipeWire for screen sharing).
+# What the binary links (ALSA, GLib, GStreamer for video), and what it loads when there (keyboard
+# maps, Wayland, the GPU through Vulkan, PipeWire for screen sharing, GStreamer's codecs).
 overrides:
   # Built on Ubuntu 22.04: glibc 2.35 or later (RHEL 9's 2.34 is too old).
   deb:
@@ -39,7 +39,14 @@ overrides:
       - libc6 (>= 2.35)
       - libasound2t64 | libasound2
       - libglib2.0-0t64 | libglib2.0-0
+      - libgstreamer1.0-0
+      - libgstreamer-plugins-base1.0-0
+      # playbin, the player itself, and MP4, WebM and VP8/VP9.
+      - gstreamer1.0-plugins-base
+      - gstreamer1.0-plugins-good
     recommends:
+      # H.264 and HEVC, which phones record.
+      - gstreamer1.0-libav
       - libxkbcommon0
       - libwayland-client0
       - libvulkan1
@@ -50,7 +57,18 @@ overrides:
       - libc.so.6(GLIBC_2.35)(64bit)
       - alsa-lib
       - glib2
+      # GStreamer by its libraries, and its plugins (playbin; MP4, WebM, VP8/VP9) by either name:
+      # Fedora and openSUSE package them differently.
+      - libgstreamer-1.0.so.0()(64bit)
+      - libgstapp-1.0.so.0()(64bit)
+      - libgstvideo-1.0.so.0()(64bit)
+      - (gstreamer1-plugins-base or gstreamer-plugins-base)
+      - (gstreamer1-plugins-good or gstreamer-plugins-good)
     recommends:
+      # H.264 and AAC, which phones record, by the GStreamer elements both distributions'
+      # packages provide; a weak dependency nothing provides is skipped.
+      - gstreamer1(element-openh264dec)()(64bit)
+      - gstreamer1(element-avdec_aac)()(64bit)
       - libxkbcommon
       - libwayland-client
       - vulkan-loader
@@ -60,6 +78,10 @@ overrides:
     depends:
       - alsa-lib
       - glib2
+      - gstreamer
+      - gst-plugins-base
+      - gst-plugins-good
+      - gst-libav
       - libxkbcommon
       - wayland
       - vulkan-icd-loader
