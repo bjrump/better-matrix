@@ -27,7 +27,9 @@ import { Icon } from '../icons';
 import { useMedia } from '../media';
 import { useNow } from '../shell/useNow';
 import { usePalette } from '../theme';
+import { CARD_IMAGE_SIDE, cardLayout } from './cardLayout';
 import { useMessageSide, useTimelineContext } from './context';
+import { HiddenMedia, useHiddenMedia } from './HiddenMedia';
 import { useContentWidth } from './readersLayout';
 import { openLink } from './open';
 
@@ -156,64 +158,85 @@ export function ThreadLink({ root, thread }: { root: string; thread: ThreadSumma
 /** The size link cards fetch their image at. */
 const CARD_IMAGE: MediaSize = { type: 'Thumbnail', data: { width: 192, height: 192 } };
 
-const CARD_IMAGE_SIDE = 64;
-
-/** The least width a link card keeps for its words beside its picture. */
-const CARD_WORDS_MIN = 100;
-
 /**
  * A link's card once the homeserver described the page: site, title, description and image
- * (left out where it would leave the words too little room).
+ * (under the words where beside them it would leave them too little room).
  */
-export function LinkCard({ url }: { url: string }) {
+export function LinkCard({ url, message }: { url: string; message: Message }) {
   const palette = usePalette();
   const store = useAppStore();
-  const { account } = useTimelineContext();
+  const { account, openActions } = useTimelineContext();
   const preview = useStore((s) => s.linkPreviews[previewKey(account, url)]);
   useEffect(() => wantLinkPreview(store, account, url), [store, account, url]);
-  const image = useMedia(account, preview?.image?.[0] ?? null, CARD_IMAGE);
-  // The picture shows only where it leaves the words a readable width beside it.
-  const words = useContentWidth() - 2 * 12 - 3 - 2 * 12 - CARD_IMAGE_SIDE;
-  const showImage = preview?.image != null && words >= CARD_WORDS_MIN;
+  // The page's picture waits for Show where the account keeps media back (ADR 0011).
+  const { hidden, reveal } = useHiddenMedia(message);
+  const image = useMedia(account, hidden ? null : (preview?.image?.[0] ?? null), CARD_IMAGE);
+  // The picture sits beside the words where they keep a readable width, else under them.
+  const below = cardLayout(useContentWidth()) === 'below';
+  const showImage = preview?.image != null;
 
   if (!preview) return null;
 
+  // The link and Show are siblings, so each is its own control; the card itself isn't one.
   return (
-    <Pressable
-      onPress={() => openLink(store, url, account)}
-      accessibilityRole="link"
-      accessibilityLabel={preview.title ?? url}
-      android_ripple={{ color: palette.hover }}
-      style={[styles.card, { backgroundColor: palette.surface, borderColor: palette.divider }]}
+    <View
+      style={[
+        styles.card,
+        below ? styles.cardStacked : null,
+        { backgroundColor: palette.surface, borderColor: palette.divider },
+      ]}
     >
-      <View style={[styles.cardBar, { backgroundColor: palette.accent }]} />
-      <View style={styles.cardWords}>
-        {preview.site ? (
-          <Text style={[font.meta, { color: palette.textMuted }]} numberOfLines={1}>
-            {preview.site}
-          </Text>
-        ) : null}
-        {preview.title ? (
-          <Text style={[font.bodyStrong, { color: palette.accent }]} numberOfLines={2}>
-            {preview.title}
-          </Text>
-        ) : null}
-        {preview.description ? (
-          <Text style={[font.meta, { color: palette.text }]} numberOfLines={3}>
-            {preview.description}
-          </Text>
-        ) : null}
-      </View>
-      {showImage ? (
-        image ? (
-          <Image source={{ uri: image }} style={styles.cardImage} contentFit="cover" />
-        ) : (
-          <View style={[styles.cardImage, styles.center, { backgroundColor: palette.hover }]}>
-            <Icon name="image" size={20} color={palette.textMuted} />
+      <Pressable
+        onPress={() => openLink(store, url, account)}
+        onLongPress={() => openActions(message)}
+        delayLongPress={350}
+        accessibilityRole="link"
+        accessibilityLabel={preview.title ?? url}
+        android_ripple={{ color: palette.hover }}
+        style={[styles.cardLink, below ? styles.cardStacked : null]}
+      >
+        <View style={below ? styles.cardLink : styles.cardRow}>
+          <View style={[styles.cardBar, { backgroundColor: palette.accent }]} />
+          <View style={styles.cardWords}>
+            {preview.site ? (
+              <Text style={[font.meta, { color: palette.textMuted }]} numberOfLines={1}>
+                {preview.site}
+              </Text>
+            ) : null}
+            {preview.title ? (
+              <Text style={[font.bodyStrong, { color: palette.accent }]} numberOfLines={2}>
+                {preview.title}
+              </Text>
+            ) : null}
+            {preview.description ? (
+              <Text style={[font.meta, { color: palette.text }]} numberOfLines={3}>
+                {preview.description}
+              </Text>
+            ) : null}
           </View>
-        )
+        </View>
+        {showImage && !hidden ? (
+          image ? (
+            <Image source={{ uri: image }} style={styles.cardImage} contentFit="cover" />
+          ) : (
+            <View style={[styles.cardImage, styles.center, { backgroundColor: palette.hover }]}>
+              <Icon name="image" size={20} color={palette.textMuted} />
+            </View>
+          )
+        ) : null}
+      </Pressable>
+      {showImage && hidden ? (
+        <HiddenMedia
+          label={t('mobile.safety.hidden_picture')}
+          onShow={reveal}
+          onLongPress={() => openActions(message)}
+          style={styles.cardImage}
+          width={CARD_IMAGE_SIDE}
+          height={CARD_IMAGE_SIDE}
+          inCard
+        />
       ) : null}
-    </Pressable>
+    </View>
   );
 }
 
@@ -226,7 +249,7 @@ const GIF_ASPECT = 4 / 3;
 const gifAspects = new Lru<string, number>(200);
 
 /** A GIF behind a link, playing once fetched, as wide as fits; pressing it opens the link. */
-export function LinkedGif({ url }: { url: string }) {
+export function LinkedGif({ url, message }: { url: string; message: Message }) {
   const palette = usePalette();
   const store = useAppStore();
   const path = useStore((s) => s.gifs[url]);
@@ -235,7 +258,22 @@ export function LinkedGif({ url }: { url: string }) {
   const aspect = measured?.url === url ? measured.aspect : (gifAspects.get(url) ?? GIF_ASPECT);
   const width = Math.min(GIF_WIDTH, useContentWidth());
   const side = useMessageSide();
-  useEffect(() => wantGif(store, url), [store, url]);
+  // A GIF the account keeps back is not fetched before Show (ADR 0011).
+  const { hidden, reveal } = useHiddenMedia(message);
+  const { openActions } = useTimelineContext();
+  useEffect(() => (hidden ? undefined : wantGif(store, url)), [store, url, hidden]);
+
+  if (hidden)
+    return (
+      <HiddenMedia
+        label={t('mobile.safety.hidden_gif')}
+        onShow={reveal}
+        style={[styles.gif, { width, aspectRatio: aspect }]}
+        width={width}
+        height={width / aspect}
+        onLongPress={() => openActions(message)}
+      />
+    );
 
   return (
     <Pressable
@@ -320,6 +358,10 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     overflow: 'hidden',
   },
+  cardLink: { flex: 1, flexDirection: 'row', gap: 12 },
+  cardRow: { flex: 1, flexDirection: 'row', gap: 12 },
+  // A card too narrow for its picture beside the words: the picture goes under them.
+  cardStacked: { flexDirection: 'column' },
   cardBar: { width: 3, borderRadius: 1.5 },
   cardWords: { flex: 1, gap: 2 },
   cardImage: { width: CARD_IMAGE_SIDE, height: CARD_IMAGE_SIDE, borderRadius: 8 },

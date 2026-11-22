@@ -31,6 +31,14 @@ fn wording(confirm: &Confirm) -> (String, String, &'static str) {
             t!("confirm.delete_message_body").to_owned(),
             t!("actions.delete"),
         ),
+        Confirm::Ignore { name, decline: None, .. } => {
+            (tf!("confirm.ignore_title", name = name), t!("confirm.ignore_body").to_owned(), t!("safety.ignore"))
+        }
+        Confirm::Ignore { name, decline: Some(_), .. } => (
+            tf!("confirm.ignore_title", name = name),
+            t!("confirm.ignore_inviter_body").to_owned(),
+            t!("confirm.ignore_inviter"),
+        ),
         Confirm::RemoveWidget { name, .. } => (
             tf!("confirm.remove_widget_title", name = name),
             t!("confirm.remove_widget_body").to_owned(),

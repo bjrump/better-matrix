@@ -25,7 +25,12 @@ import {
 } from '../../../state/actions/people';
 import { filterMembers, fileOpens, mayRename } from '../../../state/people';
 import { useAppStore, useStore } from '../../../state/react';
-import { account as accountOf, room as roomOf } from '../../../state/selectors';
+import {
+  account as accountOf,
+  room as roomOf,
+  shownFiles,
+  shownThreads,
+} from '../../../state/selectors';
 import { font } from '../../../theme/palette';
 import { Avatar } from '../../../ui/Avatar';
 import { Divider, ListRow, ListSection } from '../../../ui/components';
@@ -54,8 +59,10 @@ export default function RoomInfoScreen() {
   const palette = usePalette();
   const room = useStore((s) => roomOf(s, account, roomId));
   const members = useStore((s) => accountOf(s, account)?.members[roomId]);
-  const threads = useStore((s) => accountOf(s, account)?.threads[roomId]);
-  const files = useStore((s) => accountOf(s, account)?.files[roomId]);
+  // Threads people the user ignores started stay out of the list (ADR 0011).
+  const threads = useStore((s) => shownThreads(s, account, roomId));
+  // What people the user ignores shared stays out of the list (ADR 0011).
+  const files = useStore((s) => shownFiles(s, account, roomId));
 
   const defaultMode = useStore(
     (s) => accountOf(s, account)?.summary.default_notifications ?? 'AllMessages',
@@ -189,6 +196,16 @@ export default function RoomInfoScreen() {
             onPress={() => router.push(routes.renameRoom(account, roomId))}
           />
         ) : null}
+        <QuickAction
+          testID="info-report"
+          icon="flag"
+          label={t('report.action')}
+          onPress={() =>
+            router.push(
+              routes.report(account, { type: 'Room', data: { room_id: roomId } }, room.name),
+            )
+          }
+        />
         <QuickAction
           testID="info-leave"
           icon={direct ? 'trash' : 'leave'}

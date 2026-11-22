@@ -8,15 +8,19 @@ import type {
   AccountSummary,
   MediaRef,
   MediaSize,
+  Safety,
   SidebarLayout,
+  TimelineDiff,
+  TimelineEntry,
   TimelineKey,
 } from '@better-matrix/matrix-native/types';
 
 import { initialCallView, reconcileView } from './callView';
+import { DEFAULT_SAFETY, hiddenEntry, withChange } from './safety';
 import { keepUnchanged } from './json';
 import { DEFAULT_SETTINGS, type Settings } from './settings';
 import { applyDiffs, timelineId } from './timeline';
-import type { AccountData, State, Timeline } from './types';
+import type { AccountData, PendingSafety, State, Timeline } from './types';
 
 /** A fetched rendition's key in `State.media`. */
 export function mediaKey(media: MediaRef, size: MediaSize): string {
@@ -39,6 +43,7 @@ export function initialState(settings: Settings = DEFAULT_SETTINGS): State {
     ended: [],
     media: {},
     gifs: {},
+    revealedMedia: {},
     linkPreviews: {},
     call: {
       current: null,
@@ -95,6 +100,10 @@ function newAccount(summary: AccountSummary): AccountData {
     status: 'Online',
     savedStatus: 'Online',
     keywords: null,
+    safety: DEFAULT_SAFETY,
+    savedSafety: DEFAULT_SAFETY,
+    pendingSafety: [],
+    hiddenEvents: {},
   };
 }
 
@@ -209,7 +218,8 @@ export function applyLatestMessages(
   for (const { data } of events) {
     const account = state.accounts.find((a) => a.summary.id === data.account);
 
-    if (!account) continue;
+    // Someone the user ignores says nothing in the room list, whichever came first.
+    if (!account || fromIgnored(account, data.message)) continue;
     let maps = changes.get(data.account);
 
     if (!maps) {
@@ -230,6 +240,185 @@ export function applyLatestMessages(
   for (const [id, maps] of changes) next = updateAccount(next, id, (a) => ({ ...a, ...maps }));
 
   return next;
+}
+
+/**
+ * `account` with the reported choices `saved` and the changes still on their way, shown as
+ * `safety`. Whenever the confirmed ignore list gains anyone, what anyone on it said goes
+ * (`withoutIgnored`), so the order the answers come in can't keep it.
+ */
+export function withSafety(
+  account: AccountData,
+  saved: Safety,
+  pending: PendingSafety[],
+): AccountData {
+  const safety = pending.reduce((shown, p) => withChange(shown, p.change), saved);
+  const next = { ...account, safety, savedSafety: saved, pendingSafety: pending };
+  // Only a confirmed ignore removes anything: one still on its way hides at read time
+  // (`selectors.pendingIgnored`), so one that fails gives everything back.
+  const gained = saved.ignored.some((id) => !account.savedSafety.ignored.includes(id));
+
+  return gained ? withoutIgnored(next, new Set(saved.ignored)) : next;
+}
+
+/** `state` with a change to `account`'s choices shown at once, until the engine answers. */
+export function addPendingSafety(state: State, account: AccountId, pending: PendingSafety): State {
+  return updateAccount(state, account, (a) =>
+    withSafety(a, a.savedSafety, [...a.pendingSafety, pending]),
+  );
+}
+
+/**
+ * `state` once the engine answered the change `id`: it no longer shows on top of what was
+ * reported. A change saved came with its own report; one refused leaves the reported choices and
+ * the other changes still on their way, never an older snapshot.
+ */
+export function settlePendingSafety(state: State, account: AccountId, id: number): State {
+  return updateAccount(state, account, (a) =>
+    withSafety(
+      a,
+      a.savedSafety,
+      a.pendingSafety.filter((p) => p.id !== id),
+    ),
+  );
+}
+
+/** Whether `message` was sent by someone `account` ignores, as the engine confirmed. */
+function fromIgnored(account: AccountData, message: { sender_id: string }): boolean {
+  return account.savedSafety.ignored.includes(message.sender_id);
+}
+
+/**
+ * `entry` drawn as nothing when someone the user ignores sent it, keeping its place; its event
+ * ID goes into `hidden`, so nothing shows it again in another form (`AccountData.hiddenEvents`).
+ */
+function hiddenIfIgnored(
+  ignored: ReadonlySet<string>,
+  entry: TimelineEntry,
+  hidden: Array<[string, string]>,
+): TimelineEntry {
+  if (entry.kind.type !== 'Message' || !ignored.has(entry.kind.data.sender_id)) return entry;
+  hidden.push([entry.kind.data.event_id, entry.kind.data.sender_id]);
+
+  return hiddenEntry(entry.id, entry.kind.data);
+}
+
+/** `hiddenEvents` with `events` (event ID, sender) added; the same object when there are none. */
+function withHidden(
+  hiddenEvents: AccountData['hiddenEvents'],
+  events: Array<[string, string]>,
+): AccountData['hiddenEvents'] {
+  if (events.length === 0) return hiddenEvents;
+  const next = { ...hiddenEvents };
+
+  for (const [id, sender] of events) next[id] = sender;
+
+  return next;
+}
+
+/** The event IDs `diffs` bring as deleted (redacted) messages. */
+function redactedIn(diffs: TimelineDiff[]): string[] {
+  const entries = diffs.flatMap((diff): TimelineEntry[] => {
+    switch (diff.type) {
+      case 'Reset':
+      case 'Append':
+        return diff.data;
+      case 'PushFront':
+      case 'PushBack':
+        return [diff.data];
+      case 'Insert':
+      case 'Set':
+        return [diff.data.entry];
+      case 'Clear':
+      case 'PopFront':
+      case 'PopBack':
+      case 'Remove':
+      case 'Truncate':
+        return [];
+    }
+  });
+
+  return entries.flatMap((e) =>
+    e.kind.type === 'Message' && e.kind.data.content.type === 'Redacted'
+      ? [e.kind.data.event_id]
+      : [],
+  );
+}
+
+/**
+ * `account` with deleted messages gone from the room's listed files, so Room Info can't open
+ * them again once no timeline holds them any more.
+ */
+function withoutRedactedFiles(
+  account: AccountData,
+  roomId: string,
+  redacted: string[],
+): AccountData {
+  const files = account.files[roomId];
+
+  if (!files || !files.some((f) => redacted.includes(f.event_id))) return account;
+
+  return {
+    ...account,
+    files: { ...account.files, [roomId]: files.filter((f) => !redacted.includes(f.event_id)) },
+  };
+}
+
+/** `diffs` with what ignored people sent drawn as nothing, the positions kept. */
+function diffsWithoutIgnored(
+  diffs: TimelineDiff[],
+  ignored: ReadonlySet<string>,
+  hidden: Array<[string, string]>,
+): TimelineDiff[] {
+  if (ignored.size === 0) return diffs;
+  const hide = (entry: TimelineEntry) => hiddenIfIgnored(ignored, entry, hidden);
+
+  return diffs.map((diff): TimelineDiff => {
+    switch (diff.type) {
+      case 'Reset':
+      case 'Append':
+        return { ...diff, data: diff.data.map(hide) };
+      case 'PushFront':
+      case 'PushBack':
+        return { ...diff, data: hide(diff.data) };
+      case 'Insert':
+      case 'Set':
+        return { ...diff, data: { ...diff.data, entry: hide(diff.data.entry) } };
+      case 'Clear':
+      case 'PopFront':
+      case 'PopBack':
+      case 'Remove':
+      case 'Truncate':
+        return diff;
+    }
+  });
+}
+
+/**
+ * `account` without what the people in `ignored` said: their messages leave the room list's
+ * previews (`latest`) and every kept timeline, cold ones included, which no engine reset reaches
+ * (ADR 0011). A timeline keeps its length, as the engine's diffs count by position: their
+ * entries become hidden events (`hiddenEntry`), which draw nothing, until the engine sends the timeline again.
+ */
+function withoutIgnored(account: AccountData, ignored: ReadonlySet<string>): AccountData {
+  const latest = Object.fromEntries(
+    Object.entries(account.latest).filter(([, message]) => !ignored.has(message.sender_id)),
+  );
+
+  const timelines: Record<string, Timeline> = {};
+  const hidden: Array<[string, string]> = [];
+
+  for (const [id, timeline] of Object.entries(account.timelines)) {
+    const hit = timeline.entries.some(
+      (e) => e.kind.type === 'Message' && ignored.has(e.kind.data.sender_id),
+    );
+
+    timelines[id] = hit
+      ? { ...timeline, entries: timeline.entries.map((e) => hiddenIfIgnored(ignored, e, hidden)) }
+      : timeline;
+  }
+
+  return { ...account, latest, timelines, hiddenEvents: withHidden(account.hiddenEvents, hidden) };
 }
 
 /** Folds one event into the state. `now` is when it arrived, in ms since the epoch. */
@@ -308,11 +497,30 @@ export function apply(state: State, event: EngineEvent, now: number = Date.now()
       });
     case 'LatestMessage':
       return applyLatestMessages(state, [event], now);
-    case 'TimelineChanged':
-      return updateTimeline(state, event.data.account, event.data.key, (t) => ({
+    case 'TimelineChanged': {
+      const owner = state.accounts.find((a) => a.summary.id === event.data.account);
+      const ignored = new Set(owner?.savedSafety.ignored);
+      const hidden: Array<[string, string]> = [];
+      const diffs = diffsWithoutIgnored(event.data.diffs, ignored, hidden);
+
+      const next = updateTimeline(state, event.data.account, event.data.key, (t) => ({
         ...t,
-        entries: applyDiffs(t.entries, event.data.diffs),
+        entries: applyDiffs(t.entries, diffs),
       }));
+
+      const redacted = redactedIn(event.data.diffs);
+
+      return hidden.length === 0 && redacted.length === 0
+        ? next
+        : updateAccount(next, event.data.account, (a) =>
+            withoutRedactedFiles(
+              { ...a, hiddenEvents: withHidden(a.hiddenEvents, hidden) },
+              event.data.key.room_id,
+              redacted,
+            ),
+          );
+    }
+
     case 'HistoryLoaded':
       return updateTimeline(state, event.data.account, event.data.key, (t) => ({
         ...t,
@@ -420,6 +628,10 @@ export function apply(state: State, event: EngineEvent, now: number = Date.now()
         status: event.data.status,
         savedStatus: event.data.status,
       }));
+    case 'Safety':
+      return updateAccount(state, event.data.account, (a) =>
+        withSafety(a, event.data.safety, a.pendingSafety),
+      );
     case 'RecoveryKey':
       return { ...state, recoveryKey: { account: event.data.account, key: event.data.key } };
     case 'Verification': {

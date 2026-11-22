@@ -19,6 +19,7 @@ import type {
   RoomMember,
   RoomPreview,
   RoomSummary,
+  Safety,
   SasEmoji,
   Session,
   SharedFile,
@@ -192,6 +193,7 @@ function room(
     call: { via: 'Rtc', participants: [] },
     activity_ms: null,
     encrypted: true,
+    public: false,
     pinned: id === GENERAL ? [DEMO_THREAD.root, TEST_PLAN] : [],
     can_pin: true,
     saved: id === GENERAL ? [TEST_PLAN] : [],
@@ -502,7 +504,12 @@ function work(): Fixture {
     rooms: [
       [room(GENERAL, 'general', 'Company-wide announcements and chatter', 0, 0), room0],
       [
-        room(DESIGN, 'design', 'Mockups, reviews and the component library', 3, 0),
+        // Public: anyone may join and post, so the account's media choice may hold its
+        // pictures back (ADR 0011).
+        {
+          ...room(DESIGN, 'design', 'Mockups, reviews and the component library', 3, 0),
+          public: true,
+        },
         messages([
           [GRACE, 'Grace Hopper', text('New sidebar spacing is ready for review.'), 0],
           [
@@ -578,9 +585,58 @@ function work(): Fixture {
         inviter: person(GRACE, 'Grace Hopper'),
         space: false,
         kind: 'Group',
+        stranger: false,
       },
     ],
   };
+}
+
+/** Someone Ada shares no room with, ignored in the safety scenes. */
+export const SPAMMER = '@prizes:spam.example';
+
+/** An invitation from a stranger, which the safety scenes hide. */
+export const STRANGER_INVITE = '!free-crypto:spam.example';
+
+/**
+ * The safety scenes: Ada hides strangers' invitations (one waits, from someone she shares no
+ * room with), shows media in private rooms only, and ignores a spammer.
+ */
+export function safetyEvents(): EngineEvent[] {
+  const fixture = work();
+
+  const safety: Safety = {
+    ignored: [SPAMMER],
+    media: 'Private',
+    invite_pictures: false,
+    hide_stranger_invites: true,
+  };
+
+  return [
+    {
+      type: 'RoomsUpdated',
+      data: {
+        account: ADA,
+        list: {
+          rooms: fixture.rooms.map(([r]) => r),
+          spaces: fixture.spaces,
+          invitations: [
+            ...(fixture.invitations ?? []),
+            {
+              room_id: STRANGER_INVITE,
+              name: 'Free crypto giveaway',
+              topic: 'Claim your prize now!',
+              avatar: null,
+              inviter: person(SPAMMER, 'Prize Desk'),
+              space: false,
+              kind: 'Group',
+              stranger: true,
+            },
+          ],
+        },
+      },
+    },
+    { type: 'Safety', data: { account: ADA, safety } },
+  ];
 }
 
 function hobby(): Fixture {
@@ -740,6 +796,7 @@ export function demoThreads(): ThreadInfo[] {
   return [
     {
       root: DEMO_THREAD.root,
+      sender_id: ALAN,
       sender_name: 'Alan Turing',
       body: 'Cross-signing verification passes on Linux, macOS and Windows.',
       replies: 3,
@@ -753,23 +810,24 @@ export function demoFiles(): SharedFile[] {
   const shared = (
     name: string,
     kind: Attachment['kind'],
-    who: string,
+    [senderId, who]: [string, string],
     minutes: number,
     extra: Partial<Attachment> = {},
   ): SharedFile => ({
     event_id: `$file-${name}`,
+    sender_id: senderId,
     sender_name: who,
     timestamp: DEMO_DAY_MS + 10 * 3_600_000 + minutes * 60_000,
     attachment: file(name, kind, extra),
   });
 
   return [
-    shared('release-notes-0.2.pdf', 'File', 'Ada Lovelace', 33),
-    shared('screenshot-sidebar.png', 'Image', 'Grace Hopper', 12, {
+    shared('release-notes-0.2.pdf', 'File', [ADA, 'Ada Lovelace'], 33),
+    shared('screenshot-sidebar.png', 'Image', [GRACE, 'Grace Hopper'], 12, {
       media: DEMO_MEDIA.screenshot,
       dimensions: [1024, 1024],
     }),
-    shared('standup.ogg', 'Audio', 'Kai', 2),
+    shared('standup.ogg', 'Audio', [KAI, 'Kai'], 2),
   ];
 }
 

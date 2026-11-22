@@ -529,6 +529,23 @@ pub enum Command {
         /// The room.
         room_id: String,
     },
+    /// Change what the user keeps away (ignored people, media, invitations) on every session;
+    /// an [`Event::Safety`] with the choices after it follows.
+    SetSafety {
+        /// Whose.
+        account: AccountId,
+        /// The change.
+        change: crate::SafetyChange,
+    },
+    /// Report a message, a room or a person to the homeserver's admins.
+    Report {
+        /// Who reports.
+        account: AccountId,
+        /// What is reported.
+        target: crate::ReportTarget,
+        /// Why, in the user's words; may be empty.
+        reason: String,
+    },
     /// Kick, ban or change the role of a room member; [`Event::Members`] follows.
     ModerateMember {
         /// Whose room.
@@ -1011,6 +1028,15 @@ pub enum Event {
         account: AccountId,
         /// The arrangement.
         layout: crate::SidebarLayout,
+    },
+    /// What the user keeps away on an account (ignored people, media, invitations): sent once
+    /// an account is ready, when a sync changes it (here or on another session), and after
+    /// [`Command::SetSafety`].
+    Safety {
+        /// Whose.
+        account: AccountId,
+        /// The choices.
+        safety: crate::Safety,
     },
     /// The account's notification keywords, sorted: sent once an account is ready and whenever
     /// they change, here or on another session.
@@ -2501,6 +2527,25 @@ impl State {
                     Ok(Outcome::Done)
                 })
             }
+            // Queued now, in the order the commands came: two quick choices end on the later.
+            Command::SetSafety { account: id, change } => {
+                let changed = self.account(&id).map(|account| {
+                    let queue = account.safety_queue.clone();
+                    queue.run(async move { account.change_safety(&change).await })
+                });
+                Box::pin(async move {
+                    let safety = changed?.await?;
+                    sink.emit(Event::Safety { account: id, safety });
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::Report { account, target, reason } => {
+                let account = self.account(&account);
+                Box::pin(async move {
+                    account?.report(&target, &reason).await?;
+                    Ok(Outcome::Done)
+                })
+            }
             Command::SetSidebarLayout { account, layout } => {
                 let account = self.account(&account);
                 Box::pin(async move {
@@ -2868,6 +2913,14 @@ impl State {
                     let (account, flows, sink, feed) =
                         (account.clone(), flows.clone(), Arc::clone(&self.sink), feed.clone());
                     tokio::spawn(async move {
+                        // The safety choices as this device stored them, before any room or
+                        // invitation shows (the room list follows from the sync loop below): an
+                        // app hides what they hide from the first frame. The server's follow, as
+                        // a save may not have synced here before the app quit.
+                        match account.safety().await {
+                            Ok(safety) => sink.emit(Event::Safety { account: account.id().clone(), safety }),
+                            Err(error) => eprintln!("matrix-engine: could not read the safety choices: {error}"),
+                        }
                         // What this device knew showed at once, even offline; the server's
                         // profile follows.
                         let profile = async {
@@ -2887,6 +2940,11 @@ impl State {
                                 retry = (retry * 2).min(std::time::Duration::from_secs(60));
                             };
                             sink.emit(Event::SidebarLayout { account: account.id().clone(), layout });
+                        };
+                        let safety = async {
+                            if let Some(safety) = account.synced_safety().await {
+                                sink.emit(Event::Safety { account: account.id().clone(), safety });
+                            }
                         };
                         let keywords = async {
                             sink.emit(Event::Keywords {
@@ -2925,6 +2983,7 @@ impl State {
                         tokio::join!(
                             profile,
                             layout,
+                            safety,
                             keywords,
                             status,
                             own,
@@ -3281,6 +3340,11 @@ async fn sync_until_error(
                 && let Ok(layout) = account.sidebar_layout().await
             {
                 sink.emit(Event::SidebarLayout { account: account.id().clone(), layout });
+            }
+            if crate::safety::changed_in(&response.account_data)
+                && let Some(safety) = account.synced_safety().await
+            {
+                sink.emit(Event::Safety { account: account.id().clone(), safety });
             }
             // The user's own, as the server says now: the sync may predate a status message saved
             // meanwhile.

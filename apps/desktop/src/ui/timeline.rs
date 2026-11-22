@@ -65,6 +65,8 @@ pub struct Context<'a> {
     /// The widest a message's content can be, once the timeline has a size: pictures and GIFs
     /// fit it, so they never reach into the readers' column.
     pub content_width: f32,
+    /// Messages whose held-back media the user chose to show.
+    pub revealed: &'a std::collections::HashSet<(AccountId, String)>,
     /// Hidden events get a line (developer tools).
     pub show_hidden: bool,
     /// Classic rows or chat bubbles.
@@ -92,9 +94,15 @@ impl<'a> Context<'a> {
             reader_faces: crate::state::READER_FACES,
             readers_column: key.thread.is_none(),
             content_width: f32::INFINITY,
+            revealed: &s.revealed_media,
             show_hidden: s.settings.show_hidden_events,
             layout: s.settings.message_layout,
         }
+    }
+
+    /// Whether a message's media waits for a press here (ADR 0011).
+    fn hides(&self, message: &Message) -> bool {
+        self.data.hides_media(&self.key.room_id, message, self.revealed)
     }
 
     fn in_thread(&self) -> bool {
@@ -318,7 +326,21 @@ fn cached_plan(view_key: &str, cx: &Context<'_>, timeline: Option<&RoomTimeline>
     })
 }
 
-/// The rows of a timeline and their keys: one cheap pass over the entries.
+/// What a timeline's plan is made of: its revision, and whom the user ignores. 0 (never cached)
+/// while the timeline has no revision.
+fn plan_version(revision: u64, ignored: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if revision == 0 {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (revision, ignored).hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
+/// The rows of a timeline and their keys: one cheap pass over the entries. Messages from people
+/// the user ignores have no row: a timeline kept from before the ignore still holds them until
+/// the engine reloads it.
 fn plan(cx: &Context<'_>, timeline: Option<&RoomTimeline>) -> Vec<(String, Row)> {
     let mut rows = Vec::new();
     let entries = timeline.map_or(&[][..], |t| t.entries.as_slice());
@@ -360,6 +382,7 @@ fn plan(cx: &Context<'_>, timeline: Option<&RoomTimeline>) -> Vec<(String, Row)>
                 rows.push((cx.key(&entry.id), Row::Events { start: at, end: index }));
                 previous = None;
             }
+            EntryView::Message(item) if cx.data.ignores(&item.message.sender_id) => {}
             EntryView::Message(item) => {
                 let message = &item.message;
                 let continues = previous.is_some_and(|prev| crate::state::continues_group(prev, message));
@@ -376,7 +399,8 @@ fn plan(cx: &Context<'_>, timeline: Option<&RoomTimeline>) -> Vec<(String, Row)>
                 rows.push((entry.id.clone(), Row::Start));
                 previous = None;
             }
-            EntryView::Hidden(_) if cx.show_hidden => {
+            // Not even developer tools show what people the user ignores sent.
+            EntryView::Hidden(event) if cx.show_hidden && !cx.data.ignores(&event.sender.id) => {
                 rows.push((cx.key(&entry.id), Row::Hidden(at)));
                 previous = None;
             }
@@ -481,7 +505,10 @@ pub fn timeline(
     // messages commits as fast as a short one. The plan is one pass, made again only when the
     // timeline changed; each mounted row is built from the state by its plan entry.
     let revision = timeline.map_or(0, |t| t.revision);
-    let plan = cached_plan(view_key, cx, timeline, revision);
+    // The plan leaves out people the user ignores: it is made again when that list changes too.
+    // Everyone left out as ignored (shown, saved or being saved): the rows change with them.
+    let version = plan_version(revision, cx.data.ignores_fingerprint());
+    let plan = cached_plan(view_key, cx, timeline, version);
     let (keys, shown) = (Rc::clone(&plan), Rc::clone(&plan));
     let (account, key, palette) = (cx.account.clone(), cx.key.clone(), *p);
     let (seen_account, seen_key) = (account.clone(), key.clone());
@@ -552,7 +579,7 @@ pub fn timeline(
         });
     // The keys change only with the plan, so Rune need not ask for them again until then.
     if revision != 0 {
-        list = list.virtual_rows_version(revision);
+        list = list.virtual_rows_version(version);
     }
     let flag = Arc::clone(near_top);
     let bottom = at_bottom.map(Arc::clone);
@@ -722,7 +749,8 @@ fn message_parts(
         inside.push(quote_block(quote, said));
     }
     // A GIF link shows as the GIF, below the rest of the message (if any) like an attachment.
-    match item.gif.as_ref().filter(|gif| cx.show_gifs && !cx.gifs.has_failed(&gif.url)) {
+    // Held back, it keeps its Show even when an earlier download failed: Show tries again.
+    match item.gif.as_ref().filter(|gif| cx.show_gifs && (cx.hides(message) || !cx.gifs.has_failed(&gif.url))) {
         Some(gif) => {
             if let Some(rest) = &gif.rest {
                 let caption = text_body(&message.event_id, &rest.plain, rest.rich.as_ref(), said);
@@ -733,7 +761,11 @@ fn message_parts(
                     caption
                 });
             }
-            inside.push(linked_gif(&gif.url, cx.content_width, cx.gifs, said));
+            inside.push(if cx.hides(message) {
+                hidden_media(cx, &message.event_id, (cx.content_width.clamp(0.0, 280.0), 160.0), said)
+            } else {
+                linked_gif(&gif.url, cx.content_width, cx.gifs, said)
+            });
         }
         None => inside.push(message_body(item, cx, latest_call, said)),
     }
@@ -741,7 +773,9 @@ fn message_parts(
     if let Some((url, card)) =
         item.card_link(cx.show_gifs).and_then(|url| Some((url, cx.link_previews?.get(cx.account, url)?)))
     {
-        inside.push(link_card(&cx.key(&format!("link-{}", message.event_id)), url, card, card_width, cx.media, said));
+        let held = cx.hides(message).then(|| (cx.account.clone(), message.event_id.clone()));
+        let key = cx.key(&format!("link-{}", message.event_id));
+        inside.push(link_card(&key, url, card, (card_width, held), cx.media, said));
     }
     let mut below = Vec::new();
     if interactive && !message.reactions.is_empty() {
@@ -1232,12 +1266,17 @@ fn message_body(item: &TimelineItem, cx: &Context<'_>, latest_call: bool, p: &Pa
         {
             audio_card(&item.message, attachment, cx, p)
         }
-        (MessageContent::Attachment(attachment), _) => match attachment.preview() {
-            Some((preview, _)) if !media.has_failed(&preview) => {
-                image_preview(&item.message.event_id, attachment, cx, p)
+        (MessageContent::Attachment(attachment), _) => {
+            // Held back or not is decided first: a picture or video with no preview to draw
+            // falls back to its file card, which then offers Show too.
+            let held = crate::state::visual(attachment) && cx.hides(&item.message);
+            match attachment.preview() {
+                Some((preview, _)) if !media.has_failed(&preview) => {
+                    image_preview(&item.message.event_id, attachment, cx, held, p)
+                }
+                _ => attachment_card(&item.message.event_id, attachment, cx, held, p),
             }
-            _ => attachment_card(&item.message.event_id, attachment, cx, p),
-        },
+        }
         (MessageContent::Redacted, _) => notice_text(t!("message.deleted"), p),
         (MessageContent::Undecryptable, _) => notice_text(t!("message.undecryptable"), p),
         (MessageContent::Poll(poll), _) => {
@@ -1346,7 +1385,17 @@ const PREVIEW_BOX: (f32, f32) = (360.0, 280.0);
 /// A link's preview card, up to `max_width` wide: the site, the page's title and description,
 /// and its image beside them when that leaves the words room.
 /// Pressing it opens the link.
-fn link_card(key: &str, url: &str, card: &LinkPreview, max_width: f32, media: &MediaCache, p: &Palette) -> El {
+/// `fit`: the widest it may be, and the account and message whose held-back image waits for a
+/// press, if it does.
+fn link_card(
+    key: &str,
+    url: &str,
+    card: &LinkPreview,
+    fit: (f32, Option<(AccountId, String)>),
+    media: &MediaCache,
+    p: &Palette,
+) -> El {
+    let (max_width, held) = fit;
     /// The image's side.
     const THUMB: f32 = 72.0;
     let mut words = col().grow(1.0).min_w(0.0).gap(2.0);
@@ -1359,9 +1408,53 @@ fn link_card(key: &str, url: &str, card: &LinkPreview, max_width: f32, media: &M
     if let Some(description) = &card.description {
         words = words.child(text(description.clone()).font(font::META).color(p.text).max_lines(3).wrap_anywhere());
     }
+    // An image that failed to load leaves the words on their own. Beside them while that leaves
+    // the words a readable width; in a narrower message, under them.
+    const WORDS_MIN: f32 = 120.0;
+    let room = max_width - 2.0 * 12.0 - 3.0 - 2.0 * 12.0 - THUMB;
+    // Held back, it keeps its Show even when an earlier download failed: Show tries again.
+    let thumb =
+        card.image.as_ref().filter(|(image, _)| held.is_some() || !media.has_failed(image)).map(|(image, _)| {
+            let thumb = el().size(THUMB, THUMB).radius(8.0).clip_rounded(8.0);
+            match (held, media.image(image)) {
+                // Held back: a press on it shows it, rather than opening the link.
+                (Some((account, event_id)), _) => thumb
+                    .key(format!("{key}-hidden"))
+                    .fill(p.hover)
+                    .center()
+                    .role("button")
+                    .label(t!("safety.show_media").to_owned())
+                    .help(t!("safety.show_media").to_owned())
+                    .focusable(true)
+                    .cursor(rune::Cursor::Pointer)
+                    .child(
+                        col()
+                            .gap(4.0)
+                            .items_center()
+                            .child(icon(&icons::EYE_OFF, 18.0).color(p.text_muted))
+                            .child(text(t!("safety.show_media")).font(font::META).color(p.accent)),
+                    )
+                    .on_press({
+                        let image = image.clone();
+                        move |s: &mut State| {
+                            s.media.try_again(&image);
+                            s.reveal_media(&account, &event_id);
+                        }
+                    }),
+                (None, Some(image)) => thumb.pixels_fit(image.pixels(), SurfaceFit::Fill),
+                (None, None) => thumb.fill(p.hover).center().child(icon(&icons::IMAGE, 20.0).color(p.text_muted)),
+            }
+        });
+    let (beside, under) = match thumb {
+        Some(thumb) if room >= WORDS_MIN => (Some(thumb), None),
+        thumb => (None, thumb),
+    };
+    if let Some(thumb) = under {
+        words = words.child(thumb.mt(6.0));
+    }
     let label = card.title.clone().unwrap_or_else(|| url.to_owned());
     let opened = url.to_owned();
-    let mut entry = row()
+    let entry = row()
         .key(key.to_owned())
         .max_w(460.0)
         .mt(4.0)
@@ -1377,18 +1470,8 @@ fn link_card(key: &str, url: &str, card: &LinkPreview, max_width: f32, media: &M
         .cursor(rune::Cursor::Pointer)
         .focusable(true)
         .child(el().w(3.0).h_full().min_h(THUMB.min(40.0)).radius(1.5).fill(p.accent))
-        .child(words);
-    // An image that failed to load leaves the words on their own, as does a message too narrow
-    // to keep a readable width for them beside it.
-    const WORDS_MIN: f32 = 120.0;
-    let room = max_width - 2.0 * 12.0 - 3.0 - 2.0 * 12.0 - THUMB;
-    if let Some((image, _)) = card.image.as_ref().filter(|(image, _)| !media.has_failed(image) && room >= WORDS_MIN) {
-        let thumb = el().size(THUMB, THUMB).radius(8.0).clip_rounded(8.0);
-        entry = entry.child(match media.image(image) {
-            Some(image) => thumb.pixels_fit(image.pixels(), SurfaceFit::Fill),
-            None => thumb.fill(p.hover).center().child(icon(&icons::IMAGE, 20.0).color(p.text_muted)),
-        });
-    }
+        .child(words)
+        .children(beside);
     entry.on_press_tx(move |s: &mut State, tx| s.open_link(&opened, tx))
 }
 
@@ -1396,13 +1479,16 @@ fn link_card(key: &str, url: &str, card: &LinkPreview, max_width: f32, media: &M
 /// sender's dimensions so the timeline doesn't jump when it loads; a placeholder of the same size
 /// until then. Without the sender's dimensions, or with ones the picture doesn't match, the loaded
 /// picture's own decide. A video's poster carries a play button.
-fn image_preview(event_id: &str, attachment: &Attachment, cx: &Context<'_>, p: &Palette) -> El {
+fn image_preview(event_id: &str, attachment: &Attachment, cx: &Context<'_>, held: bool, p: &Palette) -> El {
     let max_width = cx.content_width;
-    let image = attachment.preview().and_then(|(media_ref, _)| cx.media.image(&media_ref));
+    let image = attachment.preview().and_then(|(media_ref, _)| cx.media.image(&media_ref)).filter(|_| !held);
     let loaded = image.and_then(|image| image.size()).map(|[w, h]| (w, h));
     let (w, h) = preview_size(shown_dimensions(attachment.dimensions, loaded));
     let scale = (max_width / w).clamp(0.0, 1.0);
     let (w, h) = (w * scale, h * scale);
+    if held {
+        return hidden_media(cx, event_id, (w, h), p).mt(4.0);
+    }
     let (opened, key, id) = (attachment.clone(), cx.key.clone(), event_id.to_owned());
     let frame = el()
         .key(format!("image-{}", attachment.name))
@@ -1423,6 +1509,29 @@ fn image_preview(event_id: &str, attachment: &Attachment, cx: &Context<'_>, p: &
         }
     };
     if video { frame.child(play_badge()) } else { frame }
+}
+
+/// Media the account's choice holds back (ADR 0011), in its place and at its size: nothing is
+/// fetched until Show.
+fn hidden_media(cx: &Context<'_>, event_id: &str, (w, h): (f32, f32), p: &Palette) -> El {
+    let (account, id) = (cx.account.clone(), event_id.to_owned());
+    let show = button(t!("safety.show_media"), ButtonKind::Secondary, true, p)
+        .key(cx.key(&format!("show-media-{event_id}")))
+        .on_press(move |s: &mut State| s.reveal_media(&account, &id));
+    let mut inside = col().gap(8.0).items_center();
+    // A short frame keeps only the button.
+    if h >= 110.0 {
+        inside = inside
+            .child(icon(&icons::EYE_OFF, 24.0).color(p.text_muted))
+            .child(text(t!("safety.hidden_media")).font(font::META).color(p.text_muted));
+    }
+    el().key(cx.key(&format!("hidden-media-{event_id}")))
+        .size(w, h)
+        .radius(8.0)
+        .fill(p.surface)
+        .border(1.0, p.divider)
+        .center()
+        .child(inside.child(show))
 }
 
 /// The play button over a video's poster.
@@ -1455,9 +1564,12 @@ pub fn preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
 }
 
 /// A file's card, up to the message's width: a long name is cut short.
-fn attachment_card(event_id: &str, attachment: &Attachment, cx: &Context<'_>, p: &Palette) -> El {
+/// `held`: a picture or video the media choice holds back, which opens only once its Show is
+/// pressed (ADR 0011).
+fn attachment_card(event_id: &str, attachment: &Attachment, cx: &Context<'_>, held: bool, p: &Palette) -> El {
     let max_width = cx.content_width;
     let glyph = match attachment.kind {
+        _ if held => &icons::EYE_OFF,
         AttachmentKind::Image => &icons::IMAGE,
         AttachmentKind::Video => &icons::VIDEO,
         AttachmentKind::Audio => &icons::AUDIO,
@@ -1469,7 +1581,7 @@ fn attachment_card(event_id: &str, attachment: &Attachment, cx: &Context<'_>, p:
         titles = titles.child(text(human_size(size)).font(font::META).color(p.text_muted));
     }
     let (opened, key, id) = (attachment.clone(), cx.key.clone(), event_id.to_owned());
-    row()
+    let card = row()
         .key(format!("file-{}", attachment.name))
         .max_w(max_width.clamp(0.0, 420.0))
         .mt(4.0)
@@ -1483,8 +1595,6 @@ fn attachment_card(event_id: &str, attachment: &Attachment, cx: &Context<'_>, p:
         .hover(p.hover.alpha(p.hover.a * 2.0))
         .role("button")
         .label(attachment.name.clone())
-        .cursor(rune::Cursor::Pointer)
-        .on_press(move |s: &mut State| s.open_attachment(&key, &id, &opened))
         .child(
             el().size(36.0, 36.0)
                 .radius(6.0)
@@ -1492,7 +1602,16 @@ fn attachment_card(event_id: &str, attachment: &Attachment, cx: &Context<'_>, p:
                 .center()
                 .child(icon(glyph, 20.0).color(p.accent)),
         )
-        .child(titles)
+        .child(titles);
+    if !held {
+        return card.cursor(rune::Cursor::Pointer).on_press(move |s: &mut State| s.open_attachment(&key, &id, &opened));
+    }
+    let account = cx.account.clone();
+    card.child(el().grow(1.0)).child(
+        button(t!("safety.show_media"), ButtonKind::Secondary, true, p)
+            .key(cx.key(&format!("show-media-{event_id}")))
+            .on_press(move |s: &mut State| s.reveal_media(&account, &id)),
+    )
 }
 
 /// Bars in an audio clip's waveform: as many as fit the message's width, within these.

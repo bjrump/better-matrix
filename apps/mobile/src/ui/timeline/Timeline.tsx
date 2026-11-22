@@ -50,7 +50,14 @@ import {
   shouldMarkRead,
 } from '../../state/plan';
 import { shallow, useAppStore, useStore } from '../../state/react';
-import { room as roomOf, timeline as timelineOf, unnamedSenders } from '../../state/selectors';
+import {
+  account as accountOf,
+  room as roomOf,
+  shownIgnored,
+  shownTimeline,
+  timeline as timelineOf,
+  unnamedSenders,
+} from '../../state/selectors';
 import { routes } from '../../routes';
 import { font } from '../../theme/palette';
 import { Icon } from '../icons';
@@ -69,6 +76,9 @@ import {
 } from './Rows';
 
 const NO_PINS: string[] = [];
+
+/** No one ignored, as one array, so the plan isn't made again for a new empty one. */
+const NO_ONE: string[] = [];
 
 /** Within this far of the newest message counts as at it. */
 const AT_LATEST = 48;
@@ -129,7 +139,8 @@ export function Timeline({
   const palette = usePalette();
   const store = useAppStore();
   const thread = timelineKey.thread;
-  const timeline = useStore((s) => timelineOf(s, account, timelineKey));
+  // What people whose ignore is still on its way said draws as nothing (ADR 0011).
+  const timeline = useStore((s) => shownTimeline(s, account, timelineKey));
 
   // The room's pins, once for every row (each row asking would search the rooms per change).
   const pinnedIds = useStore(
@@ -169,10 +180,13 @@ export function Timeline({
   const shownMarker = marker.shown;
 
   const showHidden = useStore((s) => s.settings.showHiddenEvents);
+  // What people the user ignores sent never draws, hidden events included, and nor does what
+  // someone whose ignore is being undone sent until that is saved (ADR 0011).
+  const ignored = useStore((s) => shownIgnored(accountOf(s, account)) ?? NO_ONE, shallow);
 
   const rows = useMemo(
-    () => planTimeline(timeline, { thread, root, marker: shownMarker, showHidden }),
-    [timeline, thread, root, shownMarker, showHidden],
+    () => planTimeline(timeline, { thread, root, marker: shownMarker, showHidden, ignored }),
+    [timeline, thread, root, shownMarker, showHidden, ignored],
   );
 
   const list = useRef<FlashListRef<Row>>(null);

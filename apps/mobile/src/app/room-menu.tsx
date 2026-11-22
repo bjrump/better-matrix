@@ -11,6 +11,7 @@ import { useState } from 'react';
 import { Alert, StyleSheet, Text, View } from 'react-native';
 
 import { t } from '../i18n';
+import { routes } from '../routes';
 import {
   addSection,
   deleteSection,
@@ -353,6 +354,19 @@ function RoomPages({
         </ListSection>
       ) : null}
       <ListSection>
+        <ListRow
+          testID="room-menu-report"
+          icon="flag"
+          title={t('report.room_action')}
+          chevron={false}
+          onPress={() => {
+            done();
+            router.push(
+              routes.report(id, { type: 'Room', data: { room_id: room.room_id } }, room.name),
+            );
+          }}
+        />
+        <Divider inset={52} />
         <ListRow
           testID="room-menu-leave"
           icon={direct ? 'trash' : 'leave'}

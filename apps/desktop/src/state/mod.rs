@@ -32,6 +32,7 @@ mod readers;
 mod receipts;
 mod retry;
 mod room_discovery;
+mod safety;
 mod search;
 mod sections;
 mod settings;
@@ -54,7 +55,7 @@ use rune::{TextEdit, Tx};
 
 pub use accounts::READ_MARKER_FADE;
 pub use accounts::{
-    AccountData, Accounts, EntryView, Landing, RoomTimeline, Scope, TimelineItem, continues_group, now_ms,
+    AccountData, Accounts, EntryView, Landing, RoomTimeline, Scope, TimelineItem, continues_group, now_ms, visual,
     wants_attention,
 };
 pub use attachments::{AttachmentAction, can_open_attachment};
@@ -288,6 +289,9 @@ pub struct AudioClip {
     /// Where it was and whether it was to play when the pointer went down on its waveform, to go
     /// back to if the drag is cancelled; `None` when that press picked it.
     pub scrub_from: Option<(f64, bool)>,
+    /// The account and the person who sent it, when a kept timeline names them: it stops once
+    /// the user ignores them.
+    pub sender: Option<(AccountId, String)>,
 }
 
 /// A step of a press or drag along a clip's waveform (`State::scrub_audio`).
@@ -452,8 +456,25 @@ pub enum Modal {
         device_id: String,
         edit: TextEdit,
     },
+    /// Reporting a message, a room or a person to the homeserver's admins.
+    Report(Box<ReportForm>),
     /// An event's source, for developer tools.
     Source(developer::SourceView),
+}
+
+/// The report dialog: what is reported, the user's reason, and whether to ignore them too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReportForm {
+    pub account: AccountId,
+    pub target: matrix_core::ReportTarget,
+    /// What the dialog calls the reported room or person.
+    pub name: String,
+    /// Who sent the message or is reported, when the report can also ignore them.
+    pub person: Option<String>,
+    pub reason: TextEdit,
+    pub also_ignore: bool,
+    /// The report on its way; the dialog waits for it.
+    pub sending: Option<RequestId>,
 }
 
 /// An action that waits for the user's confirmation. New destructive actions are new variants.
@@ -497,6 +518,14 @@ pub enum Confirm {
         key: TimelineKey,
         poll_id: String,
         question: String,
+    },
+    /// Ignore someone: their messages disappear, on every session. `decline`: an invitation from
+    /// them to decline as well.
+    Ignore {
+        account: AccountId,
+        user_id: String,
+        name: String,
+        decline: Option<String>,
     },
 }
 
@@ -643,6 +672,17 @@ enum Purpose {
     DirectChat(AccountId),
     /// Kicking, banning or changing a member's role.
     Moderate,
+    /// Changing an account's safety choices; failing, the account shows the saved ones again.
+    Safety {
+        account: AccountId,
+        /// An invitation to decline once the change is saved (ignoring its inviter).
+        decline: Option<String>,
+    },
+    /// Sending a report from the report dialog, which stays open on failure. `ignore`: whom to
+    /// ignore once it went through.
+    Report {
+        ignore: Option<(AccountId, String)>,
+    },
     /// Voting in or ending a poll.
     Poll,
     /// A direct chat being opened (or started) to call its person.
@@ -776,6 +816,9 @@ pub struct State {
     pub gifs: GifCache,
     /// Links' preview cards.
     pub link_previews: LinkPreviews,
+    /// Messages whose hidden media the user chose to show, by account and event ID: shown until
+    /// the app restarts.
+    pub revealed_media: HashSet<(AccountId, String)>,
     pub popover: Option<Popover>,
     pub modal: Option<Modal>,
     /// What the emoji picker searches for.
@@ -892,6 +935,7 @@ impl State {
             media: MediaCache::default(),
             gifs: GifCache::default(),
             link_previews: LinkPreviews::default(),
+            revealed_media: HashSet::new(),
             popover: None,
             modal: None,
             emoji_search: TextEdit::default(),
@@ -1160,6 +1204,9 @@ impl State {
                         old.map(|r| &r.pinned) != new.map(|r| &r.pinned)
                     });
                 self.accounts.set_room_list(&account, list);
+                // A room turning public (or private) may hold back (or show) its media: the
+                // preview's, and what its rows on screen load.
+                self.safety_changed();
                 self.saved_changed(&account);
                 if pins_changed && self.side == Some(SidePanel::Pins) {
                     self.side_loaded = None;
@@ -1323,6 +1370,7 @@ impl State {
             Event::Sessions { account, sessions } => self.accounts.set_sessions(&account, sessions),
             Event::ContactDetails { account, contacts } => self.accounts.set_contacts(&account, contacts),
             Event::Status { account, status } => self.accounts.status_saved(&account, status),
+            Event::Safety { account, safety } => self.safety_reported(&account, safety),
             Event::Presence { account, people } => self.accounts.set_presence(&account, people),
             Event::Keywords { account, keywords } => self.accounts.set_keywords(&account, keywords),
             Event::SidebarLayout { account, layout } => {
@@ -1717,6 +1765,18 @@ impl State {
                 Purpose::Forward if matches!(self.modal, Some(Modal::Forward { sending: Some(waiting), .. }) if waiting == request) => {
                     self.modal = None
                 }
+                Purpose::Report { ignore } => {
+                    let ignore = ignore.clone();
+                    self.report_sent(request, ignore);
+                }
+                // The inviter is ignored for good: now their invitation goes.
+                Purpose::Safety { account, decline } => {
+                    let (account, decline) = (account.clone(), decline.clone());
+                    self.safety_finished(&account, request);
+                    if let Some(room_id) = decline {
+                        self.respond_to_invitation(&account, &room_id, false);
+                    }
+                }
                 Purpose::Membership { account, room_id, action, scope } => {
                     self.membership_finished(account, room_id, *action, scope)
                 }
@@ -1872,7 +1932,7 @@ impl State {
                     match &mut preview.content {
                         PreviewContent::Document { status, .. } => *status = DocumentStatus::Failed(error),
                         PreviewContent::Image { status, .. } => *status = ImageStatus::Failed(error),
-                        PreviewContent::Video { .. } | PreviewContent::Audio => {}
+                        PreviewContent::Video { .. } | PreviewContent::Audio | PreviewContent::Held => {}
                     }
                 }
             }
@@ -1918,6 +1978,8 @@ impl State {
             }
             Purpose::Invite => self.notice = Some(tf!("notice.invite", error = error)),
             Purpose::Moderate => self.notice = Some(tf!("notice.moderate", error = error)),
+            Purpose::Safety { account, .. } => self.safety_failed(&account, request, &error),
+            Purpose::Report { .. } => self.report_failed(request, &error),
             // The panel stops loading, and says why.
             Purpose::SidePanel(account, room_id, panel) => {
                 match panel {
@@ -2323,15 +2385,19 @@ impl State {
     }
 
     /// The entries of the open timelines on screen, with their account and timeline.
+    /// The entries of the open timelines on screen, but messages from people the user ignores,
+    /// which have no row and load nothing.
     fn entries_on_screen(&self) -> impl Iterator<Item = ((&AccountId, &TimelineKey), &accounts::Entry)> {
         self.open_timelines.iter().flat_map(move |open| {
             let (account, key) = open;
             let shown = self.on_screen.get(open);
-            self.accounts
-                .get(account)
-                .and_then(|data| data.timeline(key))
-                .into_iter()
-                .flat_map(move |timeline| timeline.on_screen(shown).map(move |entry| ((account, key), entry)))
+            self.accounts.get(account).into_iter().flat_map(move |data| {
+                data.timeline(key)
+                    .into_iter()
+                    .flat_map(move |timeline| timeline.on_screen(shown))
+                    .filter(move |entry| entry.message().is_none_or(|m| !data.ignores(&m.sender_id)))
+                    .map(move |entry| ((account, key), entry))
+            })
         })
     }
 
@@ -2362,8 +2428,14 @@ impl State {
         if !self.settings.show_link_gifs {
             return;
         }
-        let shown: HashSet<String> =
-            self.entries_on_screen().filter_map(|(_, entry)| entry.gif_link()).map(str::to_owned).collect();
+        let shown: HashSet<String> = self
+            .entries_on_screen()
+            .filter(|((account, key), entry)| {
+                entry.message().is_none_or(|message| !self.hides_media(account, &key.room_id, message))
+            })
+            .filter_map(|(_, entry)| entry.gif_link())
+            .map(str::to_owned)
+            .collect();
         let mut wanted: Vec<String> = shown.iter().filter(|url| self.gifs.wants(url, now)).cloned().collect();
         self.gifs.show(shown, self.window_focused);
         wanted.sort_unstable();
@@ -2405,7 +2477,10 @@ impl State {
         let mut seen = HashSet::new();
         let mut wanted = Vec::new();
         for ((account, key), entry) in self.entries_on_screen() {
-            if let Some(attachment) = entry.image()
+            // Media the account's choice holds back is fetched only once shown.
+            let held = entry.message().is_some_and(|message| self.hides_media(account, &key.room_id, message));
+            if !held
+                && let Some(attachment) = entry.image()
                 && let Some((media, size)) = attachment.preview()
             {
                 let dimensions = media::preview_size(size, attachment.dimensions);
@@ -2430,6 +2505,7 @@ impl State {
             }
             // A link card's image.
             if self.settings.show_link_previews
+                && !held
                 && let Some((media, size)) = entry
                     .preview_link(self.settings.show_link_gifs)
                     .and_then(|url| self.link_previews.get(account, url))
@@ -2441,7 +2517,8 @@ impl State {
         }
         // The preview's strip shows its batch's previews, rows on screen or not.
         if let Some(preview) = self.preview.as_ref().filter(|preview| preview.batch.len() > 1) {
-            for attachment in preview.batch.iter().map(|item| &item.attachment) {
+            for item in preview.batch.iter().filter(|item| !self.preview_holds(item)) {
+                let attachment = &item.attachment;
                 if let Some((media, size)) = attachment.preview() {
                     let dimensions = media::preview_size(size, attachment.dimensions);
                     wanted.push((preview.account.clone(), media, size, dimensions));
@@ -2508,9 +2585,11 @@ impl State {
             let pins = self
                 .active_room_id()
                 .filter(|_| self.side == Some(SidePanel::Pins))
-                .and_then(|room| account.pins.get(room))
+                // As the panel lists them: none of people the user ignores.
+                .and_then(|room| account.room(room))
+                .and_then(|room| account.pinned_messages(room))
                 .into_iter()
-                .flat_map(|pins| pins.iter().take(MEMBER_PICTURES).filter_map(|pin| pin.sender_avatar.clone()));
+                .flat_map(|pins| pins.take(MEMBER_PICTURES).filter_map(|pin| pin.sender_avatar.clone()));
             // The open person panel's picture: the member list's, else the message's.
             let person = match (&self.side, self.active_room_id()) {
                 (Some(SidePanel::Person(shown_as)), Some(room_id)) => account
@@ -2583,7 +2662,11 @@ impl State {
                 let id = &account.summary.id;
                 let rooms = account.rooms.iter().filter_map(|room| room.avatar.as_ref());
                 let spaces = account.spaces.iter().filter_map(|space| space.avatar.as_ref());
-                let invitations = account.invitations.iter().filter_map(|invite| invite.avatar.as_ref());
+                // Invitations' pictures only where the user shows them.
+                let invitations = account
+                    .listed_invitations()
+                    .filter(|_| account.safety.invite_pictures)
+                    .filter_map(|invite| invite.avatar.as_ref());
                 rooms.chain(spaces).chain(invitations).map(move |media| (id, media))
             });
             own.chain(active)
@@ -3171,7 +3254,13 @@ impl State {
         // Picked by a press on its waveform, the release decides; else, picked at its very end,
         // it waits there for play.
         let play = held || start_at.is_none_or(|share| share < 1.0);
-        self.audio = Some(AudioClip { id, media: media.clone(), player: None, start_at, play, held, scrub_from: None });
+        let sender = self
+            .accounts
+            .get(&account)
+            .and_then(|data| data.sender_of_media(&media))
+            .map(|sender| (account.clone(), sender));
+        self.audio =
+            Some(AudioClip { id, media: media.clone(), player: None, start_at, play, held, scrub_from: None, sender });
         match self.scratch_files.get(&media).cloned() {
             Some(ScratchFile::Saved(path)) => self.open_audio(path),
             Some(ScratchFile::Downloading) => {}
@@ -3233,12 +3322,32 @@ impl State {
     /// full size, with the rest of its batch to step through; any other file saves.
     pub fn open_attachment(&mut self, key: &TimelineKey, event_id: &str, attachment: &matrix_core::Attachment) {
         let (Some(account), Some(media)) = (self.nav.account.clone(), attachment.media.clone()) else { return };
+        // Nothing opens of what someone the user ignores sent.
+        if self.accounts.get(&account).is_some_and(|data| data.ignores_sender_of(&key.room_id, event_id)) {
+            return;
+        }
+        // Held-back media shows in its place first; it opens from there. Opened from outside the
+        // loaded timeline (the Files panel), its sender may be unknown: it counts as someone else.
+        let held = self
+            .accounts
+            .get(&account)
+            .is_some_and(|data| data.hides_listed_media(&key.room_id, event_id, attachment, &self.revealed_media));
+        if held {
+            self.reveal_media(&account, event_id);
+            return;
+        }
         if !Opens::previews(attachment) {
             self.download(account, media, &attachment.name);
             return;
         }
+        // The whole batch, audio and documents included: its pictures and videos the media
+        // choice holds back wait for a press when stepped onto (`show_preview_item`).
         let entries = self.accounts.get(&account).and_then(|data| data.timeline(key)).map(|t| t.entries.as_slice());
         let mut batch = preview::batch(entries.unwrap_or_default(), event_id);
+        // Nothing of people the user ignores.
+        if let Some(data) = self.accounts.get(&account) {
+            batch.retain(|item| !data.ignores_sender_of(&key.room_id, &item.event_id));
+        }
         let index = match batch.iter().position(|item| item.event_id == event_id) {
             Some(index) => index,
             None => {
@@ -3252,7 +3361,8 @@ impl State {
         self.preview_visits += 1;
         self.reveal_thumbnail = true;
         let visit = self.preview_visits;
-        self.preview = Some(Preview { account, attachment, media, content, batch, index, visit });
+        let room_id = key.room_id.clone();
+        self.preview = Some(Preview { account, room_id, attachment, media, content, batch, index, visit });
         self.load_preview_item(&item);
         self.request_timeline_media();
     }
@@ -3277,7 +3387,8 @@ impl State {
         let Some(media) = item.attachment.media.clone() else { return };
         self.leave_preview_item();
         self.popover = None;
-        let content = self.preview_content(&item.attachment);
+        let content =
+            if self.preview_holds(&item) { PreviewContent::Held } else { self.preview_content(&item.attachment) };
         self.preview_visits += 1;
         self.reveal_thumbnail = true;
         let Some(preview) = self.preview.as_mut() else { return };
@@ -3321,8 +3432,85 @@ impl State {
                     self.dispatch(command, Purpose::Video { media, path });
                 }
             },
-            PreviewContent::Audio => {}
+            PreviewContent::Audio | PreviewContent::Held => {}
         }
+    }
+
+    /// Whether a batch item of the open preview is a picture or video the media choice holds
+    /// back: it waits for a press, its thumbnail unfetched.
+    /// Whether the item the preview shows was sent by someone the user ignores.
+    pub fn preview_item_ignored(&self) -> bool {
+        self.preview.as_ref().is_some_and(|preview| {
+            preview.batch.get(preview.index).is_some_and(|item| {
+                self.accounts
+                    .get(&preview.account)
+                    .is_some_and(|data| data.ignores_sender_of(&preview.room_id, &item.event_id))
+            })
+        })
+    }
+
+    pub fn preview_holds(&self, item: &PreviewItem) -> bool {
+        self.preview.as_ref().is_some_and(|preview| {
+            self.accounts.get(&preview.account).is_some_and(|data| {
+                data.hides_listed_media(&preview.room_id, &item.event_id, &item.attachment, &self.revealed_media)
+            })
+        })
+    }
+
+    /// The media choice or a room changed: an item the preview shows that it now holds back (and
+    /// the user didn't reveal) gives way to Show, letting go of what showed as stepping does; one
+    /// it held back that may now show loads, as stepping onto it would.
+    /// The item's sender now ignored, the preview closes.
+    pub(super) fn reconcile_preview(&mut self) {
+        if self.preview_item_ignored() {
+            self.close_preview();
+            return;
+        }
+        let Some(preview) = &self.preview else { return };
+        let held = matches!(preview.content, PreviewContent::Held);
+        let Some(item) = preview.batch.get(preview.index).cloned() else { return };
+        let holds = self.preview_holds(&item);
+        if held && !holds {
+            let content = self.preview_content(&item.attachment);
+            self.preview_visits += 1;
+            let visit = self.preview_visits;
+            if let Some(preview) = self.preview.as_mut() {
+                preview.content = content;
+                preview.visit = visit;
+            }
+            self.load_preview_item(&item.attachment);
+            return;
+        }
+        if held || !holds {
+            return;
+        }
+        self.leave_preview_item();
+        if matches!(self.popover, Some(Popover::AttachmentMenu { .. })) {
+            self.popover = None;
+        }
+        // A file still on its way for what showed lands nowhere.
+        self.preview_visits += 1;
+        let visit = self.preview_visits;
+        if let Some(preview) = self.preview.as_mut() {
+            preview.content = PreviewContent::Held;
+            preview.visit = visit;
+        }
+    }
+
+    /// Shows the held-back item the preview is on, and loads it.
+    pub fn reveal_preview_item(&mut self) {
+        let Some(preview) = &self.preview else { return };
+        let Some(item) = preview.batch.get(preview.index).cloned() else { return };
+        let account = preview.account.clone();
+        self.reveal_media(&account, &item.event_id);
+        let content = self.preview_content(&item.attachment);
+        self.preview_visits += 1;
+        let visit = self.preview_visits;
+        if let Some(preview) = self.preview.as_mut() {
+            preview.content = content;
+            preview.visit = visit;
+        }
+        self.load_preview_item(&item.attachment);
     }
 
     /// Lets go of the preview's current attachment: stops its PDF render, drops its video and
@@ -3377,6 +3565,18 @@ impl State {
         }) = self.preview.as_mut().filter(|preview| preview.media == *media)
         {
             *status = VideoStatus::Failed(error.to_owned());
+        }
+    }
+
+    /// The clip's sender is now ignored: it stops, and doesn't start once its file comes.
+    pub(super) fn stop_ignored_audio(&mut self) {
+        let ignored = self
+            .audio
+            .as_ref()
+            .and_then(|clip| clip.sender.as_ref())
+            .is_some_and(|(account, sender)| self.accounts.get(account).is_some_and(|data| data.ignores(sender)));
+        if ignored {
+            self.pause_audio();
         }
     }
 
@@ -3486,6 +3686,12 @@ impl State {
         }
         self.leave_preview_item();
         self.preview = None;
+    }
+
+    /// Whether the preview shows a held-back picture or video, waiting for Show: its file
+    /// actions aren't offered.
+    pub fn preview_held(&self) -> bool {
+        self.preview.as_ref().is_some_and(|preview| matches!(preview.content, PreviewContent::Held))
     }
 
     /// Saves the previewed file where the user picks.
@@ -3847,6 +4053,11 @@ impl State {
             Confirm::RemoveWidget { account, room_id, widget_id, .. } => {
                 (Command::RemoveWidget { account, room_id, widget_id }, Purpose::Widget)
             }
+            Confirm::Ignore { account, user_id, decline, .. } => {
+                // An invitation is declined only once the ignore is saved: failing, it stays.
+                self.change_safety(&account, matrix_core::SafetyChange::Ignore { user_id, ignored: true }, decline);
+                return;
+            }
         };
         self.dispatch(command, purpose);
     }
@@ -4040,6 +4251,7 @@ impl State {
                 | Modal::RenameSession { edit, .. }
                 | Modal::SectionName { edit, .. },
             ) => edit,
+            Some(Modal::Report(form)) => &mut form.reason,
             _ => &mut self.scratch,
         }
     }

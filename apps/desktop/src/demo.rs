@@ -190,6 +190,17 @@ pub fn preview_batch(s: &mut State) {
     }
 }
 
+/// The batch's recording, opened with pictures and videos held back everywhere, stepped back
+/// onto the held-back video: Show, and nothing fetched.
+pub fn preview_held(s: &mut State) {
+    batch_messages(s);
+    let safety = matrix_core::Safety { media: matrix_core::ShowMedia::Never, ..matrix_core::Safety::default() };
+    apply(s, Event::Safety { account: AccountId::new(ADA), safety });
+    let file = batch_attachments().swap_remove(2);
+    s.open_attachment(&TimelineKey::room(DEMO_THREAD.0), "$batch-2", &file);
+    s.show_preview_item(1);
+}
+
 /// The batch's video, a third of the way through and paused, with its controls.
 pub fn preview_video(s: &mut State) {
     open_batch(s, 1);
@@ -243,10 +254,63 @@ pub fn invitation(s: &mut State) {
             inviter: Some(Person { id: GRACE.into(), name: "Grace Hopper".into(), avatar: None }),
             space: false,
             kind: RoomKind::Group,
+            stranger: false,
         }],
     };
     apply(s, Event::RoomsUpdated { account, list });
     s.show_invitation("!design:example.org");
+}
+
+/// Settings → Safety: someone ignored, media shown in private rooms only, and a stranger's
+/// invitation hidden there rather than in the sidebar.
+pub fn safety(s: &mut State) {
+    invitation(s);
+    s.close_modal();
+    let account = AccountId::new(ADA);
+    let Some(data) = s.accounts.get(&account) else { return };
+    let mut list =
+        RoomList { rooms: data.rooms.clone(), spaces: data.spaces.clone(), invitations: data.invitations.clone() };
+    list.invitations.push(matrix_core::Invitation {
+        room_id: "!prizes:spam.example".into(),
+        name: "Claim your prize".into(),
+        topic: None,
+        avatar: None,
+        inviter: Some(Person { id: "@winner:spam.example".into(), name: "Prize desk".into(), avatar: None }),
+        space: false,
+        kind: RoomKind::Group,
+        stranger: true,
+    });
+    apply(s, Event::RoomsUpdated { account: account.clone(), list });
+    let safety = matrix_core::Safety {
+        ignored: vec!["@troll:spam.example".into()],
+        media: matrix_core::ShowMedia::Private,
+        invite_pictures: false,
+        hide_stranger_invites: true,
+    };
+    apply(s, Event::Safety { account, safety });
+    s.open_settings();
+    s.show_settings_section(crate::state::SettingsSection::Safety);
+}
+
+/// Reporting someone else's message.
+pub fn report(s: &mut State) {
+    attachment_message(s);
+    s.report_message(&TimelineKey::room(DEMO_THREAD.0), "$attachment");
+}
+
+/// A picture in a public room, held back by media shown in private rooms only.
+pub fn hidden_media(s: &mut State) {
+    attachment_message(s);
+    let account = AccountId::new(ADA);
+    let Some(data) = s.accounts.get(&account) else { return };
+    let mut list =
+        RoomList { rooms: data.rooms.clone(), spaces: data.spaces.clone(), invitations: data.invitations.clone() };
+    for room in list.rooms.iter_mut().filter(|room| room.room_id == DEMO_THREAD.0) {
+        room.public = true;
+    }
+    apply(s, Event::RoomsUpdated { account: account.clone(), list });
+    let safety = matrix_core::Safety { media: matrix_core::ShowMedia::Private, ..matrix_core::Safety::default() };
+    apply(s, Event::Safety { account, safety });
 }
 
 /// A space with public rooms to discover and join.
@@ -419,14 +483,16 @@ pub fn room_history(s: &mut State) {
     let thread = matrix_core::ThreadInfo {
         root: DEMO_THREAD.1.into(),
         sender_name: "Alan Turing".into(),
+        sender_id: ALAN.into(),
         body: "Cross-signing verification passes on Linux, macOS and Windows.".into(),
         replies: 3,
         latest_at: Some(DEMO_DAY_MS + 11 * 3_600_000 + 36 * 60_000),
     };
     apply(s, Event::Threads { account: AccountId::new(ADA), room_id: room_id.clone(), threads: vec![thread] });
-    let file = |name: &str, kind: AttachmentKind, who: &str, minutes: u64| matrix_core::SharedFile {
+    let file = |name: &str, kind: AttachmentKind, (id, who): (&str, &str), minutes: u64| matrix_core::SharedFile {
         event_id: format!("$file-{name}"),
         sender_name: who.into(),
+        sender_id: id.into(),
         timestamp: DEMO_DAY_MS + 10 * 3_600_000 + minutes * 60_000,
         attachment: Attachment {
             kind,
@@ -439,9 +505,9 @@ pub fn room_history(s: &mut State) {
         },
     };
     let files = vec![
-        file("release-notes-0.2.pdf", AttachmentKind::File, "Ada Lovelace", 33),
-        file("screenshot-sidebar.png", AttachmentKind::Image, "Grace Hopper", 12),
-        file("standup.ogg", AttachmentKind::Audio, "Kai", 2),
+        file("release-notes-0.2.pdf", AttachmentKind::File, (ADA, "Ada Lovelace"), 33),
+        file("screenshot-sidebar.png", AttachmentKind::Image, (GRACE, "Grace Hopper"), 12),
+        file("standup.ogg", AttachmentKind::Audio, (KAI, "Kai"), 2),
     ];
     apply(s, Event::Files { account: AccountId::new(ADA), room_id, files });
 }
@@ -731,6 +797,7 @@ fn room(id: &str, name: &str, topic: Option<&str>, unread: u64, mentions: u64) -
         call: matrix_core::RoomCall { via: Some(matrix_core::CallVia::Rtc), ..matrix_core::RoomCall::default() },
         activity_ms: None,
         encrypted: true,
+        public: false,
         can_rename: true,
         pinned: Vec::new(),
         can_pin: true,

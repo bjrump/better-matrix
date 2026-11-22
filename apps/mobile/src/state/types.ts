@@ -19,6 +19,8 @@ import type {
   MessagePreview,
   SavedMessage,
   RoomSummary,
+  Safety,
+  SafetyChange,
   Security,
   Session,
   SharedFile,
@@ -104,6 +106,26 @@ export interface AccountData {
   savedStatus: Status;
   /** The words that notify the user wherever they are written, once the engine reports them. */
   keywords: string[] | null;
+  /**
+   * What the user keeps away (ignored people, media, invitations), as shown: the last reported
+   * choices with the changes still on their way applied (`savedSafety`, `pendingSafety`).
+   */
+  safety: Safety;
+  /** The choices as the engine last reported them: what a failed change falls back to. */
+  savedSafety: Safety;
+  /** Changes made on this device that the engine hasn't confirmed or refused yet, in order. */
+  pendingSafety: PendingSafety[];
+  /**
+   * Events drawn as nothing in their timelines as their sender is ignored, with that sender: while
+   * the user still ignores them, nothing shows the event in another form (a file Room Info listed).
+   */
+  hiddenEvents: Record<string, string>;
+}
+
+/** A safety change on its way to the engine; `id` tells it apart from the same change again. */
+export interface PendingSafety {
+  id: number;
+  change: SafetyChange;
 }
 
 /** A verification running for one of the accounts. */
@@ -151,6 +173,8 @@ export interface State {
   media: Record<string, string>;
   /** Linked GIF files, by URL. */
   gifs: Record<string, string>;
+  /** Hidden media the user tapped Show on, by `revealKey`, until the app restarts. */
+  revealedMedia: Record<string, true>;
   /** Link cards, by `previewKey`; `null` when the page has none. */
   linkPreviews: Record<string, LinkPreview | null>;
   call: CallState;

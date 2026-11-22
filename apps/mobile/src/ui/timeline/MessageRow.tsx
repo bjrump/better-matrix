@@ -34,6 +34,28 @@ import { RichText } from './RichText';
 
 export const AVATAR = 36;
 
+/** The least height of a message's sender column, its screen readers' control on every row. */
+export const GUTTER_MIN = 20;
+
+/** What a screen reader can do with a message: open its actions, by activating or long-pressing. */
+const ROW_ACTIONS = [{ name: 'activate' }, { name: 'longpress' }];
+
+/**
+ * The screen-reader control that opens a message's actions, on a view that holds no other
+ * control (a classic row's sender column, a bubble's time): the row itself is none (ADR 0011).
+ */
+function actionsControl(message: Message, open: (message: Message) => void) {
+  return {
+    accessible: true,
+    accessibilityRole: 'button' as const,
+    accessibilityLabel: `${message.sender_name}, ${clockTime(message.timestamp_ms)}`,
+    accessibilityHint: t('actions.more'),
+    accessibilityActions: ROW_ACTIONS,
+    onAccessibilityAction: () => open(message),
+    onAccessibilityTap: () => open(message),
+  };
+}
+
 /** The most of the row a bubble of words takes. */
 const BUBBLE_SHARE = 0.85;
 
@@ -73,11 +95,17 @@ function ClassicRow({ message, continues, latestCall, highlighted }: MessageRowP
   const status = statusOf(message);
 
   return (
+    // The row is no control of its own for screen readers, so the links, Show and other controls
+    // in it stay reachable; its sender's column (below) opens the message's actions instead.
     <Pressable
       onLongPress={() => openActions(message)}
       delayLongPress={350}
       android_ripple={{ color: palette.hover }}
-      accessibilityHint={t('actions.more')}
+      // Not a control on either platform: Android's TalkBack and focus skip it, its children
+      // stay exposed ("no", not "no-hide-descendants").
+      accessible={false}
+      focusable={false}
+      importantForAccessibility="no"
       style={[
         styles.row,
         { paddingTop: continues ? 2 : 10, opacity: message.pending ? 0.6 : 1 },
@@ -92,7 +120,7 @@ function ClassicRow({ message, continues, latestCall, highlighted }: MessageRowP
         highlighted ? { backgroundColor: `${palette.accent}26` } : null,
       ]}
     >
-      <View style={styles.gutter}>
+      <View style={styles.gutter} {...actionsControl(message, openActions)}>
         {continues ? null : (
           <Avatar
             account={account}
@@ -174,12 +202,12 @@ function Said({
       {gif ? (
         <>
           {gif.rest ? <RichText blocks={gif.rest} /> : null}
-          <LinkedGif key={gif.url} url={gif.url} />
+          <LinkedGif key={gif.url} url={gif.url} message={message} />
         </>
       ) : (
         <Body message={message} latestCall={latestCall} />
       )}
-      {link ? <LinkCard key={link} url={link} /> : null}
+      {link ? <LinkCard key={link} url={link} message={message} /> : null}
     </>
   );
 }
@@ -262,11 +290,14 @@ function BubbleRow({ message, continues, latestCall, highlighted }: MessageRowPr
   const said = <Said message={message} latestCall={latestCall} shown={shown} />;
 
   return (
+    // As a classic row: no control of its own for screen readers; its time opens the actions.
     <Pressable
       onLongPress={() => openActions(message)}
       delayLongPress={350}
       android_ripple={{ color: palette.hover }}
-      accessibilityHint={t('actions.more')}
+      accessible={false}
+      focusable={false}
+      importantForAccessibility="no"
       style={[
         styles.row,
         { paddingTop: continues ? 2 : 10, opacity: message.pending ? 0.6 : 1 },
@@ -326,17 +357,15 @@ function BubbleRow({ message, continues, latestCall, highlighted }: MessageRowPr
             ) : (
               said
             )}
-            <Text
-              style={[
-                font.meta,
-                bubbled
-                  ? [styles.time, { color: palette.bubbleMeta }]
-                  : { color: palette.textMuted },
-              ]}
-              numberOfLines={1}
-            >
-              {time}
-            </Text>
+            {/* A view, not the text, carries the control: iOS doesn't activate a text's. */}
+            <View style={bubbled ? styles.time : null} {...actionsControl(message, openActions)}>
+              <Text
+                style={[font.meta, { color: bubbled ? palette.bubbleMeta : palette.textMuted }]}
+                numberOfLines={1}
+              >
+                {time}
+              </Text>
+            </View>
           </View>
           <Hanging message={message} />
           <ReadLine message={message} />
@@ -388,7 +417,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingBottom: 2,
   },
-  gutter: { width: AVATAR },
+  // Stretched to the row, so a following message's empty column still has bounds to focus.
+  gutter: { width: AVATAR, alignSelf: 'stretch', minHeight: GUTTER_MIN },
   content: { flex: 1, minWidth: 0, gap: 2 },
   bubbleColumn: { flex: 1, minWidth: 0, gap: 4 },
   bubble: { minWidth: 0, gap: 4 },

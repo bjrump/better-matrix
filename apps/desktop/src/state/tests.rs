@@ -46,6 +46,7 @@ fn room(room_id: &str) -> RoomSummary {
         call: matrix_core::RoomCall::default(),
         activity_ms: None,
         encrypted: false,
+        public: false,
         can_rename: true,
         pinned: Vec::new(),
         can_pin: true,
@@ -2069,6 +2070,7 @@ fn playing_clip(s: &mut State) -> matrix_core::Attachment {
         play: true,
         held: false,
         scrub_from: None,
+        sender: None,
     });
     memo
 }

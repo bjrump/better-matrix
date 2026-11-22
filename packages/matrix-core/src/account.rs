@@ -82,6 +82,12 @@ pub struct Account {
     pub(crate) status_saves: Arc<tokio::sync::Mutex<()>>,
     /// Held while a room's saved messages change: one change at a time (`crate::saved`).
     pub(crate) saved_changes: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a safety choice changes: one change at a time, each on the server's latest
+    /// copy; it holds the choices the server last confirmed (`crate::safety`).
+    pub(crate) safety_changes: Arc<tokio::sync::Mutex<Option<crate::Safety>>>,
+    /// Safety changes, run in the order they were asked for: two quick choices of one setting
+    /// end on the later one (`crate::safety`).
+    pub(crate) safety_queue: crate::drafts::DraftQueue,
     /// Draft reads and writes, in the order they were asked for (`crate::drafts`).
     pub(crate) drafts: crate::drafts::DraftQueue,
     /// The room list's sliding sync, while it runs (servers with MSC4186; ADR 0002).
@@ -160,6 +166,9 @@ pub(crate) struct RoomCache {
     rooms: HashMap<String, crate::RoomSummary>,
     spaces: HashMap<String, crate::SpaceSummary>,
     invitations: HashMap<String, crate::Invitation>,
+    /// The joined rooms when invitations were last read: joining or leaving one can make an
+    /// inviter a stranger or not, so every invitation is read again when they change.
+    joined: std::collections::BTreeSet<String>,
     /// Whether a list was built from it yet: the first is, even when empty.
     listed: bool,
 }
@@ -296,6 +305,8 @@ impl Account {
             status: Arc::default(),
             status_saves: Arc::default(),
             saved_changes: Arc::default(),
+            safety_changes: Arc::default(),
+            safety_queue: crate::drafts::DraftQueue::default(),
             drafts: crate::drafts::DraftQueue::default(),
             room_list: Arc::default(),
             followed: Arc::default(),
@@ -414,6 +425,8 @@ impl Account {
             status: Arc::default(),
             status_saves: Arc::default(),
             saved_changes: Arc::default(),
+            safety_changes: Arc::default(),
+            safety_queue: crate::drafts::DraftQueue::default(),
             drafts: crate::drafts::DraftQueue::default(),
             room_list: Arc::default(),
             followed: Arc::default(),
@@ -673,12 +686,22 @@ impl Account {
         let held = cache.invitations.len();
         cache.invitations.retain(|id, _| invited.iter().any(|room| room.room_id().as_str() == id));
         moved |= cache.invitations.len() != held;
+        let joined: std::collections::BTreeSet<String> =
+            self.client.joined_rooms().iter().map(|room| room.room_id().to_string()).collect();
+        let rejudge = joined != cache.joined;
+        cache.joined = joined;
         for room in invited {
             let id = room.room_id().to_string();
-            if changed.is_some_and(|changed| !changed.contains(&id)) && cache.invitations.contains_key(&id) {
+            if !rejudge && changed.is_some_and(|changed| !changed.contains(&id)) && cache.invitations.contains_key(&id)
+            {
                 continue;
             }
-            let inviter = room.invite_details().await.ok().map(|invite| crate::Person {
+            let details = room.invite_details().await.ok();
+            let stranger = match details.as_ref() {
+                Some(invite) => !crate::safety::shares_room(&self.client, &invite.inviter_id).await,
+                None => true,
+            };
+            let inviter = details.map(|invite| crate::Person {
                 id: invite.inviter_id.to_string(),
                 name: invite
                     .inviter
@@ -705,6 +728,7 @@ impl Account {
                 } else {
                     crate::RoomKind::Group
                 },
+                stranger,
             };
             moved |= self::changed(&mut cache.invitations, id, invitation);
         }
@@ -1196,6 +1220,8 @@ mod tests {
             status: Arc::default(),
             status_saves: Arc::default(),
             saved_changes: Arc::default(),
+            safety_changes: Arc::default(),
+            safety_queue: crate::drafts::DraftQueue::default(),
             drafts: crate::drafts::DraftQueue::default(),
             room_list: Arc::default(),
             followed: Arc::default(),

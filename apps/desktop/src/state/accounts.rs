@@ -12,6 +12,12 @@ use rune::{TextEdit, Tx};
 /// Seconds reserved for the "New" divider's fade before its row closes.
 pub const READ_MARKER_FADE: f32 = 2.5;
 
+/// Whether an attachment is visual media the user's media choice may hold back: a picture
+/// (stickers included) or a video, poster or not. Audio and other files never wait.
+pub fn visual(attachment: &Attachment) -> bool {
+    matches!(attachment.kind, matrix_core::AttachmentKind::Image | matrix_core::AttachmentKind::Video)
+}
+
 /// Whether a room should draw attention: any unread message, or only mentions when the room
 /// notifies for mentions only or is muted.
 pub fn wants_attention(room: &RoomSummary) -> bool {
@@ -687,6 +693,14 @@ pub struct AccountData {
     /// The latest status message chosen while it is saved: until that request finishes, it shows
     /// over what the engine reports.
     pub saving_status_message: Option<matrix_core::RequestId>,
+    /// What the user keeps away on this account, including a change still being saved; nothing
+    /// until the engine reports.
+    pub safety: matrix_core::Safety,
+    /// The choices as last reported: what a change that fails to save falls back to.
+    pub saved_safety: matrix_core::Safety,
+    /// Changes still being saved, by request, oldest first: `safety` is `saved_safety` with
+    /// them applied, whichever finishes first.
+    pending_safety: Vec<(matrix_core::RequestId, matrix_core::SafetyChange)>,
 }
 
 impl AccountData {
@@ -737,6 +751,9 @@ impl AccountData {
             presence: HashMap::new(),
             saved_status_message: None,
             saving_status_message: None,
+            safety: matrix_core::Safety::default(),
+            saved_safety: matrix_core::Safety::default(),
+            pending_safety: Vec::new(),
             keywords: None,
         }
     }
@@ -802,9 +819,18 @@ impl AccountData {
     }
 
     /// The saved messages listed, as rooms' summaries know them now: one no longer saved
-    /// leaves at once.
+    /// leaves at once, and those of people the user ignores don't show (they stay saved).
     pub fn saved_messages(&self) -> impl Iterator<Item = &matrix_core::SavedMessage> {
-        self.saved.iter().flatten().filter(|saved| self.is_saved(&saved.room_id, &saved.preview.event_id))
+        self.saved.iter().flatten().filter(|saved| {
+            self.is_saved(&saved.room_id, &saved.preview.event_id) && !self.ignores(&saved.preview.sender_id)
+        })
+    }
+
+    /// A room's pinned messages as listed, those still pinned, but not those of people the user
+    /// ignores (they stay pinned).
+    pub fn pinned_messages(&self, room: &RoomSummary) -> Option<impl Iterator<Item = &matrix_core::MessagePreview>> {
+        let pins = self.pins.get(&room.room_id)?;
+        Some(pins.iter().filter(|pin| room.pinned.contains(&pin.event_id) && !self.ignores(&pin.sender_id)))
     }
 
     /// Whether a message saved in some room isn't in the list yet: saved here or on another
@@ -842,9 +868,150 @@ impl AccountData {
         listed.iter().filter_map(|at| Some((*at, self.rooms.get(*at)?))).filter(move |(_, room)| room.kind == kind)
     }
 
+    /// Drops the cached newest messages of people the user is now confirmed to ignore, so no
+    /// preview shows them: the room's next message from sync takes their place. (While an
+    /// ignore is still saving, previews skip them as they read instead, so a failure brings
+    /// them back.)
+    fn forget_ignored_latest(&mut self) {
+        let safety = &self.saved_safety;
+        self.latest.retain(|_, message| !safety.ignores(&message.sender_id));
+    }
+
+    /// The choices shown: the saved ones with every change still being saved applied.
+    fn replay_safety(&mut self) {
+        self.safety =
+            self.pending_safety.iter().fold(self.saved_safety.clone(), |safety, (_, change)| safety.with(change));
+    }
+
+    /// Whether listed media (a file in the Files panel, or one opened from anywhere) waits for a
+    /// press: as its message in the room's timeline when loaded there, else as the Files panel
+    /// lists its sender; with neither, someone else's. Only visual media counts ([`visual`]).
+    pub fn hides_listed_media(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        attachment: &Attachment,
+        revealed: &HashSet<(AccountId, String)>,
+    ) -> bool {
+        if !visual(attachment) {
+            return false;
+        }
+        let loaded = self
+            .timelines
+            .iter()
+            .filter(|(key, _)| key.room_id == room_id)
+            .find_map(|(_, timeline)| timeline.messages().find(|m| m.event_id == event_id));
+        match loaded {
+            Some(message) => self.hides_media(room_id, message, revealed),
+            None => {
+                // The Files panel's list knows the sender; without it, someone else.
+                let own = self
+                    .files
+                    .get(room_id)
+                    .and_then(|files| files.iter().find(|file| file.event_id == event_id))
+                    .is_some_and(|file| file.sender_id == self.summary.id.as_str());
+                let public = self.room(room_id).is_none_or(|room| room.public);
+                !self.safety.shows_media(public, own)
+                    && !revealed.contains(&(self.summary.id.clone(), event_id.to_owned()))
+            }
+        }
+    }
+
+    /// Whether the message `event_id` in a room was sent by someone the user ignores ([`ignores`]),
+    /// as a kept timeline or the Files panel's list knows its sender.
+    ///
+    /// [`ignores`]: AccountData::ignores
+    pub fn ignores_sender_of(&self, room_id: &str, event_id: &str) -> bool {
+        let loaded = self
+            .timelines
+            .iter()
+            .filter(|(key, _)| key.room_id == room_id)
+            .find_map(|(_, timeline)| timeline.messages().find(|m| m.event_id == event_id))
+            .map(|message| message.sender_id.as_str());
+        let listed = || {
+            self.files
+                .get(room_id)
+                .and_then(|files| files.iter().find(|file| file.event_id == event_id))
+                .map(|file| file.sender_id.as_str())
+        };
+        loaded.or_else(listed).is_some_and(|sender| self.ignores(sender))
+    }
+
+    /// Whether the user ignores someone, or is saving an ignore of them (even with a Stop ignoring
+    /// queued after it): what lists of their things (the Files panel) leave out.
+    pub fn ignores(&self, user_id: &str) -> bool {
+        self.safety.ignores(user_id)
+            || self.saved_safety.ignores(user_id)
+            || self.pending_safety.iter().any(|(_, change)| {
+                matches!(change, matrix_core::SafetyChange::Ignore { user_id: pending, ignored: true } if pending == user_id)
+            })
+    }
+
+    /// A fingerprint of everyone [`AccountData::ignores`] counts: what views built from it (a
+    /// timeline's rows) are made again for when it changes.
+    pub fn ignores_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.safety.ignored.hash(&mut hasher);
+        self.saved_safety.ignored.hash(&mut hasher);
+        for (_, change) in &self.pending_safety {
+            if let matrix_core::SafetyChange::Ignore { user_id, ignored: true } = change {
+                user_id.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// The entries carrying the message `event_id`, in the timelines kept.
+    pub fn timelines_holding<'a>(&'a self, event_id: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
+        self.timelines.values().flat_map(move |timeline| {
+            timeline.entries.iter().filter(move |e| e.message().is_some_and(|m| m.event_id == event_id))
+        })
+    }
+
+    /// Who sent the attachment `media`, as a kept timeline knows it.
+    pub fn sender_of_media(&self, media: &matrix_core::MediaRef) -> Option<String> {
+        self.timelines.values().flat_map(RoomTimeline::messages).find_map(|message| match &message.content {
+            MessageContent::Attachment(file) if file.media.as_ref() == Some(media) => Some(message.sender_id.clone()),
+            _ => None,
+        })
+    }
+
+    /// The invitations listed anywhere: all but those from people the user ignores ([`ignores`]),
+    /// which stay out of sight without being declined.
+    ///
+    /// [`ignores`]: AccountData::ignores
+    pub fn listed_invitations(&self) -> impl Iterator<Item = &matrix_core::Invitation> {
+        self.invitations
+            .iter()
+            .filter(|invite| invite.inviter.as_ref().is_none_or(|inviter| !self.ignores(&inviter.id)))
+    }
+
+    /// The invitations the sidebar and Home list: all but strangers' when the user hides them,
+    /// and never those of people the user ignores.
+    pub fn shown_invitations(&self) -> impl Iterator<Item = &matrix_core::Invitation> {
+        self.listed_invitations().filter(|invite| self.safety.shows_invitation(invite))
+    }
+
+    /// Strangers' invitations the user hides, which only Settings → Safety lists (not those of
+    /// people the user ignores).
+    pub fn hidden_invitations(&self) -> impl Iterator<Item = &matrix_core::Invitation> {
+        self.listed_invitations().filter(|invite| !self.safety.shows_invitation(invite))
+    }
+
+    /// Whether a message's pictures, video poster, linked GIF and link card image wait for a
+    /// press: the user's media choice keeps them back in its room, and `revealed` doesn't hold it.
+    /// A room with no summary here counts as public.
+    pub fn hides_media(&self, room_id: &str, message: &Message, revealed: &HashSet<(AccountId, String)>) -> bool {
+        let public = self.room(room_id).is_none_or(|room| room.public);
+        let own = message.sender_id == self.summary.id.as_str();
+        !self.safety.shows_media(public, own)
+            && !revealed.contains(&(self.summary.id.clone(), message.event_id.clone()))
+    }
+
     /// Whether any room in the scope has unread messages, for the rail's dots.
     pub fn has_unread(&self, scope: &Scope) -> bool {
-        (*scope == Scope::Home && !self.invitations.is_empty())
+        (*scope == Scope::Home && self.shown_invitations().next().is_some())
             || [RoomKind::Group, RoomKind::Direct]
                 .into_iter()
                 .any(|kind| self.rooms_in(scope, kind).any(wants_attention))
@@ -883,16 +1050,19 @@ impl AccountData {
         self.stale_members.remove(room_id);
     }
 
-    /// The newest message in a room: from its timeline when open, else from sync.
+    /// The newest message in a room: from its timeline when open, else from sync. Never one
+    /// from someone the user ignores, whose messages a kept timeline may still hold until the
+    /// engine reloads it.
     pub fn last_message(&self, room_id: &str) -> Option<&Message> {
         // Asked for every room the sidebar sorts on every commit: the few timelines kept are
         // looked through rather than a key made for each room.
+        let heard = |message: &&Message| !self.ignores(&message.sender_id);
         let from_timeline = self
             .timelines
             .iter()
             .find(|(key, _)| key.thread.is_none() && key.room_id == room_id)
-            .and_then(|(_, timeline)| timeline.messages().next_back());
-        match (from_timeline, self.latest.get(room_id)) {
+            .and_then(|(_, timeline)| timeline.messages().rev().find(heard));
+        match (from_timeline, self.latest.get(room_id).filter(heard)) {
             (Some(a), Some(b)) => Some(if a.timestamp_ms >= b.timestamp_ms { a } else { b }),
             (a, b) => a.or(b),
         }
@@ -1135,6 +1305,42 @@ impl Accounts {
     pub fn remove(&mut self, id: &AccountId) {
         self.list.retain(|account| &account.summary.id != id);
         self.revision += 1;
+    }
+
+    /// The safety choices the engine reported: kept as the confirmed ones, and shown with the
+    /// changes still being saved applied.
+    pub fn safety_saved(&mut self, id: &AccountId, safety: matrix_core::Safety) {
+        if let Some(account) = self.get_mut(id) {
+            account.saved_safety = safety;
+            account.replay_safety();
+            account.forget_ignored_latest();
+            // The lists (invitations, their pictures) may change with them.
+            self.revision += 1;
+        }
+    }
+
+    /// Shows a safety change at once, while `request` saves it.
+    pub fn safety_pending(
+        &mut self,
+        id: &AccountId,
+        request: matrix_core::RequestId,
+        change: matrix_core::SafetyChange,
+    ) {
+        if let Some(account) = self.get_mut(id) {
+            account.pending_safety.push((request, change));
+            account.replay_safety();
+            self.revision += 1;
+        }
+    }
+
+    /// `request` finished saving a change, or failed to: the choices shown are the saved ones
+    /// with the changes still being saved applied.
+    pub fn safety_settled(&mut self, id: &AccountId, request: matrix_core::RequestId) {
+        if let Some(account) = self.get_mut(id) {
+            account.pending_safety.retain(|(pending, _)| *pending != request);
+            account.replay_safety();
+            self.revision += 1;
+        }
     }
 
     pub fn set_search_usage(&mut self, id: &AccountId, usage: matrix_core::SearchUsage) {
@@ -1398,9 +1604,11 @@ impl Accounts {
         }
     }
 
-    /// Records a room's newest message, for previews.
+    /// Records a room's newest message, for previews: never one from someone the user ignores.
     pub fn set_latest(&mut self, id: &AccountId, room_id: &str, message: Message) {
-        if let Some(account) = self.get_mut(id) {
+        if let Some(account) = self.get_mut(id)
+            && !account.saved_safety.ignores(&message.sender_id)
+        {
             account.latest.insert(room_id.to_owned(), message);
             account.heard_at.insert(room_id.to_owned(), now_ms());
         }
@@ -1647,6 +1855,7 @@ mod tests {
             call: matrix_core::RoomCall::default(),
             activity_ms: None,
             encrypted: false,
+            public: false,
             can_rename: false,
             pinned: Vec::new(),
             can_pin: true,

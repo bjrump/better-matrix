@@ -88,6 +88,7 @@ pub(crate) async fn room_summary(
         call: call_in(room, kind, rtc_service, power.as_ref(), crate::calls::joined_sticky(room, sticky, false).await),
         activity_ms: room.latest_event_timestamp().map(|at| at.get().into()),
         encrypted: room.encryption_state().is_encrypted(),
+        public: !private_join_rule(room.join_rule().as_ref()),
         can_rename: may_send_state(StateEventType::RoomName),
         pinned: room.pinned_event_ids().unwrap_or_default().iter().map(ToString::to_string).collect(),
         saved: crate::saved::saved_ids(room).await,
@@ -221,6 +222,14 @@ async fn sender_name(room: &Room, sender: &matrix_sdk::ruma::UserId) -> String {
 }
 
 /// A push notification for a room message, if it is one the user should hear about.
+/// Whether a join rule keeps strangers out, as MSC4278 lists private rooms: invite, knock,
+/// restricted and knock-restricted. Anything else, public, rules this app doesn't know and a room
+/// whose rule hasn't loaded, counts as public, so media there waits for a press.
+fn private_join_rule(rule: Option<&matrix_sdk::ruma::events::room::join_rules::JoinRule>) -> bool {
+    use matrix_sdk::ruma::events::room::join_rules::JoinRule;
+    matches!(rule, Some(JoinRule::Invite | JoinRule::Knock | JoinRule::Restricted(_) | JoinRule::KnockRestricted(_)))
+}
+
 pub(crate) async fn notification(
     account: &AccountId,
     room: &Room,
@@ -378,6 +387,25 @@ mod tests {
     use matrix_sdk::ruma::{OwnedMxcUri, uint};
 
     use super::*;
+
+    #[test]
+    fn invite_knock_and_restricted_join_rules_should_count_as_private() {
+        use matrix_sdk::ruma::events::room::join_rules::{JoinRule, Restricted};
+        assert!(private_join_rule(Some(&JoinRule::Invite)));
+        assert!(private_join_rule(Some(&JoinRule::Knock)));
+        assert!(private_join_rule(Some(&JoinRule::Restricted(Restricted::new(Vec::new())))));
+        assert!(private_join_rule(Some(&JoinRule::KnockRestricted(Restricted::new(Vec::new())))));
+    }
+
+    #[test]
+    fn public_unknown_and_missing_join_rules_should_count_as_public() {
+        use matrix_sdk::ruma::events::room::join_rules::JoinRule;
+        assert!(!private_join_rule(None));
+        assert!(!private_join_rule(Some(&JoinRule::Public)));
+        assert!(!private_join_rule(Some(&JoinRule::Private)));
+        let custom: JoinRule = serde_json::from_value(serde_json::json!({ "join_rule": "org.example.open" })).unwrap();
+        assert!(!private_join_rule(Some(&custom)));
+    }
 
     #[test]
     fn a_sticker_should_show_as_an_image_named_by_its_description() {

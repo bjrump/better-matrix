@@ -46,6 +46,7 @@ fn spec() -> AppSpec<State> {
             ("demo-preview-batch", demo::preview_batch),
             ("demo-preview-video", demo::preview_video),
             ("demo-preview-audio", demo::preview_audio),
+            ("demo-preview-held", demo::preview_held),
             ("demo-pinned-message", |s| {
                 demo::pinned_messages(s);
                 s.open_thread(demo::DEMO_THREAD.1);
@@ -87,6 +88,13 @@ fn spec() -> AppSpec<State> {
             ("demo-unread", demo::unread),
             ("demo-invitation", demo::invitation),
             ("demo-discovery", demo::discovery),
+            ("demo-safety", demo::safety),
+            ("demo-report", demo::report),
+            ("demo-hidden-media", demo::hidden_media),
+            ("demo-hidden-media-bubbles", |s| {
+                demo::hidden_media(s);
+                s.settings.message_layout = state::MessageLayout::Bubbles;
+            }),
             ("demo-public-rooms", |s| {
                 demo::discovery(s);
                 s.browse_public_rooms();
@@ -246,6 +254,7 @@ fn spec() -> AppSpec<State> {
                     play: true,
                     held: false,
                     scrub_from: None,
+                    sender: None,
                 });
             }),
             ("demo-typing", |s| {
