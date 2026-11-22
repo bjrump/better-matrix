@@ -4,6 +4,8 @@
 import type { AccountId, JoinRule, ReportTarget } from '@better-matrix/matrix-native/types';
 import type { Href } from 'expo-router';
 
+import type { Reach } from './state/seek';
+
 export const routes = {
   /** The Home tab, under every other screen. */
   home: (): Href => '/',
@@ -30,19 +32,20 @@ export const routes = {
     pathname: '/room-menu',
     params: section ? { account, section } : { account },
   }),
-  room: (account: AccountId, roomId: string, eventId?: string, localTarget = false): Href => ({
+  /** A room's timeline, opened at `eventId` when given, looked for as far as `reach` says. */
+  room: (account: AccountId, roomId: string, eventId?: string, reach: Reach = 'near'): Href => ({
     pathname: '/room/[account]/[roomId]',
-    params: messageParams(account, roomId, eventId, localTarget),
+    params: messageParams(account, roomId, eventId, reach),
   }),
   thread: (
     account: AccountId,
     roomId: string,
     root: string,
     eventId?: string,
-    localTarget = false,
+    reach: Reach = 'near',
   ): Href => ({
     pathname: '/thread/[account]/[roomId]/[root]',
-    params: { ...messageParams(account, roomId, eventId, localTarget), root },
+    params: { ...messageParams(account, roomId, eventId, reach), root },
   }),
   /** The long-press sheet of one message; `thread` when the message is in a thread's timeline. */
   messageActions: (account: AccountId, roomId: string, eventId: string, thread?: string): Href => ({
@@ -97,6 +100,31 @@ export const routes = {
   ): Href => ({
     pathname: '/emoji',
     params: { account, roomId, ...options },
+  }),
+  /** A message's earlier versions, from its "edited" label. */
+  editHistory: (account: AccountId, roomId: string, eventId: string): Href => ({
+    pathname: '/edit-history',
+    params: { account, roomId, eventId },
+  }),
+  /** The sticker picker, sending into a room's or thread's timeline. */
+  stickers: (account: AccountId, roomId: string, thread?: string): Href => ({
+    pathname: '/stickers',
+    params: thread ? { account, roomId, thread } : { account, roomId },
+  }),
+  /** Sharing a place: the phone's position or one found by name. */
+  location: (account: AccountId, roomId: string, thread?: string): Href => ({
+    pathname: '/location',
+    params: thread ? { account, roomId, thread } : { account, roomId },
+  }),
+  /** When to send what the composer holds, from a long press on Send. */
+  schedule: (account: AccountId, roomId: string, thread?: string): Href => ({
+    pathname: '/schedule',
+    params: thread ? { account, roomId, thread } : { account, roomId },
+  }),
+  /** A conversation's scheduled messages, to send now or cancel. */
+  scheduled: (account: AccountId, roomId: string): Href => ({
+    pathname: '/scheduled',
+    params: { account, roomId },
   }),
   newPoll: (account: AccountId, roomId: string, thread?: string): Href => ({
     pathname: '/new-poll',
@@ -249,20 +277,23 @@ type MessageParams = {
   account: AccountId;
   roomId: string;
   eventId?: string;
-  localTarget?: string;
+  /** How far the timeline looks for `eventId` (`reachParam` reads it back); none when `near`. */
+  reach?: Reach;
 };
 
 function messageParams(
   account: AccountId,
   roomId: string,
   eventId?: string,
-  localTarget = false,
+  reach: Reach = 'near',
 ): MessageParams {
   const params: MessageParams = { account, roomId };
 
-  if (eventId) params.eventId = eventId;
+  if (eventId) {
+    params.eventId = eventId;
 
-  if (localTarget) params.localTarget = '1';
+    if (reach !== 'near') params.reach = reach;
+  }
 
   return params;
 }

@@ -27,6 +27,11 @@ fetches keys, so a newly verified session would stay unable to read history.
     (ADR 0003).
   - Every client is built with `auto_enable_cross_signing`, `auto_enable_backups` and
     `BackupDownloadStrategy::AfterDecryptionFailure`, the settings Element X uses.
+  - One exception encrypts by hand: scheduled messages (MSC4140) must be encrypted before the
+    server holds them, and the SDK encrypts only what it sends. Each client is built on a base
+    client the engine makes itself (`account::Crypto`, the SDK builder's `base_client`, same
+    stores and defaults), and `matrix_core::scheduled` follows the SDK's own send path with its
+    `OlmMachine` ([0007](0007-composer-and-media.md)).
 - **Security state is pushed:** the engine watches the SDK's recovery and verification state and
   the offline device, and sends `Event::SecurityChanged` with
   `Security { session_verified, recovery, offline_device }` at start and on every change. The

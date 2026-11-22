@@ -985,7 +985,10 @@ fn a_failed_page_should_not_load_again_until_retried() {
     let (mut s, mut commands) = scrolled_room();
     s.near_top.store(true, Ordering::Relaxed);
     s.poll(&mut Tx::default());
-    let (request, _) = commands.try_next().unwrap();
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::LoadOlder { .. }))
+        .expect("a page asked for");
     apply(&mut s, Event::Finished { request, result: Err("offline".into()) });
     s.near_top.store(true, Ordering::Relaxed);
     s.poll(&mut Tx::default());
@@ -1962,6 +1965,35 @@ fn pasting_an_image_should_attach_it_to_the_draft() {
     let content = rune::clipboard::ClipboardContent::new("").with_image(image);
     assert!(s.paste_into_composer(ComposerTarget::Room, &content));
     assert_eq!(s.composer.attachments.first().map(matrix_core::Upload::name).as_deref(), Some("image.png"));
+}
+
+#[test]
+fn pasting_a_spoiler_into_a_code_block_should_do_nothing() {
+    let (mut s, _) = state();
+    s.composer.edit.insert("let x");
+    s.composer.format(Format::CodeBlock);
+    let content =
+        rune::clipboard::ClipboardContent::new("secret").with_html("<span data-pill=\"spoiler\">secret</span>");
+    assert!(s.paste_into_composer(ComposerTarget::Room, &content));
+    assert_eq!(s.composer.edit.text, "let x");
+    assert!(s.notice.is_some());
+}
+
+#[test]
+fn pasting_a_spoiler_holding_only_an_address_should_be_left_to_the_editor() {
+    let (mut s, _) = state();
+    let content = rune::clipboard::ClipboardContent::new("https://secret.example")
+        .with_html("<span data-pill=\"spoiler\">https://secret.example</span>");
+    assert!(!s.paste_into_composer(ComposerTarget::Room, &content));
+    assert_eq!(s.composer.edit.text, "");
+}
+
+#[test]
+fn pasting_a_spoiler_outside_code_should_be_left_to_the_editor() {
+    let (mut s, _) = state();
+    let content =
+        rune::clipboard::ClipboardContent::new("secret").with_html("<span data-pill=\"spoiler\">secret</span>");
+    assert!(!s.paste_into_composer(ComposerTarget::Room, &content));
 }
 
 #[test]
@@ -5636,6 +5668,607 @@ fn opening_someones_profile_should_request_the_complete_member_list() {
             .iter()
             .any(|command| matches!(command, Command::ListMembers { room_id, all: true, .. } if room_id == "!one:x"))
     );
+}
+
+/// Signed in, `!one:x` on screen, its composer focused, the commands so far drained.
+fn writing(s: &mut State, commands: &mut DetachedCommands) -> AccountId {
+    let id = AccountId::new("@a:example.org");
+    with_rooms(s, &id, &["!one:x"], Vec::new());
+    s.select_room("!one:x");
+    s.composer.edit.focused = true;
+    drain(commands);
+    id
+}
+
+fn sent(commands: &mut DetachedCommands) -> Vec<Outgoing> {
+    all_commands(commands)
+        .into_iter()
+        .filter_map(|command| match command {
+            Command::Send { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect()
+}
+
+fn room_member(id: &str, name: &str) -> matrix_core::RoomMember {
+    matrix_core::RoomMember {
+        person: matrix_core::Person { id: id.into(), name: name.into(), avatar: None },
+        role: matrix_core::MemberRole::Member,
+        presence: matrix_core::Presence::Online,
+        status_message: None,
+        verified: false,
+        level: 0,
+    }
+}
+
+#[test]
+fn a_mention_should_be_sent_as_a_link_and_in_m_mentions() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert_pill("user:@grace:x", "Grace");
+    s.composer.edit.insert(" hi");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let messages = sent(&mut commands);
+    let [Outgoing::Text { body, html: Some(html), mentions }] = messages.as_slice() else { panic!("{messages:?}") };
+    assert_eq!(body, "Grace hi");
+    assert!(html.contains("<a href=\"https://matrix.to/#/@grace:x\">Grace</a>"), "{html}");
+    assert_eq!(mentions.user_ids, ["@grace:x"]);
+}
+
+#[test]
+fn a_room_mention_should_mention_everyone() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert_pill("everyone", "@room");
+    s.composer.edit.insert(" release is out");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(matches!(sent(&mut commands).as_slice(), [Outgoing::Text { mentions, .. }] if mentions.room));
+}
+
+#[test]
+fn typing_an_at_sign_should_suggest_room_members() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    let members = matrix_core::Members {
+        people: vec![room_member("@grace:x", "Grace Hopper"), room_member("@alan:x", "Alan Turing")],
+        complete: true,
+        ..Default::default()
+    };
+    apply(&mut s, Event::Members { request: None, account: id, room_id: "!one:x".into(), members });
+    s.composer.edit.insert("thanks @gr");
+    let (_, found) = s.suggestions(ComposerTarget::Room).expect("suggestions");
+    assert!(matches!(found.as_slice(), [Suggestion::Person { user_id, .. }] if user_id == "@grace:x"));
+}
+
+#[test]
+fn typing_an_at_sign_should_load_members_the_room_lacks() {
+    let (mut s, mut commands) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x"], Vec::new());
+    s.select_room("!one:x");
+    s.composer.edit.focused = true;
+    // The list opening the room asked for failed.
+    let asked = drain(&mut commands).into_iter().find(|(_, command)| matches!(command, Command::ListMembers { .. }));
+    let (request, _) = asked.expect("members asked for as the room opened");
+    apply(&mut s, Event::Finished { request, result: Err("offline".into()) });
+    s.composer.edit.insert("@");
+    s.poll(&mut Tx::default());
+    assert!(
+        all_commands(&mut commands)
+            .iter()
+            .any(|command| matches!(command, Command::ListMembers { room_id, .. } if room_id == "!one:x"))
+    );
+}
+
+#[test]
+fn enter_should_take_the_picked_suggestion_as_a_pill() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    let members = matrix_core::Members { people: vec![room_member("@grace:x", "Grace Hopper")], ..Default::default() };
+    apply(&mut s, Event::Members { request: None, account: id, room_id: "!one:x".into(), members });
+    s.composer.edit.insert("hi @gr");
+    let enter = rune::KeyEvent { key: rune::Key::Enter, mods: rune::Mods::default() };
+    assert!(s.suggestion_key(ComposerTarget::Room, &enter));
+    assert_eq!(s.composer.edit.text, "hi Grace Hopper ");
+    let pills: Vec<_> = s.composer.edit.pills().map(|(_, id)| id.to_owned()).collect();
+    assert_eq!(pills, ["user:@grace:x"]);
+}
+
+#[test]
+fn escape_should_hide_the_suggestions_for_the_word() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/");
+    let escape = rune::KeyEvent { key: rune::Key::Escape, mods: rune::Mods::default() };
+    assert!(s.suggestion_key(ComposerTarget::Room, &escape));
+    assert!(s.suggestions(ComposerTarget::Room).is_none());
+}
+
+#[test]
+fn me_should_send_an_emote() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/me waves");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(matches!(sent(&mut commands).as_slice(), [Outgoing::Emote { body, .. }] if body == "waves"));
+}
+
+#[test]
+fn shrug_should_add_its_face_to_the_message() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/shrug fine");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(matches!(sent(&mut commands).as_slice(), [Outgoing::Text { body, .. }] if body == "fine ¯\\_(ツ)_/¯"));
+}
+
+#[test]
+fn spoiler_should_hide_the_message_from_the_plain_body() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/spoiler the butler did it");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let messages = sent(&mut commands);
+    let [Outgoing::Text { body, html: Some(html), .. }] = messages.as_slice() else { panic!("{messages:?}") };
+    assert_eq!(body, "[Spoiler]");
+    assert!(html.contains("<span data-mx-spoiler>the butler did it</span>"), "{html}");
+}
+
+#[test]
+fn an_unknown_command_should_keep_the_text_and_send_nothing() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/frobnicate now");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(sent(&mut commands).is_empty());
+    assert_eq!(s.composer.edit.text, "/frobnicate now");
+    assert!(s.notice.is_some());
+}
+
+#[test]
+fn two_slashes_should_send_one() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("//me is literal");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(matches!(sent(&mut commands).as_slice(), [Outgoing::Text { body, .. }] if body == "/me is literal"));
+}
+
+#[test]
+fn topic_should_set_the_rooms_topic() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/topic Release week");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(all_commands(&mut commands).iter().any(
+        |command| matches!(command, Command::ChangeRoom { room_id, setting: matrix_core::RoomSetting::Topic(topic), .. } if room_id == "!one:x" && topic == "Release week")
+    ));
+    assert!(s.composer.is_empty());
+}
+
+#[test]
+fn a_command_hidden_in_a_spoiler_should_be_sent_as_a_spoiler() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert_pill("spoiler", "/topic confidential");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let all = all_commands(&mut commands);
+    assert!(!all.iter().any(|command| matches!(command, Command::ChangeRoom { .. })));
+    assert!(all.iter().any(|command| matches!(command, Command::Send { message: Outgoing::Text { body, .. }, .. } if !body.contains("confidential"))));
+}
+
+#[test]
+fn a_topic_holding_a_spoiler_should_not_be_set() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/topic ");
+    s.composer.edit.insert_pill("spoiler", "confidential");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(!all_commands(&mut commands).iter().any(|command| matches!(command, Command::ChangeRoom { .. })));
+    assert!(s.notice.is_some());
+    assert!(!s.composer.is_empty());
+}
+
+#[test]
+fn invite_should_invite_the_mentioned_person() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/invite ");
+    s.composer.edit.insert_pill("user:@grace:x", "Grace");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    assert!(
+        all_commands(&mut commands)
+            .iter()
+            .any(|command| matches!(command, Command::Invite { user_id, .. } if user_id == "@grace:x"))
+    );
+}
+
+#[test]
+fn scheduling_should_hand_the_message_to_the_server_and_empty_the_composer() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("later");
+    s.schedule_message(ComposerTarget::Room, When::Hour);
+    let scheduled = all_commands(&mut commands).into_iter().find_map(|command| match command {
+        Command::Schedule { message: Outgoing::Text { body, .. }, delay_ms, .. } => Some((body, delay_ms)),
+        _ => None,
+    });
+    let (body, delay) = scheduled.expect("a scheduled message");
+    assert_eq!(body, "later");
+    assert!((3_590_000..=3_600_000).contains(&delay), "{delay}");
+    assert!(s.composer.is_empty());
+}
+
+#[test]
+fn a_message_with_attachments_should_not_be_scheduled() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("look");
+    s.composer.attach([PathBuf::from("/a.png")]);
+    assert!(!s.can_schedule(ComposerTarget::Room));
+}
+
+#[test]
+fn the_rooms_scheduled_messages_should_be_listed_for_it_alone() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    let message = |delay_id: &str, room_id: &str| matrix_core::ScheduledMessage {
+        delay_id: delay_id.into(),
+        room_id: room_id.into(),
+        send_at_ms: 1,
+        body: None,
+        failed: None,
+    };
+    apply(
+        &mut s,
+        Event::ScheduledMessages { account: id, messages: vec![message("d1", "!one:x"), message("d2", "!two:x")] },
+    );
+    let listed: Vec<_> = s.scheduled_here().iter().map(|message| message.delay_id.clone()).collect();
+    assert_eq!(listed, ["d1"]);
+}
+
+#[test]
+fn a_link_to_a_message_should_ask_where_it_shows() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.open_permalink("https://matrix.to/#/!one:x/$far?via=x");
+    assert!(all_commands(&mut commands).iter().any(
+        |command| matches!(command, Command::LocateMessage { room_id, event_id, .. } if room_id == "!one:x" && event_id == "$far")
+    ));
+}
+
+#[test]
+fn a_message_found_in_a_thread_should_open_its_thread() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    s.jump_to_message(&id, "!one:x", "$reply");
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::LocateMessage { .. }))
+        .expect("a lookup");
+    let key = TimelineKey::thread("!one:x", "$root");
+    apply(&mut s, Event::MessageLocated { request, account: id, key: key.clone(), event_id: "$reply".into() });
+    assert_eq!(s.active_thread(), Some("$root"));
+    assert!(s.message_jump.as_ref().is_some_and(|jump| jump.key == key && jump.event_id == "$reply"));
+}
+
+#[test]
+fn edit_history_should_show_the_versions_of_its_message() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.open_edit_history("!one:x", "$m");
+    assert!(
+        all_commands(&mut commands)
+            .iter()
+            .any(|command| matches!(command, Command::ListEdits { event_id, .. } if event_id == "$m"))
+    );
+    let version = matrix_core::EditVersion { event_id: "$m".into(), body: "v1".into(), html: None, timestamp_ms: 1 };
+    apply(
+        &mut s,
+        Event::EditHistory {
+            account: AccountId::new("@a:example.org"),
+            room_id: "!one:x".into(),
+            event_id: "$m".into(),
+            versions: vec![version],
+        },
+    );
+    assert!(
+        matches!(&s.modal, Some(Modal::EditHistory(history)) if history.versions.as_ref().is_some_and(|v| v.len() == 1))
+    );
+}
+
+#[test]
+fn typed_coordinates_should_be_chosen_without_a_search() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.open_location(ComposerTarget::Room);
+    s.location.search.insert("52.5163, 13.3777");
+    s.search_places();
+    assert!(all_commands(&mut commands).iter().all(|command| !matches!(command, Command::SearchPlaces { .. })));
+    assert_eq!(s.location.chosen.as_ref().map(|place| place.geo_uri.as_str()), Some("geo:52.5163,13.3777"));
+}
+
+#[test]
+fn a_place_should_be_searched_by_name_and_sent() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.open_location(ComposerTarget::Room);
+    s.location.search.insert("Brandenburger Tor");
+    s.search_places();
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::SearchPlaces { query, .. } if query == "Brandenburger Tor"))
+        .expect("a search");
+    let place = matrix_core::Place { name: "Brandenburger Tor".into(), geo_uri: "geo:52.5,13.4".into(), map: None };
+    apply(&mut s, Event::PlacesFound { request, places: vec![place] });
+    s.send_location(&mut Tx::default());
+    assert!(matches!(
+        sent(&mut commands).as_slice(),
+        [Outgoing::Location { geo_uri, description: Some(name) }] if geo_uri == "geo:52.5,13.4" && name == "Brandenburger Tor"
+    ));
+}
+
+#[test]
+fn pressing_a_spoiler_should_reveal_it_rather_than_open_a_link() {
+    let (mut s, _) = state();
+    let link = format!("{SPOILER_LINK}$m/4");
+    s.open_link(&link, &mut Tx::default());
+    assert!(s.revealed.contains(&link));
+}
+
+#[test]
+fn a_sticker_should_be_sent_from_its_composer() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    let image = matrix_core::PackImage {
+        shortcode: "wave".into(),
+        body: "wave".into(),
+        url: "mxc://x/wave".into(),
+        media: MediaRef::opaque("wave"),
+        emoticon: false,
+        sticker: true,
+        dimensions: None,
+        mimetype: None,
+    };
+    s.send_sticker(ComposerTarget::Room, image, &mut Tx::default());
+    assert!(matches!(sent(&mut commands).as_slice(), [Outgoing::Sticker(image)] if image.url == "mxc://x/wave"));
+}
+
+#[test]
+fn a_command_that_sends_nothing_should_not_be_scheduled() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("/topic Release week");
+    s.schedule_message(ComposerTarget::Room, When::Hour);
+    let sent = all_commands(&mut commands);
+    assert!(sent.iter().all(|command| !matches!(command, Command::ChangeRoom { .. } | Command::Schedule { .. })));
+    assert_eq!(s.composer.edit.text, "/topic Release week");
+    assert!(s.notice.is_some());
+}
+
+#[test]
+fn a_refused_scheduled_message_should_come_back_with_its_reply() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    let answered = Message { event_id: "$q".into(), sender_name: "Grace".into(), ..Message::default() };
+    s.start_reply(ComposerTarget::Room, &answered, &mut Tx::default());
+    s.composer.edit.insert("later");
+    s.schedule_message(ComposerTarget::Room, When::Hour);
+    assert!(s.composer.is_empty());
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::Schedule { .. }))
+        .expect("a scheduled message");
+    apply(&mut s, Event::Finished { request, result: Err("delay too long".into()) });
+    assert_eq!(s.composer.edit.text, "later");
+    assert_eq!(s.composer.reply_to.as_ref().map(|reply| reply.event_id.as_str()), Some("$q"));
+}
+
+#[test]
+fn a_scheduled_message_coming_due_should_list_them_again() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    s.poll(&mut Tx::default());
+    let message = matrix_core::ScheduledMessage {
+        delay_id: "d1".into(),
+        room_id: "!one:x".into(),
+        send_at_ms: 1,
+        body: None,
+        failed: None,
+    };
+    apply(&mut s, Event::ScheduledMessages { account: id, messages: vec![message] });
+    drain(&mut commands);
+    s.poll(&mut Tx::default());
+    s.poll(&mut Tx::default());
+    let listed = all_commands(&mut commands)
+        .into_iter()
+        .filter(|command| matches!(command, Command::ListScheduled { .. }))
+        .count();
+    assert_eq!(listed, 1);
+}
+
+fn failed_scheduled(reason: &str) -> matrix_core::ScheduledMessage {
+    matrix_core::ScheduledMessage {
+        delay_id: "d1".into(),
+        room_id: "!one:x".into(),
+        send_at_ms: 1,
+        body: Some("later".into()),
+        failed: Some(reason.into()),
+    }
+}
+
+#[test]
+fn a_scheduled_message_that_failed_should_say_so_once() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    apply(&mut s, Event::ScheduledMessages { account: id.clone(), messages: vec![failed_scheduled("No posting")] });
+    assert!(s.notice.as_deref().is_some_and(|notice| notice.contains("No posting")));
+    s.notice = None;
+    apply(&mut s, Event::ScheduledMessages { account: id, messages: vec![failed_scheduled("No posting")] });
+    assert_eq!(s.notice, None);
+}
+
+#[test]
+fn a_scheduled_message_that_failed_should_not_keep_asking_for_the_list() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    s.poll(&mut Tx::default());
+    apply(&mut s, Event::ScheduledMessages { account: id, messages: vec![failed_scheduled("No posting")] });
+    drain(&mut commands);
+    s.poll(&mut Tx::default());
+    assert!(!all_commands(&mut commands).iter().any(|command| matches!(command, Command::ListScheduled { .. })));
+}
+
+#[test]
+fn a_link_to_a_message_in_a_room_found_by_its_preview_should_go_to_the_message() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.open_permalink("https://matrix.to/#/#one:x/$far");
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::PreviewRoom { .. }))
+        .expect("a preview asked for");
+    let preview = matrix_core::RoomPreview {
+        room_id: "!one:x".into(),
+        alias: Some("#one:x".into()),
+        name: Some("One".into()),
+        topic: None,
+        avatar: None,
+        member_count: 2,
+        join_rule: Some(matrix_core::JoinRule::Public),
+        space: false,
+        joined: true,
+        invited: false,
+    };
+    apply(&mut s, Event::RoomPreview { request, preview: Box::new(preview) });
+    assert!(
+        all_commands(&mut commands)
+            .iter()
+            .any(|command| matches!(command, Command::LocateMessage { event_id, .. } if event_id == "$far"))
+    );
+}
+
+#[test]
+fn a_message_found_after_leaving_its_room_should_not_pull_the_user_back() {
+    let (mut s, mut commands) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x", "!two:x"], Vec::new());
+    s.select_room("!one:x");
+    drain(&mut commands);
+    s.jump_to_message(&id, "!one:x", "$m");
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::LocateMessage { .. }))
+        .expect("a lookup");
+    s.select_room("!two:x");
+    let key = TimelineKey::room("!one:x");
+    apply(&mut s, Event::MessageLocated { request, account: id, key, event_id: "$m".into() });
+    assert_eq!(s.active_room_id(), Some("!two:x"));
+    assert!(s.message_jump.is_none());
+}
+
+#[test]
+fn an_earlier_jump_answering_late_should_not_undo_a_later_one() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    s.jump_to_message(&id, "!one:x", "$first");
+    s.jump_to_message(&id, "!one:x", "$second");
+    let lookups: Vec<_> = drain(&mut commands)
+        .into_iter()
+        .filter(|(_, command)| matches!(command, Command::LocateMessage { .. }))
+        .map(|(request, _)| request)
+        .collect();
+    let [first, second] = lookups.as_slice() else { panic!("two lookups") };
+    let thread = |root: &str| TimelineKey::thread("!one:x", root);
+    apply(
+        &mut s,
+        Event::MessageLocated { request: *second, account: id.clone(), key: thread("$b"), event_id: "$second".into() },
+    );
+    apply(&mut s, Event::MessageLocated { request: *first, account: id, key: thread("$a"), event_id: "$first".into() });
+    assert_eq!(s.active_thread(), Some("$b"));
+}
+
+#[test]
+fn spoiler_should_hide_its_words_even_in_a_code_block() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.format(Format::CodeBlock);
+    s.composer.edit.insert("/spoiler secret");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let messages = sent(&mut commands);
+    let [Outgoing::Text { body, html: Some(html), .. }] = messages.as_slice() else { panic!("{messages:?}") };
+    assert_eq!(body, "[Spoiler]");
+    assert_eq!(html, "<span data-mx-spoiler>secret</span>");
+}
+
+#[test]
+fn spoiler_should_send_the_drafts_files_and_reply_too() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    let answered = Message { event_id: "$q".into(), sender_name: "Grace".into(), ..Message::default() };
+    s.start_reply(ComposerTarget::Room, &answered, &mut Tx::default());
+    s.composer.attach([PathBuf::from("/a.png")]);
+    s.composer.edit.insert("/spoiler the ending");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    let sent: Vec<_> = all_commands(&mut commands)
+        .into_iter()
+        .filter_map(|command| match command {
+            Command::Send { message, reply_to, .. } => Some((message, reply_to)),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(&sent[0], (Outgoing::Text { body, .. }, Some(reply)) if body == "[Spoiler]" && reply == "$q"));
+    assert!(matches!(&sent[1], (Outgoing::File(_), None)));
+}
+
+#[test]
+fn a_search_hit_opened_while_a_lookup_waits_should_not_be_undone_by_it() {
+    let (mut s, mut commands) = state();
+    let id = writing(&mut s, &mut commands);
+    s.jump_to_message(&id, "!one:x", "$far");
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::LocateMessage { .. }))
+        .expect("a lookup");
+    s.open_message(&TimelineKey::room("!one:x"), "$hit");
+    let key = TimelineKey::thread("!one:x", "$root");
+    apply(&mut s, Event::MessageLocated { request, account: id, key, event_id: "$far".into() });
+    assert_eq!(s.message_jump.as_ref().map(|jump| jump.event_id.as_str()), Some("$hit"));
+}
+
+#[test]
+fn a_lookup_failing_after_leaving_its_room_should_say_nothing() {
+    let (mut s, mut commands) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x", "!two:x"], Vec::new());
+    s.select_room("!one:x");
+    drain(&mut commands);
+    s.jump_to_message(&id, "!one:x", "$m");
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::LocateMessage { .. }))
+        .expect("a lookup");
+    s.select_room("!two:x");
+    apply(&mut s, Event::Finished { request, result: Err("not found".into()) });
+    assert!(s.notice.is_none());
+}
+
+#[test]
+fn a_refused_scheduled_draft_should_wait_for_its_composer_to_be_free() {
+    let (mut s, mut commands) = state();
+    writing(&mut s, &mut commands);
+    s.composer.edit.insert("later");
+    s.schedule_message(ComposerTarget::Room, When::Hour);
+    let (request, _) = drain(&mut commands)
+        .into_iter()
+        .find(|(_, command)| matches!(command, Command::Schedule { .. }))
+        .expect("a scheduled message");
+    s.composer.edit.insert("next one");
+    apply(&mut s, Event::Finished { request, result: Err("delay too long".into()) });
+    assert_eq!(s.composer.edit.text, "next one");
+    s.send_message(ComposerTarget::Room, &mut Tx::default());
+    s.poll(&mut Tx::default());
+    assert_eq!(s.composer.edit.text, "later");
 }
 
 // ----- developer tools and widgets -----------------------------------------------------------

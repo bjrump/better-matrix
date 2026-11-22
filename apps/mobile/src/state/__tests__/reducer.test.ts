@@ -1,4 +1,11 @@
-import { applyLatestMessages, apply, forgetRoomDetails, initialState, mediaKey } from '../reducer';
+import {
+  applyLatestMessages,
+  apply,
+  editsKey,
+  forgetRoomDetails,
+  initialState,
+  mediaKey,
+} from '../reducer';
 import { DEFAULT_SETTINGS } from '../settings';
 import { roomKey, timelineId } from '../timeline';
 import type { State } from '../types';
@@ -550,5 +557,60 @@ describe('forgetRoomDetails', () => {
     });
 
     expect(forgetRoomDetails(state.accounts[0]!, '!a:x').threads).toEqual({ '!b:x': [] });
+  });
+});
+
+describe('apply for composer extras', () => {
+  it('should keep image packs by the room they were listed for', () => {
+    const state = apply(signedIn(ADA), {
+      type: 'ImagePacks',
+      data: { account: ADA, room_id: '!r', packs: [] },
+    });
+
+    expect(state.accounts[0]?.packs).toEqual({ '!r': [] });
+  });
+
+  it('should keep the scheduled messages the server reported', () => {
+    const messages = [{ delay_id: 'd', room_id: '!r', send_at_ms: 1, body: 'hi', failed: null }];
+
+    const state = apply(signedIn(ADA), {
+      type: 'ScheduledMessages',
+      data: { account: ADA, messages },
+    });
+
+    expect(state.accounts[0]?.scheduled).toEqual(messages);
+  });
+
+  it('should tell once that a scheduled message couldn’t be sent', () => {
+    const messages = [
+      { delay_id: 'd', room_id: '!r', send_at_ms: 1, body: 'hi', failed: 'No posting' },
+    ];
+
+    const event = { type: 'ScheduledMessages' as const, data: { account: ADA, messages } };
+
+    const once = apply(signedIn(ADA), event);
+    const twice = apply(once, event);
+
+    expect(once.notices.map((notice) => notice.message)).toEqual([
+      expect.stringContaining('No posting'),
+    ]);
+    expect(twice.notices).toHaveLength(1);
+  });
+
+  it('should keep a message’s edit history by room and event', () => {
+    const versions = [{ event_id: '$e', body: 'a', html: null, timestamp_ms: 1 }];
+
+    const state = apply(signedIn(ADA), {
+      type: 'EditHistory',
+      data: { account: ADA, room_id: '!r', event_id: '$e', versions },
+    });
+
+    expect(state.accounts[0]?.edits[editsKey('!r', '$e')]).toEqual(versions);
+  });
+
+  it('should leave answers to one request to whoever asked', () => {
+    const state = signedIn(ADA);
+
+    expect(apply(state, { type: 'PlacesFound', data: { request: 1, places: [] } })).toBe(state);
   });
 });

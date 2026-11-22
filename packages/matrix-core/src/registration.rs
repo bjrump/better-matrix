@@ -157,7 +157,7 @@ impl Account {
     ) -> Result<Self, Error> {
         let (store, passphrase) = (NewStore::new(layout)?, crate::session::new_passphrase()?);
         let client = async {
-            let client =
+            let (client, crypto) =
                 crate::account::build_client(&request.homeserver, &store.path(), &passphrase, sessions, holder).await?;
             let mut auth = None;
             // The address being confirmed, and the credentials the server sent the link under.
@@ -169,7 +169,7 @@ impl Account {
                 register.initial_device_display_name = Some(DEVICE_DISPLAY_NAME.to_owned());
                 register.auth = auth.take();
                 let error = match client.matrix_auth().register(register).await {
-                    Ok(_) if client.user_id().is_some() => return Ok(client),
+                    Ok(_) if client.user_id().is_some() => return Ok((client, crypto)),
                     Ok(_) => return Err(Error::NoUserId),
                     Err(error) => error,
                 };
@@ -244,7 +244,8 @@ impl Account {
             }
         }
         .await?;
-        store.signed_in(client, sessions, holder, passphrase).await
+        let (client, crypto) = client;
+        store.signed_in(client, crypto, sessions, holder, passphrase).await
     }
 }
 

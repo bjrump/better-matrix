@@ -1,24 +1,33 @@
 import { detachedEngine } from '@better-matrix/matrix-native/client';
 
 import { t } from '../../../i18n';
-import { ADA, message, summary } from '../../../test/fixtures';
+import { ADA, EVERY_PRIVATE_USE, message, summary, withContent } from '../../../test/fixtures';
 import { composer, startEdit, startReply } from '../../composer';
+import { applyFormat, continueBlock } from '../../format';
+import { editDraftOf } from '../../messages';
 import { newPollForm } from '../../pollForm';
 import { Store } from '../../store';
 import { roomKey, threadKey } from '../../timeline';
+import { emotePill, pillAt, spoilerPill, userPill } from '../../pills';
 import {
   addAttachments,
   cancelEdit,
+  completeDraft,
   insertIntoDraft,
   keyOf,
   react,
   removeAttachment,
+  scheduleComposer,
   sendComposer,
   sendPoll,
   sendTyping,
   sendVoiceMemo,
   setDraft,
+  spliceDraft,
 } from '../composer';
+
+/** `m.mentions` for a message that mentions nobody. */
+const NOBODY = { user_ids: [], room: false };
 
 const ROOM = '!lab:example.org';
 
@@ -66,7 +75,7 @@ describe('composer actions', () => {
           account: ADA,
           key: KEY,
           reply_to: null,
-          message: { type: 'Text', data: { body: 'hello', html: null } },
+          message: { type: 'Text', data: { body: 'hello', html: null, mentions: NOBODY } },
         },
       },
     ]);
@@ -121,9 +130,40 @@ describe('composer actions', () => {
     expect(commands()).toEqual([
       {
         type: 'Edit',
-        data: { account: ADA, key: KEY, event_id: '$mine', body: 'hello', html: null },
+        data: {
+          account: ADA,
+          key: KEY,
+          event_id: '$mine',
+          body: 'hello',
+          html: null,
+          mentions: NOBODY,
+        },
       },
     ]);
+  });
+
+  it('should keep a spoiler over several lines hidden through an edit of one of its words', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, '/spoiler he\ndies\n\nsadly');
+    sendComposer(store, ADA, KEY);
+    const sent = commands()[0];
+
+    if (sent?.type !== 'Send' || sent.data.message.type !== 'Text')
+      throw new Error(`not a text message: ${JSON.stringify(sent)}`);
+    const mine = withContent('$mine', { type: 'Text', data: sent.data.message.data });
+    const { draft, pills } = editDraftOf(mine);
+    startEdit(store, ADA, KEY, mine, draft, pills);
+    setDraft(store, ADA, KEY, draft.replace('dies', 'lives'));
+    sendComposer(store, ADA, KEY);
+    const edit = commands()[1];
+
+    expect(edit).toMatchObject({
+      type: 'Edit',
+      data: {
+        body: '[Spoiler]',
+        html: '<p><span data-mx-spoiler>he<br />lives<br /><br />sadly</span></p>',
+      },
+    });
   });
 
   it('should bring the draft back when an edit is cancelled', () => {
@@ -152,6 +192,22 @@ describe('composer actions', () => {
     await flush();
     const after = composer(store.getState(), ADA, KEY);
     expect([after.editing?.event_id, after.draft]).toEqual(['$mine', 'hello']);
+  });
+
+  it('a refused edit should come back with its pills and the message’s own', async () => {
+    const { store, fail } = setUp();
+    const grace = pillAt(userPill('@grace:x', 'Grace'), 3);
+    startEdit(store, ADA, KEY, message('$mine', 'hi Grace'), 'hi @Grace', [grace]);
+    setDraft(store, ADA, KEY, 'hi @Grace!');
+    sendComposer(store, ADA, KEY);
+    fail(0, 'offline');
+    await flush();
+    const after = composer(store.getState(), ADA, KEY);
+    expect([after.draft, after.pills, after.setAside?.originalPills]).toEqual([
+      'hi @Grace!',
+      [grace],
+      [grace],
+    ]);
   });
 
   it('a refused edit should set aside what was typed since, bringing it back when dropped', async () => {
@@ -293,5 +349,358 @@ describe('composer actions', () => {
     expect(commands()).toEqual([
       { type: 'Typing', data: { account: ADA, room_id: ROOM, typing: true } },
     ]);
+  });
+});
+
+describe('pills in the composer', () => {
+  const grace = userPill('@grace:x', 'Grace');
+
+  const otherGrace = userPill('@grace:y', 'Grace');
+
+  it('should keep the pill a picked suggestion inserted', () => {
+    const { store } = setUp();
+    setDraft(store, ADA, KEY, 'hi @Gr');
+    completeDraft(store, ADA, KEY, 'hi @Grace ', { start: 10, end: 10 }, pillAt(grace, 3));
+    expect(composer(store.getState(), ADA, KEY).pills).toEqual([pillAt(grace, 3)]);
+  });
+
+  it('should bind a picked pill to the words it replaced, not the same words before them', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, '@Grace said @Gr');
+    completeDraft(store, ADA, KEY, '@Grace said @Grace', { start: 18, end: 18 }, pillAt(grace, 12));
+    sendComposer(store, ADA, KEY);
+    expect(commands()[0]).toMatchObject({
+      data: {
+        message: {
+          data: {
+            body: '@Grace said Grace',
+            html: '<p>@Grace said <a href="https://matrix.to/#/@grace:x">Grace</a></p>',
+          },
+        },
+      },
+    });
+  });
+
+  it('should keep two people with one name apart as the words around them change', () => {
+    const { store } = setUp();
+    setDraft(store, ADA, KEY, '@Gr');
+    completeDraft(store, ADA, KEY, '@Grace ', { start: 7, end: 7 }, pillAt(grace, 0));
+    setDraft(store, ADA, KEY, '@Grace and @Gr');
+    completeDraft(
+      store,
+      ADA,
+      KEY,
+      '@Grace and @Grace ',
+      { start: 18, end: 18 },
+      pillAt(otherGrace, 11),
+    );
+    setDraft(store, ADA, KEY, 'hi @Grace and @Grace ', undefined, 0);
+    setDraft(store, ADA, KEY, 'hi @Grace @Grace ', undefined, 13);
+    setDraft(store, ADA, KEY, 'hi @Grace ', undefined, 3);
+    expect(composer(store.getState(), ADA, KEY).pills).toEqual([pillAt(otherGrace, 3)]);
+  });
+
+  it('should drop a pill once its label is edited away', () => {
+    const { store } = setUp();
+    completeDraft(store, ADA, KEY, 'hi @Grace ', { start: 10, end: 10 }, pillAt(grace, 3));
+    setDraft(store, ADA, KEY, 'hi @Gra');
+    expect(composer(store.getState(), ADA, KEY).pills).toEqual([]);
+  });
+
+  it('should put a custom emoji picked for the draft at the caret as a pill', () => {
+    const { store } = setUp();
+    const cat = emotePill('mxc://x/cat', 'cat');
+    insertIntoDraft(store, ADA, KEY, ':cat:', cat);
+    expect(composer(store.getState(), ADA, KEY)).toMatchObject({
+      draft: ':cat:',
+      pills: [pillAt(cat, 0)],
+    });
+  });
+
+  it('should move the pills after an emoji picked before them', () => {
+    const { store } = setUp();
+    completeDraft(store, ADA, KEY, 'hi @Grace', { start: 0, end: 0 }, pillAt(grace, 3));
+    insertIntoDraft(store, ADA, KEY, '🎉 ');
+    expect(composer(store.getState(), ADA, KEY).pills).toEqual([pillAt(grace, 6)]);
+  });
+
+  it.each(['bold', 'italic', 'strike', 'code'] as const)(
+    'should keep a pill the toolbar makes %s around',
+    (format) => {
+      const { store } = setUp();
+      completeDraft(store, ADA, KEY, 'hi @Grace', { start: 9, end: 9 }, pillAt(grace, 3));
+      const marker = { bold: '**', italic: '_', strike: '~~', code: '`' }[format];
+      spliceDraft(store, ADA, KEY, applyFormat('hi @Grace', { start: 3, end: 9 }, format));
+      expect(composer(store.getState(), ADA, KEY)).toMatchObject({
+        draft: `hi ${marker}@Grace${marker}`,
+        pills: [pillAt(grace, 3 + marker.length)],
+      });
+    },
+  );
+
+  it('should send a mention made bold by the toolbar as a bold mention', () => {
+    const { store, commands } = setUp();
+    completeDraft(store, ADA, KEY, 'hi @Grace', { start: 9, end: 9 }, pillAt(grace, 3));
+    spliceDraft(store, ADA, KEY, applyFormat('hi @Grace', { start: 3, end: 9 }, 'bold'));
+    sendComposer(store, ADA, KEY);
+    expect(commands()[0]).toMatchObject({
+      data: {
+        message: {
+          data: {
+            html: '<p>hi <strong><a href="https://matrix.to/#/@grace:x">Grace</a></strong></p>',
+            mentions: { user_ids: ['@grace:x'] },
+          },
+        },
+      },
+    });
+  });
+
+  it('should keep a pill on a list item the toolbar continues', () => {
+    const { store } = setUp();
+    completeDraft(store, ADA, KEY, '- @Grace', { start: 8, end: 8 }, pillAt(grace, 2));
+    const continued = continueBlock('- @Grace', '- @Grace\n');
+
+    if (!continued) throw new Error('the list should continue');
+    spliceDraft(store, ADA, KEY, continued);
+    expect(composer(store.getState(), ADA, KEY).pills).toEqual([pillAt(grace, 2)]);
+  });
+
+  it('should keep a pill when the toolbar makes its line a bullet', () => {
+    const { store } = setUp();
+    completeDraft(store, ADA, KEY, '@Grace', { start: 6, end: 6 }, pillAt(grace, 0));
+    spliceDraft(store, ADA, KEY, applyFormat('@Grace', { start: 0, end: 0 }, 'bullets'));
+    expect(composer(store.getState(), ADA, KEY).pills).toEqual([pillAt(grace, 2)]);
+  });
+
+  it('should send a mention with whom it mentions and forget the pills', () => {
+    const { store, commands } = setUp();
+    completeDraft(store, ADA, KEY, 'hi @Grace', { start: 9, end: 9 }, pillAt(grace, 3));
+    sendComposer(store, ADA, KEY);
+    expect([commands()[0], composer(store.getState(), ADA, KEY).pills]).toMatchObject([
+      { data: { message: { data: { mentions: { user_ids: ['@grace:x'] } } } } },
+      undefined,
+    ]);
+  });
+});
+
+describe('commands from the composer', () => {
+  it('should say an unknown command and keep the draft', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, '/frob');
+    expect(sendComposer(store, ADA, KEY)).toBe(false);
+    expect([
+      commands(),
+      composer(store.getState(), ADA, KEY).draft,
+      store.getState().notices.map((n) => n.message),
+    ]).toEqual([[], '/frob', [t('mobile.composer.command_unknown', { name: 'frob' })]]);
+  });
+
+  it('should refuse a topic holding a spoiler, say why and keep the draft', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, '/topic ||launch day||');
+    expect(sendComposer(store, ADA, KEY)).toBe(false);
+    expect([
+      commands(),
+      composer(store.getState(), ADA, KEY).draft,
+      store.getState().notices.map((n) => n.message),
+    ]).toEqual([[], '/topic ||launch day||', [t('slash.no_spoiler', { command: 'topic' })]]);
+  });
+
+  it('should say a draft whose pills can’t be kept wasn’t sent and keep it', () => {
+    const { store, commands } = setUp();
+    const draft = `${EVERY_PRIVATE_USE} secret`;
+    const pills = [pillAt(spoilerPill('secret'), EVERY_PRIVATE_USE.length + 1)];
+    completeDraft(store, ADA, KEY, draft, { start: draft.length, end: draft.length }, pills[0]!);
+    expect(sendComposer(store, ADA, KEY)).toBe(false);
+    expect([
+      commands(),
+      composer(store.getState(), ADA, KEY).draft === draft,
+      composer(store.getState(), ADA, KEY).pills,
+      store.getState().notices.map((n) => n.message),
+    ]).toEqual([[], true, pills, [t('mobile.composer.pills_unkept')]]);
+  });
+
+  it('should invite with /invite and empty the draft', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, '/invite @kai:x');
+    sendComposer(store, ADA, KEY);
+    expect([commands(), composer(store.getState(), ADA, KEY).draft]).toEqual([
+      [{ type: 'Invite', data: { account: ADA, room_id: ROOM, user_id: '@kai:x' } }],
+      '',
+    ]);
+  });
+
+  it('should open the room /join joined', async () => {
+    const { store, succeed } = setUp();
+    const joined = jest.fn();
+    setDraft(store, ADA, KEY, '/join #rust:x');
+    sendComposer(store, ADA, KEY, { joined });
+    store.engine.emit({ type: 'RoomJoined', data: { request: 1, room_id: '!rust:x' } });
+    succeed(0);
+    await flush();
+    expect(joined).toHaveBeenCalledWith('!rust:x');
+  });
+
+  it('should leave the room’s screen once a confirmed /leave worked', async () => {
+    const { store, succeed } = setUp();
+    const left = jest.fn();
+    setDraft(store, ADA, KEY, '/leave');
+    sendComposer(store, ADA, KEY, { left, confirmLeave: (leave) => leave(false) });
+    succeed(0);
+    await flush();
+    expect(left).toHaveBeenCalled();
+  });
+
+  it('should ask before /leave leaves, and forget a deleted chat', () => {
+    const { store, commands } = setUp();
+    const asked: ((forget: boolean) => void)[] = [];
+    setDraft(store, ADA, KEY, '/leave');
+    sendComposer(store, ADA, KEY, { confirmLeave: (leave) => asked.push(leave) });
+    const beforeAgreeing = commands().length;
+    asked[0]?.(true);
+    expect([beforeAgreeing, commands()]).toEqual([
+      0,
+      [{ type: 'LeaveRoom', data: { account: ADA, room_id: ROOM, forget: true } }],
+    ]);
+  });
+
+  it('should stay in the room with an emptied composer when /leave is cancelled', () => {
+    const { store, commands } = setUp();
+    const left = jest.fn();
+    setDraft(store, ADA, KEY, '/leave');
+    sendComposer(store, ADA, KEY, { left, confirmLeave: () => {} });
+    expect([commands(), left.mock.calls, composer(store.getState(), ADA, KEY).draft]).toEqual([
+      [],
+      [],
+      '',
+    ]);
+  });
+
+  it('should say why a command failed', async () => {
+    const { store, fail } = setUp();
+    setDraft(store, ADA, KEY, '/topic Hi');
+    sendComposer(store, ADA, KEY);
+    fail(0, 'forbidden');
+    await flush();
+    expect(store.getState().notices.map((n) => n.message)).toEqual([
+      t('mobile.composer.command_failed', { error: 'forbidden' }),
+    ]);
+  });
+});
+
+describe('scheduling from the composer', () => {
+  it('should hand the draft to the server and empty the composer', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, 'later');
+    expect(scheduleComposer(store, ADA, KEY, 1_000)).toBe(true);
+    expect([commands().map((c) => c.type), composer(store.getState(), ADA, KEY).draft]).toEqual([
+      ['Schedule'],
+      '',
+    ]);
+  });
+
+  it('should give the text back when the server refused it', async () => {
+    const { store, fail } = setUp();
+    setDraft(store, ADA, KEY, 'later');
+    scheduleComposer(store, ADA, KEY, 1_000);
+    fail(0, 'unsupported');
+    await flush();
+    expect(composer(store.getState(), ADA, KEY).draft).toBe('later');
+  });
+
+  it('should give the whole composer back when the server refused it: pills and reply too', async () => {
+    const { store, fail } = setUp();
+    const grace = pillAt(userPill('@grace:x', 'Grace'), 6);
+    startReply(store, ADA, KEY, message('$q', 'when?'));
+    completeDraft(store, ADA, KEY, 'later @Grace', { start: 12, end: 12 }, grace);
+    scheduleComposer(store, ADA, KEY, 1_000);
+    fail(0, 'unsupported');
+    await flush();
+    const after = composer(store.getState(), ADA, KEY);
+    expect([after.draft, after.pills, after.replyTo?.event_id]).toEqual([
+      'later @Grace',
+      [grace],
+      '$q',
+    ]);
+  });
+
+  it('a refused schedule should wait while the composer holds new text', async () => {
+    const { store, fail } = setUp();
+    setDraft(store, ADA, KEY, 'later');
+    scheduleComposer(store, ADA, KEY, 1_000);
+    setDraft(store, ADA, KEY, 'next');
+    fail(0, 'unsupported');
+    await flush();
+    expect(composer(store.getState(), ADA, KEY).draft).toBe('next');
+  });
+
+  it('a refused schedule should come back with its pills and reply once the composer is emptied', async () => {
+    const { store, fail } = setUp();
+    const grace = pillAt(userPill('@grace:x', 'Grace'), 6);
+    startReply(store, ADA, KEY, message('$q', 'when?'));
+    completeDraft(store, ADA, KEY, 'later @Grace', { start: 12, end: 12 }, grace);
+    scheduleComposer(store, ADA, KEY, 1_000);
+    setDraft(store, ADA, KEY, 'next');
+    fail(0, 'unsupported');
+    await flush();
+    setDraft(store, ADA, KEY, '');
+    const after = composer(store.getState(), ADA, KEY);
+    expect([after.draft, after.pills, after.replyTo?.event_id, after.refused]).toEqual([
+      'later @Grace',
+      [grace],
+      '$q',
+      [],
+    ]);
+  });
+
+  it('a refused schedule should come back once the message typed since is sent', async () => {
+    const { store, fail } = setUp();
+    setDraft(store, ADA, KEY, 'later');
+    scheduleComposer(store, ADA, KEY, 1_000);
+    setDraft(store, ADA, KEY, 'next');
+    fail(0, 'unsupported');
+    await flush();
+    sendComposer(store, ADA, KEY);
+    expect(composer(store.getState(), ADA, KEY).draft).toBe('later');
+  });
+
+  it('a refused schedule should wait for an edit under way to end', async () => {
+    const { store, fail } = setUp();
+    setDraft(store, ADA, KEY, 'later');
+    scheduleComposer(store, ADA, KEY, 1_000);
+    startEdit(store, ADA, KEY, message('$m', 'old'), 'old');
+    fail(0, 'unsupported');
+    await flush();
+    const during = composer(store.getState(), ADA, KEY).draft;
+    cancelEdit(store, ADA, KEY);
+    expect([during, composer(store.getState(), ADA, KEY).draft]).toEqual(['old', 'later']);
+  });
+
+  it('should not schedule attachments', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, 'x');
+    addAttachments(store, ADA, KEY, [pdf]);
+    expect([scheduleComposer(store, ADA, KEY, 1_000), commands()]).toEqual([false, []]);
+  });
+
+  it('should not run a command that acts when a time is picked, keeping the draft and saying why', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, '/leave');
+    expect([
+      scheduleComposer(store, ADA, KEY, 1_000),
+      commands(),
+      composer(store.getState(), ADA, KEY).draft,
+      store.getState().notices.map((n) => n.message),
+    ]).toEqual([false, [], '/leave', [t('mobile.composer.schedule_command')]]);
+  });
+
+  it('should schedule a command that makes a message', () => {
+    const { store, commands } = setUp();
+    setDraft(store, ADA, KEY, '/me waves');
+    scheduleComposer(store, ADA, KEY, 1_000);
+    expect(commands()[0]).toMatchObject({
+      type: 'Schedule',
+      data: { message: { type: 'Emote', data: { body: 'waves' } } },
+    });
   });
 });

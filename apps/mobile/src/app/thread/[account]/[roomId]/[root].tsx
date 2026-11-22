@@ -10,6 +10,7 @@ import { t } from '../../../../i18n';
 import { findMessage } from '../../../../state/messages';
 import { useStore } from '../../../../state/react';
 import { room as roomOf, timeline } from '../../../../state/selectors';
+import { reachParam } from '../../../../state/seek';
 import { roomKey, threadKey } from '../../../../state/timeline';
 import { inlineName } from '../../../../state/timelineText';
 import { font } from '../../../../theme/palette';
@@ -21,12 +22,12 @@ import { Conversation } from '../../../../ui/timeline/Conversation';
 import { Timeline } from '../../../../ui/timeline/Timeline';
 
 export default function ThreadScreen() {
-  const { account, roomId, root, eventId, localTarget } = useLocalSearchParams<{
+  const { account, roomId, root, eventId, reach } = useLocalSearchParams<{
     account: string;
     roomId: string;
     root: string;
     eventId?: string;
-    localTarget?: string;
+    reach?: string;
   }>();
 
   const palette = usePalette();
@@ -73,7 +74,7 @@ export default function ThreadScreen() {
         }
       >
         <Timeline
-          localTarget={localTarget === '1'}
+          targetReach={reachParam(reach)}
           target={eventId ?? null}
           account={account}
           timelineKey={key}

@@ -5,11 +5,13 @@
 // formatting toolbar, once picked, sits above the row until it is closed. The screen around it
 // (`ui/timeline/Conversation`) keeps it above the keyboard and the home indicator. The draft
 // lives in the store per timeline, so it survives leaving the room; typing notices follow its
-// changes.
+// changes. Typing `@`, `#`, `:` or a `/` command lists suggestions above the field; a picked
+// person, room or custom emoji is a pill (`state/pills.ts`), drawn in the accent in the field.
+// A long press on Send schedules the message.
 
 import type { AccountId, TimelineKey } from '@better-matrix/matrix-native/types';
 import { useFocusEffect, useRouter } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Keyboard,
@@ -22,36 +24,53 @@ import {
   View,
 } from 'react-native';
 
-import { t } from '../../i18n';
+import { t, tp } from '../../i18n';
 import { routes } from '../../routes';
 import {
   addAttachments,
   cancelEdit,
   cancelReply,
+  completeDraft,
   removeAttachment,
+  scheduleProblemText,
   sendComposer,
   sendTyping,
   sendVoiceMemo,
   setDraft,
   setSelection,
+  spliceDraft,
 } from '../../state/actions/composer';
 import { flushDraft, followDraft } from '../../state/actions/drafts';
+import { listImagePacks } from '../../state/actions/messages';
+import { listAllMembers } from '../../state/actions/people';
 import { composer, type PendingAttachment } from '../../state/composer';
 import {
   activeBlocks,
   applyFormat,
   applyLink,
   continueBlock,
+  type Edited,
   type Format,
   hasText,
   type Selection,
 } from '../../state/format';
-import { excerpt, formatDuration } from '../../state/outgoing';
+import { excerpt, formatDuration, scheduleProblem } from '../../state/outgoing';
+import {
+  completeAt,
+  type DraftPill,
+  isSpoiler,
+  pillAt,
+  placePills,
+  triggerAt,
+} from '../../state/pills';
 import { addNotice } from '../../state/reducer';
 import { useAppStore, useStore } from '../../state/react';
-import { room } from '../../state/selectors';
+import { failedIn, scheduledIn } from '../../state/schedule';
+import { account as accountOf, room } from '../../state/selectors';
+import { type Suggestion, suggestionsFor } from '../../state/suggestions';
 import { draftChanged, typingEnded, typingFor } from '../../state/typingNotices';
 import { font } from '../../theme/palette';
+import { askToLeave } from '../askToLeave';
 import { IconButton } from '../components';
 import { Icon } from '../icons';
 import { usePalette } from '../theme';
@@ -59,7 +78,9 @@ import { AttachTray, type TrayChoice } from './AttachTray';
 import { Attachments } from './Attachments';
 import { Banner } from './Banner';
 import { FormatBar } from './FormatBar';
+import { Suggestions } from './Suggestions';
 import { DENIED, pickFiles, pickFromLibrary, takeWithCamera } from './pickers';
+import { useScheduledRefresh } from './useScheduledRefresh';
 import { useVoiceMemo } from './useVoiceMemo';
 import { VoiceGlow } from './VoiceGlow';
 
@@ -79,6 +100,11 @@ type Tool =
 
 const NONE: Tool = { type: 'none' };
 
+const NO_SUGGESTIONS: Suggestion[] = [];
+
+/** Characters that may start a suggestion: only then does the field report where the caret is. */
+const SIGNS = /[@#:/]/;
+
 export function Composer({ account, timelineKey, roomName }: ComposerProps) {
   const store = useAppStore();
   const palette = usePalette();
@@ -93,7 +119,7 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
   /** The draft as this view last wrote or took it: anything else in the store came from elsewhere. */
   const written = useRef(state.draft);
   const selection = useRef<Selection>({ start: state.draft.length, end: state.draft.length });
-  /** Where the caret is, while the formatting toolbar shows it. */
+  /** Where the caret is, while the formatting toolbar or a suggestion's sign needs it. */
   const [caret, setCaret] = useState(state.draft.length);
   /** Where the caret goes once the field shows a text this view changed. */
   const pendingSelection = useRef<Selection | null>(null);
@@ -161,31 +187,53 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
     ),
   );
 
-  /** Takes a new draft from the user or the toolbar. */
-  const write = (draft: string, caretAt?: Selection) => {
+  /**
+   * Takes a new draft from the user, a suggestion (`pill`, when it is one) or the toolbar (the
+   * `splices` it made, which move the pills exactly).
+   */
+  const write = (
+    draft: string,
+    caretAt?: Selection,
+    pill?: DraftPill | null,
+    splices?: Edited['splices'],
+  ) => {
     written.current = draft;
     setText(draft);
 
-    if (caretAt) pendingSelection.current = caretAt;
-    setDraft(store, account, timelineKey, draft);
+    if (caretAt) {
+      pendingSelection.current = caretAt;
+      setCaret(caretAt.start);
+    }
+
+    if (splices && caretAt)
+      spliceDraft(store, account, timelineKey, { text: draft, selection: caretAt, splices });
+    else if (pill !== undefined)
+      completeDraft(store, account, timelineKey, draft, caretAt ?? selection.current, pill);
+    // Where the caret was tells apart an edit in repeated text, for the pills after it.
+    else setDraft(store, account, timelineKey, draft, undefined, selection.current.start);
     const step = draftChanged(typing.current, draft, Date.now());
     typing.current = step.next;
     notify(step.notice);
   };
 
+  /** Takes a change the app made at known places. */
+  const writeEdited = (edited: Edited) =>
+    write(edited.text, edited.selection, undefined, edited.splices);
+
   const onChangeText = (next: string) => {
     const continued = continueBlock(written.current, next);
 
-    if (continued) write(continued.text, continued.selection);
+    if (continued) writeEdited(continued);
     else write(next);
   };
 
   const onSelectionChange = (event: TextInputSelectionChangeEvent) => {
     selection.current = event.nativeEvent.selection;
 
-    // Only the formatting toolbar shows where the caret is: typing without it redraws once a
-    // keystroke, not twice.
-    if (tool.type === 'format' || tool.type === 'link') setCaret(event.nativeEvent.selection.start);
+    // Only the formatting toolbar and suggestions need where the caret is: typing without them
+    // redraws once a keystroke, not twice.
+    if (tool.type === 'format' || tool.type === 'link' || SIGNS.test(written.current))
+      setCaret(event.nativeEvent.selection.start);
   };
 
   const format = (which: Format) => {
@@ -195,14 +243,12 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
       return;
     }
 
-    const edited = applyFormat(written.current, selection.current, which);
-    write(edited.text, edited.selection);
+    writeEdited(applyFormat(written.current, selection.current, which));
   };
 
   const confirmLink = () => {
     if (tool.type !== 'link') return;
-    const edited = applyLink(written.current, tool.selection, tool.url);
-    write(edited.text, edited.selection);
+    writeEdited(applyLink(written.current, tool.selection, tool.url));
     setTool({ type: 'format' });
     field.current?.focus();
   };
@@ -211,7 +257,106 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
     const step = typingEnded(typing.current, '');
     typing.current = step.next;
     notify(step.notice);
-    sendComposer(store, account, timelineKey);
+    sendComposer(store, account, timelineKey, {
+      joined: (joined) => {
+        if (joined) router.push(routes.room(account, joined));
+      },
+      left: () => router.navigate(routes.home()),
+      confirmLeave: (leave) => {
+        const leaving = room(store.getState(), account, timelineKey.room_id);
+
+        if (leaving) askToLeave(leaving, leave);
+      },
+    });
+  };
+
+  // What the word at the caret asks to complete, and the suggestions for it.
+  const trigger = useMemo(
+    () => (tool.type === 'attach' ? null : triggerAt(text, Math.min(caret, text.length))),
+    [text, caret, tool.type],
+  );
+
+  const suggestionState = useStore((s) => (trigger ? s : null));
+
+  const suggestions = useMemo(
+    () =>
+      trigger && suggestionState
+        ? suggestionsFor(suggestionState, account, roomId, trigger)
+        : NO_SUGGESTIONS,
+    [trigger, suggestionState, account, roomId],
+  );
+
+  // People are suggested from the room's whole member list, fetched once asked for; packs for
+  // custom emoji and stickers once the composer shows.
+  const wantsPeople = trigger?.kind === 'user';
+  useEffect(() => {
+    if (wantsPeople) listAllMembers(store, account, roomId);
+  }, [wantsPeople, store, account, roomId]);
+  useEffect(() => listImagePacks(store, account, roomId), [store, account, roomId]);
+
+  // What the server holds to send here later, kept current while the conversation is open.
+  const scheduled = useStore((s) => scheduledIn(accountOf(s, account)?.scheduled, roomId).length);
+  const failed = useStore((s) => failedIn(accountOf(s, account)?.scheduled, roomId));
+
+  useScheduledRefresh(account, roomId);
+
+  const pick = (suggestion: Suggestion) => {
+    if (!trigger) return;
+
+    const insert =
+      suggestion.type === 'command'
+        ? `/${suggestion.command.name}`
+        : suggestion.type === 'emoji'
+          ? suggestion.emoji
+          : suggestion.pill.label;
+
+    const done = completeAt(written.current, trigger, insert);
+
+    // The pill stands for the words the suggestion replaced, not any like them elsewhere.
+    const pill =
+      suggestion.type === 'pill' || suggestion.type === 'emote'
+        ? pillAt(suggestion.pill, trigger.start)
+        : null;
+
+    write(done.text, done.selection, pill);
+  };
+
+  // The field's text as tokens: its pills in the accent, a spoiler's words on the muted colour.
+  const pills = state.pills;
+
+  const segments = useMemo(() => {
+    const placed = placePills(text, pills ?? []);
+    const parts: Array<{ text: string; pill: 'pill' | 'spoiler' | null }> = [];
+    let at = 0;
+
+    for (const p of placed) {
+      if (p.start > at) parts.push({ text: text.slice(at, p.start), pill: null });
+      parts.push({
+        text: text.slice(p.start, p.end),
+        pill: isSpoiler(p.pill) ? 'spoiler' : 'pill',
+      });
+      at = p.end;
+    }
+
+    if (at < text.length || parts.length === 0) parts.push({ text: text.slice(at), pill: null });
+
+    return parts;
+  }, [text, pills]);
+
+  const schedule = () => {
+    // A draft that can't wait on the server (attachments, a command that acts) says why here.
+    const problem = scheduleProblem(state, account, timelineKey);
+
+    if (problem) {
+      const text = scheduleProblemText(problem);
+
+      if (text) Alert.alert(t('mobile.composer.schedule'), text);
+
+      return;
+    }
+
+    setSelection(store, account, timelineKey, selection.current);
+    router.push(routes.schedule(account, roomId, thread ?? undefined));
   };
 
   const notice = (message: string) => store.update((s) => addNotice(s, message, account));
@@ -272,6 +417,14 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
       case 'emoji':
         setTool(NONE);
         openEmoji();
+        break;
+      case 'sticker':
+        setTool(NONE);
+        router.push(routes.stickers(account, roomId, thread ?? undefined));
+        break;
+      case 'location':
+        setTool(NONE);
+        router.push(routes.location(account, roomId, thread ?? undefined));
         break;
     }
   };
@@ -336,7 +489,10 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
   };
 
   const onActionLongPress = () => {
-    if (!recording && !sendable && !editing) voice.dispatch({ type: 'press', held: true });
+    if (recording) return;
+
+    if (!sendable && !editing) voice.dispatch({ type: 'press', held: true });
+    else if (sendable && !editing) schedule();
   };
 
   return (
@@ -344,6 +500,38 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
       style={[styles.composer, { backgroundColor: palette.bg, borderTopColor: palette.divider }]}
       testID="composer"
     >
+      {scheduled > 0 ? (
+        <Pressable
+          testID="composer-scheduled"
+          accessibilityRole="button"
+          onPress={() => router.push(routes.scheduled(account, roomId))}
+          android_ripple={{ color: palette.hover }}
+          style={styles.scheduled}
+        >
+          {/* Any the server couldn't send come first: they wait for the user, not the clock. */}
+          <Icon
+            name="scheduleSend"
+            size={16}
+            color={failed > 0 ? palette.danger : palette.accent}
+          />
+          <Text
+            style={[
+              font.meta,
+              styles.scheduledText,
+              { color: failed > 0 ? palette.danger : palette.accent },
+            ]}
+          >
+            {failed > 0
+              ? tp('mobile.composer.scheduled_failed_count', failed)
+              : tp('mobile.composer.scheduled', scheduled)}
+          </Text>
+          <Icon
+            name="chevronRight"
+            size={14}
+            color={failed > 0 ? palette.danger : palette.accent}
+          />
+        </Pressable>
+      ) : null}
       {state.replyTo && !editing ? (
         <Banner
           icon="reply"
@@ -406,6 +594,7 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
           />
         </View>
       ) : null}
+      {recording ? null : <Suggestions account={account} suggestions={suggestions} onPick={pick} />}
       {(tool.type === 'format' || tool.type === 'link') && !recording ? (
         <View style={styles.formatBar}>
           <IconButton
@@ -465,7 +654,6 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
             <TextInput
               ref={field}
               testID="composer-input"
-              value={text}
               onChangeText={onChangeText}
               onSelectionChange={onSelectionChange}
               onFocus={() => {
@@ -479,7 +667,24 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
               scrollEnabled
               textAlignVertical="top"
               style={[font.body, styles.input, { color: palette.text }]}
-            />
+            >
+              {segments.map((part, index) =>
+                part.pill === 'spoiler' ? (
+                  <Text key={index} style={{ backgroundColor: `${palette.textMuted}40` }}>
+                    {part.text}
+                  </Text>
+                ) : part.pill === 'pill' ? (
+                  <Text
+                    key={index}
+                    style={{ color: palette.accent, backgroundColor: `${palette.accent}1f` }}
+                  >
+                    {part.text}
+                  </Text>
+                ) : (
+                  <Text key={index}>{part.text}</Text>
+                ),
+              )}
+            </TextInput>
           )}
         </View>
         <Pressable
@@ -487,7 +692,11 @@ export function Composer({ account, timelineKey, roomName }: ComposerProps) {
           accessibilityRole="button"
           accessibilityLabel={action.label}
           accessibilityHint={
-            action.icon === 'mic' && !recording ? t('mobile.composer.voice_hint') : undefined
+            action.icon === 'mic' && !recording
+              ? t('mobile.composer.voice_hint')
+              : action.icon === 'send' && !recording
+                ? t('mobile.composer.schedule')
+                : undefined
           }
           accessibilityState={{ disabled: actionDisabled }}
           disabled={actionDisabled}
@@ -575,4 +784,12 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   held: { transform: [{ scale: 1.25 }] },
+  scheduled: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 16,
+    paddingBottom: 6,
+  },
+  scheduledText: { flex: 1, fontWeight: '600' },
 });

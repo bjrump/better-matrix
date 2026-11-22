@@ -47,7 +47,7 @@ fn name(sender: &UserId, profile: &TimelineDetails<Profile>) -> String {
 fn embedded_body(event: &EmbeddedEvent) -> Option<String> {
     match &event.content {
         TimelineItemContent::MsgLike(MsgLikeContent { kind: MsgLikeKind::Message(message), .. }) => {
-            Some(convert::content(message.msgtype()).plain().to_owned())
+            Some(convert::content(message.msgtype()).plain().into_owned())
         }
         _ => None,
     }
@@ -201,6 +201,7 @@ fn base_message(event: &EventTimelineItem, me: &UserId) -> Message {
         read_receipts,
         reply_to: None,
         thread: None,
+        highlighted: event.is_highlighted(),
     }
 }
 

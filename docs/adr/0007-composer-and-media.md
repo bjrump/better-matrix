@@ -23,7 +23,160 @@ screenshots, voice memos, and images, PDFs, videos and recordings that open larg
     text. Pressing a link opens it in the browser (`on_link`, `State::open_link`).
   - A pasted lone web address goes into the draft as a link, and pasted over a selection links
     the selection (`Composer::paste_link`, one undo step); text typed after it is plain.
-  - `Format` lists every toolbar action; the toolbar renders the list.
+  - `Format` lists every toolbar action; the toolbar renders the list. Spoiler and Formula
+    turn the selection into a pill (below).
+- **Pills:** what Matrix HTML carries that isn't formatting is one pill in a field (Rune's
+  `Mark::Pill`, `<span data-pill="id">` in its HTML): mentions (`user:@…`, `room:#…` or a room
+  ID), `@room` (`everyone`), spoilers (`spoiler`), formulas (`math`) and custom emoji
+  (`emote:mxc://…`). `matrix_core::html` is the one translation, both ways: `to_pills` reads a
+  message's HTML for showing it (`Pills::Display`: formulas as Unicode) or editing it
+  (`Pills::Compose`: formulas as their LaTeX), `from_pills` writes a field's pills as Matrix
+  HTML (a matrix.to link, `data-mx-spoiler`, `data-mx-maths` with the LaTeX as its `<code>`
+  fallback, `<img data-mx-emoticon>` 32 px high). A field with a pill counts as formatted, so it
+  goes with HTML. Drafts keep Matrix HTML and come back as pills, as edits do. A spoiler's words
+  stay out of the plain body (`[Spoiler]`), so clients that show only the body don't show them.
+- **Mentions:** every text, emote and edit carries `m.mentions` (`Outgoing::Text::mentions`,
+  `Command::Edit::mentions`), empty when it mentions nobody: a message mentions only the people
+  its pills name, never someone whose name its words happen to hold (the spec's intentional
+  mentions). A reply adds the replied-to sender, as the SDK does. Received mention links show as
+  chips in the accent colour; one naming the reader is filled, and the row of a message whose
+  push rules highlight it (`Message::highlighted`) gets a warm tint and bar, as in Slack.
+- **Suggestions** (`state::suggest`): the word before the caret asks for them when it starts
+  with `@` (room members, then `@room`), `#` (joined rooms, not direct chats), `:` and two
+  letters (the packs' custom emoji, then emoji whose short code starts with it, then whose name
+  holds it) or `/` at the start of the message (commands). Never inside code, a pill or a
+  selection. The list is worked out from the field each frame, eight at most; a composer keeps
+  only the pick and a dismissal for the word they were made for (`Suggest`), so typing on keeps
+  them and a new word starts over. Up and Down move round, Tab and Enter take, Escape hides the
+  list for that word; a press takes one. Taking one puts in a pill (mentions by display name,
+  as Element does; rooms as `#name`) or the emoji, then a space. Members load when `@` is first
+  typed in a room whose list isn't here (`load_for_suggestions`, from `poll`). The list sits on
+  the composer's frame at the window's root and takes no focus.
+- **Slash commands** (`state::slash`): `/me`, `/shrug`, `/tableflip`, `/unflip`, `/lenny`,
+  `/plain`, `/spoiler`, `/invite`, `/join`, `/leave`, `/topic`, `/nick`. Each becomes something
+  that exists: an emote or text through the usual send (with the draft's reply), an invite, the
+  link dialog for a join (`open_typed_link`), the leave confirmation, `Command::ChangeRoom` (`RoomSetting::Topic`, the room settings' own path), the
+  global display name. A name the app doesn't know stops the send with a notice and keeps the
+  text: a typo never goes out. `//` sends a leading slash; `/usr/bin` is a message.
+- **Spoilers and formulas:** received spoilers draw as a block of their own colour, carrying an
+  app link (`SPOILER_LINK`, naming the message, the place and a fingerprint of the words) a press
+  reveals for the run (`State::revealed`): an edit hiding other words there hides them again.
+  Until revealed, the words never reach the text Rune holds (blanks of the same length stand in),
+  so neither a screen reader nor a copied selection has them. A spoiler is its
+  plain words (a custom emoji by its description): nothing inside it becomes a pill or link that
+  could show or act through it, and a link around a spoiler is no link, its words being hidden.
+  A spoiler wins over everything else an element says (maths too), and a code block holding one
+  shows as ordinary text, as fields keep no pills in code blocks; for the same reason the
+  composer makes no spoiler or formula inside a code block, nor a code block over a pill, and a
+  key or paste that would join a paragraph holding a pill onto a code block (Backspace or Delete
+  at the join, or typing, Enter, cutting or pasting over a selection across it) does nothing.
+  Any other change that strips a pill into a code block (the field's own cut, word deletion,
+  Tab, input methods) is taken back after its frame, and again before a message is sent or
+  scheduled (`Composer::keep_pills`), so a spoiler never leaves as plain words.
+  A message's plain body may spell out what its spoiler hides, so text taken from a message
+  (previews, notifications, quotes, search hits, copying, translating) is what it shows:
+  `MessageContent::plain` and `html::shown_text`, each spoiler as `[Spoiler]`.
+  `/spoiler` writes its spoiler itself (`html::spoiler`), line breaks and all, whatever the field
+  held its words as. Formulas
+  (`data-mx-maths`) show as one line of Unicode on a chip, in italics (`matrix_core::math`:
+  Greek and symbols by name, scripts in Unicode's super- and subscripts or `^(…)`, `\frac` as
+  `a/b`, unknown commands kept); there is no typesetting engine for Rune, and Unicode keeps
+  selection and copy working. Formulas come from anyone in a room, so reading one is bounded:
+  accents stack on letters rather than doubling the text, and past 2000 bytes, 32 nested levels
+  or 8000 bytes of output a formula shows as its LaTeX. The mobile port runs the same vectors
+  (`math.json`).
+- **Custom emoji and stickers** (MSC2545 image packs, `matrix_core::packs`): the user's pack
+  (`m.image_pack`), the room's (`m.room.image_pack`, one per state key) and those enabled
+  everywhere (`m.image_pack.rooms`), each also under the `im.ponies.*` name clients used before
+  (a room's pack under both names once), read from the store (under sliding sync, whose fixed
+  required state leaves packs out, also from the room's state on the server, once a run per
+  room, what sync brought since winning for the same pack), listed per room once a run
+  (`Command::ListImagePacks`; the sticker picker lists again as it opens). The emoji picker
+  leads with the room's custom emoji; a sticker button opens a grid of the packs' stickers, a
+  press sends `Outgoing::Sticker` (`m.sticker`), as a reply and into a thread like any message
+  (the SDK relates only room messages itself, so the engine writes the relation for stickers
+  and polls). A received image from `mxc://` is a custom
+  emoji, `data-mx-emoticon` or not: the SDK's sanitiser drops that attribute, which the spec's
+  list of allowed attributes lacks. Received custom emoji draw as their picture
+  inline (`El::inline_icon`), their short code kept as unseen text so copying gives `:code:`;
+  pictures load like other media on screen (`TimelineItem::emotes`, 128 px), and like it wait
+  while the account keeps the message's media back (ADR 0011), reading as their short codes
+  until it is shown. Adding to packs
+  stays with clients that edit them.
+- **Locations** (`matrix_core::geo`): `Outgoing::Location` sends `m.location` with a
+  `geo:` URI, a pin asset (MSC3488) and the place's name as its body (else its coordinates).
+  Maps come from OpenStreetMap, as asked: a map is a `MediaRef` (`osm:lat,lon,zoom`) that
+  `Command::FetchMedia` draws from the standard tiles at the size asked for, with a pin, so maps
+  load, cache and retry as pictures do on both apps. As OpenStreetMap's tile policy asks, tiles
+  are kept on disk (`StoreLayout::map_tiles`) for as long as the server's `Cache-Control` or
+  `Expires` say (less what a cache on the way already held it for; seven days when it says
+  nothing readable), then asked for again with `If-None-Match` /
+  `If-Modified-Since`, a copy past its time still showing when the server can't be reached; the
+  last 64 are also kept decoded in memory, and they are fetched two at a time with a User-Agent
+  naming the app and its home;
+  every map credits "© OpenStreetMap contributors". Loading a map tells OpenStreetMap the
+  device's address and the area shown, for places shared in encrypted rooms too, so Settings →
+  General → Maps of shared places turns maps off (on by default, as GIFs from links): cards and
+  the dialog then show the name and coordinates only, and fetch nothing. The location dialog
+  (`Modal::Location`) finds places with Nominatim on Enter or Search only (its policy forbids
+  searching as one types), at most once a second with the last 32 answers kept, in the app's
+  language, or takes typed coordinates; the timeline's card shows the map, the name,
+  the coordinates and "Open in OpenStreetMap". The desktop has no position of its own to share.
+- **Scheduled messages** (MSC4140 delayed events, `matrix_core::scheduled`): the button beside
+  send (or right-clicking send) offers in 30 minutes, in an hour, tomorrow 09:00 and next Monday
+  09:00, local time (on that day's clock, summer time and all); the server sends the message
+  then, whether or not the app runs. The engine schedules any message (`Command::Schedule`
+  takes an `Outgoing`: text, emotes, stickers, places, polls); the apps schedule the
+  composer's message (text and emotes, and the commands that make one), while the sticker
+  picker, the location dialog and the poll form send at once. Scheduled messages go
+  with a reply (mentioning whom it answers) or into a thread (relations written as the SDK
+  would); uploads can't (they go when sent), nor commands that do something rather than send
+  (`/topic` waits, with a notice). The composer empties as sending does and, if the server
+  refuses, what it held comes back with its reply (`Purpose::Scheduling`), at once if the composer
+  is still empty, else as soon as it is free again (`State::refused`), as a refused edit does. Only a server whose
+  `/versions` names `org.matrix.msc4140` is asked (one that doesn't is refused with a notice: it
+  would ignore a delay on `/send` and post at once). Messages go only through MSC4140's own
+  endpoint, in the proposal's current shape (`/delayed_event/…` with `delay_ms`; ruma 0.17 has an
+  older shape, so `scheduled::api` defines these requests): Synapse first took a delay on
+  `/send`, but a server ignoring it posts at once and nothing tells the two apart beforehand, so
+  a server with only that is refused with a notice. Sending now and cancelling put the action in
+  the path, else in the body as Synapse first had it; lists are read in either shape (`delay_ms`/`delayed_since_ts`/`finalised`, or
+  `delay`/`running_since`/`finalised_ts`). In an encrypted room
+  the message is encrypted before the server holds it: the SDK encrypts only what it sends
+  itself, so each account's client is built on a base client of the engine's own
+  (`account::Crypto`, through the builder's `base_client`, the same SQLite stores and defaults
+  the builder would make) whose `OlmMachine` the engine drives as the SDK's send path does:
+  members synced, unknown or outdated devices queried, sessions claimed, the room key shared
+  (`BaseClient::share_room_key`), then `encrypt_room_event_raw`, under the store's cross-process
+  lock and one at a time per account; a failed share discards the room key, as the SDK does. A bar above the room's composer counts the room's scheduled messages and lists them with
+  send now and cancel (`Command::UpdateScheduled`); each account's list is asked for once a run,
+  as the list opens and when one of its messages comes due, then every 30 s while the server
+  still lists it (sent ones aren't listed), and comes back after every change. Each account's
+  lists are read and reported one at a time (`Account::listing_scheduled`), so an older answer
+  never covers a newer. A server that holds delayed events but can't list them (the bulk list is
+  optional) shows the messages this account scheduled there, still to come, kept in its store
+  across restarts, so they can still be sent now or cancelled. One this device can't decrypt shows as "Encrypted message".
+  A message can still fail when its time comes (its sender lost the right to post, the room
+  went): the server finalises it with an error and lists it no more. So this device keeps what
+  it scheduled past its time until the server says what became of it (from the list, else
+  `GET …/delayed_events/{delay_id}`, the one read MSC4140 keeps since the bulk list moved to
+  MSC4486): a sent one is let go; one the server no longer knows (Synapse forgets them once it
+  sends, or fails to) is looked for in the room: from its time on (the event the server finds
+  at that time, then forward), else back from now, an event from this account between a minute
+  before and two after its time that the server made of it (`unsigned`'s
+  `org.matrix.msc4140.delay_id`, Synapse 1.150 on) or that says the same: there, it went;
+  absent once two minutes have passed, it counts as failed (`NOT_POSTED`, a code the apps put
+  in words; an event naming another delay never stands for it, and a few events past the
+  window, their clocks being their servers', don't end the search). One sent early from another
+  device ("send now" there) or delivered long after its time falls outside the window and reads
+  as failed: rare, and the message is in the room to see; a failed one stays
+  (`ScheduledMessage::failed`, its error), with a notice once, shown first in the bar and in the
+  list with why, until dismissed (cancelling it asks nothing of the server). Unanswered ones go
+  after eight days (servers keep finalised ones for about a week), failed ones after 30.
+  Failures of messages scheduled from another device aren't followed: nothing on this device
+  could dismiss them. When the server can't list them at all for now, the messages this device
+  scheduled stand in (`Account::scheduled_or_known`), so one just scheduled never drops out of
+  sight.
 - **Composer layout:**
   - Room and thread editors grow up to eight lines, then scroll inside their own viewport,
     keeping the caret visible while typing or pasting. Vertical padding and the bottom bar stay outside
@@ -68,7 +221,11 @@ screenshots, voice memos, and images, PDFs, videos and recordings that open larg
   answer only for the read that asked (`DraftLoaded.request`, and a token per follow, so a read
   answered after sign-out is dropped), and put it under an edit started meanwhile as the draft
   it sets aside. Phones keep their own composer source (markers
-  and all) as the body, so it comes back exactly; the desktop keeps text and HTML.
+  and all) as the body, so it comes back exactly, and, when it holds pills, the same source as
+  the HTML with each pill as the desktop's field writes one (`<span data-pill="id">label</span>`,
+  the rest escaped text), so mentions, `@room`, custom emoji and spoilers come back as the pills
+  they were; phones read that HTML as their source only when it spells the body exactly, else
+  as a message's. The desktop keeps text and HTML.
 - **Uploads:** `Outgoing::File` carries an `Upload`, a path on disk or bytes with a name.
   - Pastes reach the field through `on_input_paste`. A pasted image joins the draft as
     `image.png`, `image-2.png` and so on; pasted files are attached; text pastes as text.
@@ -318,8 +475,29 @@ screenshots, voice memos, and images, PDFs, videos and recordings that open larg
 
 ## Consequences
 
-- What you type is what others see, through one model. Tags outside Rune's subset (tables,
-  colours, spoilers) render as plain text.
+- What you type is what others see, through one model. Tags outside Rune's subset and the pills
+  (tables, colours) render as plain text.
+- Formulas read as Unicode, not typeset: fractions and roots stay on one line.
+- Scheduled messages depend on the server enabling MSC4140 (Synapse's
+  `max_event_delay_duration`, which also caps how far ahead); a server without it refuses with a
+  notice. Their encryption follows the SDK's send path by hand: an SDK upgrade must be checked
+  against `Room::preshare_room_key` and `ensure_room_encryption_ready`. The SDK's own locks
+  around claiming sessions and sharing a room's key are private, so a scheduled message and a
+  message sent at the same moment can claim sessions side by side (the crypto store's
+  cross-process lock still keeps their writes apart). A message scheduled in
+  an encrypted room may go out with a room key the room rotated since; members who were given
+  that key still decrypt it, a member who joined in between can't.
+- A scheduled message in an encrypted room is encrypted, and its room key shared, when it is
+  scheduled: whoever is a member then can read it once it is sent, even after leaving the room
+  meanwhile (where history visibility lets them see it). Encrypting at the moment of sending
+  would need the user's device then, which is what scheduling on the server avoids.
+- Refused scheduled drafts that wait for a busy composer live for the run, as refused edits do;
+  quitting before the composer is free again drops them. The message itself was never sent.
+- Every map and place search contacts OpenStreetMap's servers from the device (not the
+  homeserver): the app's name, the place, and the device's address. Maps can be turned off;
+  searches go only when the user asks.
+- On the desktop, `@room` in a draft kept across a restart comes back as text: drafts keep
+  Matrix HTML, where it is plain words (phones keep it as a pill).
 - Only what the user looks at is downloaded, and a server hiccup heals without a restart.
 - Two media with the same bytes share one decode in Rune but count twice here; an animation
   whose frame count can't be read counts as one frame.

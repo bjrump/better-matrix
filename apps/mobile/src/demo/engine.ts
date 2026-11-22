@@ -1,7 +1,8 @@
 // The demo engine: an engine with nothing behind it that answers like a homeserver would, from
 // the fixtures. Every command finishes (so no screen waits forever); lists come back with the
 // demo's members, threads, files and sessions; messages sent appear in their timeline; media the
-// demo names is served from the app's own assets.
+// demo names is served from the app's own assets. Image packs, places, edit histories, where a
+// message is and scheduled messages are answered from the fixtures too.
 
 import { Engine, type EngineEvent } from '@better-matrix/matrix-native/client';
 import type {
@@ -17,12 +18,14 @@ import type {
   RoomList,
   RequestId,
   RoomPreview,
+  ScheduledMessage,
   Safety,
   RoomSettings,
   RoomSummary,
 } from '@better-matrix/matrix-native/types';
 
 import { withPending } from '../state/admin';
+import { mapOf } from '../state/geo';
 import { messageText } from '../state/messages';
 import { DEFAULT_SAFETY, withChange } from '../state/safety';
 import { roleLevel } from '../state/people';
@@ -44,8 +47,12 @@ import {
   seedEvents,
   GENERAL,
   DEMO_THREAD,
+  demoPacks,
+  demoPlaces,
   GRACE,
   KAI,
+  SIGN_OFF,
+  signOffVersions,
   verificationEmojis,
   LAB_V2,
 } from './fixtures';
@@ -262,6 +269,7 @@ export function answer(
         reactions: [],
         reply_to: null,
         thread: null,
+        highlighted: false,
       };
 
       return [
@@ -312,6 +320,47 @@ export function answer(
       return [];
     case 'SetStatus':
       return [{ type: 'Status', data: command.data }];
+    case 'ListImagePacks':
+      return [
+        {
+          type: 'ImagePacks',
+          data: {
+            account: command.data.account,
+            room_id: command.data.room_id,
+            packs: demoPacks(),
+          },
+        },
+      ];
+    case 'SearchPlaces':
+      return [{ type: 'PlacesFound', data: { request, places: demoPlaces(command.data.query) } }];
+    case 'ListEdits': {
+      const { account, room_id: roomId, event_id: eventId } = command.data;
+
+      return [
+        {
+          type: 'EditHistory',
+          data: {
+            account,
+            room_id: roomId,
+            event_id: eventId,
+            versions: eventId === SIGN_OFF ? signOffVersions() : [],
+          },
+        },
+      ];
+    }
+
+    case 'LocateMessage': {
+      const { account, room_id: roomId, event_id: eventId } = command.data;
+      const thread = demoMessage(account, roomId, eventId)?.thread ?? null;
+
+      return [
+        {
+          type: 'MessageLocated',
+          data: { request, account, key: { room_id: roomId, thread }, event_id: eventId },
+        },
+      ];
+    }
+
     // As the engine: the flow's ID answers the request, before any of its steps.
     case 'VerifyThisSession':
     case 'VerifyUser': {
@@ -515,7 +564,25 @@ function demoPreview(room: string): RoomPreview {
 function sentContent(message: Outgoing): MessageContent | null {
   switch (message.type) {
     case 'Text':
-      return { type: 'Text', data: message.data };
+      return { type: 'Text', data: { body: message.data.body, html: message.data.html } };
+    case 'Emote':
+      return { type: 'Emote', data: { body: message.data.body, html: message.data.html } };
+    case 'Location':
+      return { type: 'Location', data: { ...message.data, map: mapOf(message.data.geo_uri) } };
+    case 'Sticker':
+      // A sticker shows as an image, as the engine reads one.
+      return {
+        type: 'Attachment',
+        data: {
+          kind: 'Image',
+          name: message.data.body,
+          size: null,
+          media: message.data.media,
+          thumbnail: null,
+          dimensions: message.data.dimensions,
+          audio: null,
+        },
+      };
     case 'Poll':
       return {
         type: 'Poll',
@@ -598,6 +665,8 @@ export function demoEngine(resolveMedia: MediaResolver): Engine {
   const waiting = new Set<RequestId>();
   /** Drafts kept as the engine's store keeps them, for the run of the demo. */
   const drafts = new Map<string, Draft>();
+  /** What the server holds to send later, by account (a scene's own list included). */
+  const scheduled = new Map<string, ScheduledMessage[]>();
   /** Each account's safety choices, as its account data holds them. */
   const safeties = new Map<string, Safety>();
   /** Rooms' settings and member lists as changes left them, by account and room. */
@@ -606,8 +675,16 @@ export function demoEngine(resolveMedia: MediaResolver): Engine {
   engine.subscribe((event) => {
     if (event.type === 'RoomsUpdated') lists.set(event.data.account, event.data.list);
 
+    if (event.type === 'ScheduledMessages') scheduled.set(event.data.account, event.data.messages);
+
     if (event.type === 'Safety') safeties.set(event.data.account, event.data.safety);
   });
+
+  const tellScheduled = (account: string) =>
+    engine.emit({
+      type: 'ScheduledMessages',
+      data: { account, messages: scheduled.get(account) ?? [] },
+    });
 
   const roomKeyOf = (account: string, roomId: string) => `${account}|${roomId}`;
 
@@ -1162,6 +1239,73 @@ export function demoEngine(resolveMedia: MediaResolver): Engine {
           data: { request, media: command.data.media, size: command.data.size, path },
         });
       finish(request, path ? undefined : 'not in the demo');
+
+      return;
+    }
+
+    if (command.type === 'Schedule') {
+      const { account, key, message, delay_ms: delay } = command.data;
+      const body = message.type === 'Text' || message.type === 'Emote' ? message.data.body : null;
+
+      const held: ScheduledMessage = {
+        delay_id: `demo-delay-${request}`,
+        room_id: key.room_id,
+        send_at_ms: Date.now() + delay,
+        body,
+        failed: null,
+      };
+
+      scheduled.set(
+        account,
+        [...(scheduled.get(account) ?? []), held].sort((a, b) => a.send_at_ms - b.send_at_ms),
+      );
+      tellScheduled(account);
+      finish(request);
+
+      return;
+    }
+
+    if (command.type === 'ListScheduled') {
+      tellScheduled(command.data.account);
+      finish(request);
+
+      return;
+    }
+
+    if (command.type === 'UpdateScheduled') {
+      const { account, delay_id: delayId, action } = command.data;
+      const held = (scheduled.get(account) ?? []).find((m) => m.delay_id === delayId);
+      scheduled.set(
+        account,
+        (scheduled.get(account) ?? []).filter((m) => m.delay_id !== delayId),
+      );
+
+      if (held && action === 'SendNow') {
+        for (const event of answer(
+          {
+            type: 'Send',
+            data: {
+              account,
+              key: { room_id: held.room_id, thread: null },
+              reply_to: null,
+              message: {
+                type: 'Text',
+                data: {
+                  body: held.body ?? '',
+                  html: null,
+                  mentions: { user_ids: [], room: false },
+                },
+              },
+            },
+          },
+          request,
+          Date.now(),
+        ))
+          engine.emit(event);
+      }
+
+      tellScheduled(account);
+      finish(request);
 
       return;
     }

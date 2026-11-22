@@ -18,6 +18,7 @@ import type {
 } from '@better-matrix/matrix-native/types';
 
 import { galleryAround, thumbnailOf } from './gallery';
+import { findMessage, mxcMedia } from './messages';
 import { EMPTY_TIMELINE, mediaKey } from './reducer';
 import { hiddenEntry, revealKey, showsMedia, shownInvitations } from './safety';
 import { newestMessages, type NewestMessages } from './sections';
@@ -166,6 +167,17 @@ export function timeline(state: State, id: AccountId, key: TimelineKey): Timelin
   return account(state, id)?.timelines[timelineId(key)] ?? EMPTY_TIMELINE;
 }
 
+/** Who sent the message with this event ID, from whichever of the account's timelines holds it. */
+export function messageSender(state: State, id: AccountId, eventId: string): string | undefined {
+  for (const kept of Object.values(account(state, id)?.timelines ?? {})) {
+    const sender = findMessage(kept.entries, eventId)?.sender_id;
+
+    if (sender !== undefined) return sender;
+  }
+
+  return undefined;
+}
+
 export function room(state: State, id: AccountId, roomId: string) {
   return account(state, id)?.rooms.find((r) => r.room_id === roomId);
 }
@@ -283,6 +295,21 @@ export function mediaHidden(
 }
 
 /**
+ * The picture to fetch for an inline image in a message's text (a custom emoji, `<img>`): none
+ * while the message's media is held back (`mediaHidden`), so it shows as its short code and
+ * nothing is requested until the user shows the message's media.
+ */
+export function inlinePicture(
+  state: State,
+  id: AccountId,
+  roomId: string,
+  message: { sender_id: string; event_id: string },
+  url: string,
+): MediaRef | null {
+  return mediaHidden(state, id, roomId, message) ? null : mxcMedia(url);
+}
+
+/**
  * Whether the attachment preview keeps a message's media back: `mediaHidden`, for pictures and
  * videos only. Audio and other files never wait for Show (ADR 0011).
  */
@@ -320,6 +347,7 @@ function listedMessage(file: SharedFile): Message {
       edited: false,
       editable: false,
       pending: false,
+      highlighted: false,
       timestamp_ms: file.timestamp,
       reactions: [],
       reply_to: null,

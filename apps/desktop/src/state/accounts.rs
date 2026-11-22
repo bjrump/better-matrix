@@ -60,6 +60,8 @@ pub struct TimelineItem {
     pub gif: Option<GifLink>,
     /// The first other link in the text, which gets a preview card.
     pub link: Option<String>,
+    /// The custom emoji its text shows, to fetch while it is on screen.
+    pub emotes: Vec<matrix_core::MediaRef>,
 }
 
 /// One entry of a room's timeline, ready to render.
@@ -134,6 +136,22 @@ impl Entry {
             _ => (None, None),
         };
         first.into_iter().chain(second)
+    }
+
+    /// The custom emoji its text shows.
+    pub fn emotes(&self) -> &[matrix_core::MediaRef] {
+        match &self.kind {
+            EntryView::Message(item) => &item.emotes,
+            _ => &[],
+        }
+    }
+
+    /// The map of the place it shares, if it shares one.
+    pub fn location_map(&self) -> Option<&matrix_core::MediaRef> {
+        match &self.message()?.content {
+            MessageContent::Location(location) => location.map.as_ref(),
+            _ => None,
+        }
     }
 
     /// The image attachment it shows a preview of, if any.
@@ -571,13 +589,18 @@ impl TimelineItem {
     }
 
     fn new(message: Message) -> Self {
+        // A hidden spoiler's fallback may name its link: nothing is fetched for it.
         let link = match &message.content {
-            MessageContent::Text { body, .. } => matrix_core::links::find_preview_link(body).map(str::to_owned),
+            MessageContent::Text { body, html } if !html.as_deref().is_some_and(matrix_core::html::holds_spoiler) => {
+                matrix_core::links::find_preview_link(body).map(str::to_owned)
+            }
             _ => None,
         };
         let (rich, gif) = match &message.content {
+            MessageContent::Emote { body, html } => (rich_body(body, html.as_deref()), None),
             MessageContent::Text { body, html } => {
-                let gif = matrix_core::links::find_gif_link(body).map(|url| {
+                let hides = html.as_deref().is_some_and(matrix_core::html::holds_spoiler);
+                let gif = matrix_core::links::find_gif_link(body).filter(|_| !hides).map(|url| {
                     let plain = matrix_core::links::without_link(body, url);
                     let html = html.as_deref().map(|html| matrix_core::links::html_without_link(html, url));
                     let rest = (!plain.is_empty()).then(|| Body { rich: rich_body(&plain, html.as_deref()), plain });
@@ -587,7 +610,13 @@ impl TimelineItem {
             }
             _ => (None, None),
         };
-        Self { message, rich, gif, link }
+        let emotes = rich
+            .iter()
+            .chain(gif.as_ref().and_then(|gif| gif.rest.as_ref()).and_then(|rest| rest.rich.as_ref()))
+            .flat_map(|edit| edit.pills())
+            .filter_map(|(_, id)| id.strip_prefix("emote:").and_then(matrix_core::MediaRef::from_mxc))
+            .collect();
+        Self { message, rich, gif, link, emotes }
     }
 }
 
@@ -597,7 +626,8 @@ impl TimelineItem {
 fn rich_body(plain: &str, html: Option<&str>) -> Option<TextEdit> {
     use rune::{Mark, MarkRange};
     let mut edit = match html {
-        Some(html) => TextEdit::from_html(html),
+        // Mentions, spoilers, maths and custom emoji become pills the view draws.
+        Some(html) => TextEdit::from_html(&matrix_core::html::to_pills(html, matrix_core::html::Pills::Display)),
         None if matrix_core::links::link_ranges(plain).next().is_some() => {
             TextEdit::from_parts(plain, Vec::new(), Vec::new())
         }
@@ -605,7 +635,9 @@ fn rich_body(plain: &str, html: Option<&str>) -> Option<TextEdit> {
     };
     let taken = |range: &std::ops::Range<usize>| {
         edit.marks().iter().any(|mark| {
-            matches!(mark.mark, Mark::Link(_) | Mark::Code) && mark.start < range.end && range.start < mark.end
+            matches!(mark.mark, Mark::Link(_) | Mark::Code | Mark::Pill(_))
+                && mark.start < range.end
+                && range.start < mark.end
         })
     };
     let links: Vec<MarkRange> = matrix_core::links::link_ranges(&edit.text)
@@ -1813,6 +1845,30 @@ mod tests {
     fn a_web_address_in_plain_text_should_show_as_a_link() {
         let edit = rich_body("see https://matrix.org/blog.", None).unwrap_or_default();
         assert_eq!(links(&edit), [("https://matrix.org/blog", "https://matrix.org/blog".to_owned())]);
+    }
+
+    fn text(body: &str, html: &str) -> TimelineItem {
+        let content = MessageContent::Text { body: body.into(), html: Some(html.into()) };
+        TimelineItem::new(Message { content, ..Message::default() })
+    }
+
+    #[test]
+    fn a_link_beside_a_hidden_spoiler_should_get_no_preview() {
+        let item = text("https://secret.example", "<span data-mx-spoiler>a secret</span>");
+        assert_eq!(item.card_link(false), None);
+    }
+
+    #[test]
+    fn a_gif_beside_a_hidden_spoiler_should_not_play() {
+        let item = text("https://giphy.com/gifs/x-abc", "<span data-mx-spoiler>a gif</span>");
+        assert!(matrix_core::links::find_gif_link("https://giphy.com/gifs/x-abc").is_some());
+        assert!(item.gif.is_none());
+    }
+
+    #[test]
+    fn a_link_in_text_without_a_spoiler_should_get_a_preview() {
+        let item = text("https://matrix.org", "<b>https://matrix.org</b>");
+        assert_eq!(item.card_link(false), Some("https://matrix.org"));
     }
 
     #[test]

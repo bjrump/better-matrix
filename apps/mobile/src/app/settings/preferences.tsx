@@ -1,5 +1,6 @@
-// Preferences on this device: language, theme, how messages lay out, link previews and GIFs from
-// links, and hidden events (developer tools), as the desktop's General and Appearance settings.
+// Preferences on this device: language, theme, how messages lay out, link previews, GIFs from
+// links and maps from OpenStreetMap, and hidden events (developer tools), as the desktop's General
+// and Appearance settings.
 
 import { Fragment } from 'react';
 
@@ -86,6 +87,22 @@ export default function PreferencesScreen() {
           toggle={{
             value: settings.showLinkGifs,
             onChange: (on) => updateSettings(store, { showLinkGifs: on }),
+          }}
+        />
+      </ListSection>
+      <ListSection
+        title={t('mobile.accounts.maps')}
+        footer={
+          settings.showMaps ? t('mobile.accounts.maps_on_hint') : t('mobile.accounts.maps_hint')
+        }
+      >
+        <ListRow
+          testID="maps"
+          icon="location"
+          title={t('mobile.accounts.maps_on')}
+          toggle={{
+            value: settings.showMaps,
+            onChange: (on) => updateSettings(store, { showMaps: on }),
           }}
         />
       </ListSection>

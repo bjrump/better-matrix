@@ -247,7 +247,8 @@ impl Account {
             }
         };
         let (store, passphrase) = (NewStore::new(layout)?, crate::session::new_passphrase()?);
-        let client = crate::account::build_client(&homeserver, &store.path(), &passphrase, sessions, holder).await?;
+        let (client, crypto) =
+            crate::account::build_client(&homeserver, &store.path(), &passphrase, sessions, holder).await?;
         let mut metadata = ClientMetadata::new(
             ApplicationType::Native,
             vec![OAuthGrantType::DeviceCode],
@@ -279,7 +280,7 @@ impl Account {
             let _ = client.logout().await;
             return Err(Error::AlreadySignedIn(user));
         }
-        let account = store.signed_in(client, sessions, holder, passphrase).await?;
+        let account = store.signed_in(client, crypto, sessions, holder, passphrase).await?;
         // Only now: an app that leaves the flow on `Done` can't cancel the saving.
         report(QrLoginStep::Done { account: Some(account.id().clone()) });
         Ok(account)

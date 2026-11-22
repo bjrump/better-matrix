@@ -15,9 +15,11 @@ import type {
   TimelineKey,
 } from '@better-matrix/matrix-native/types';
 
+import { t } from '../i18n';
 import { initialCallView, reconcileView } from './callView';
-import { DEFAULT_SAFETY, hiddenEntry, withChange } from './safety';
 import { keepUnchanged } from './json';
+import { DEFAULT_SAFETY, hiddenEntry, withChange } from './safety';
+import { failureReason, newlyFailed } from './schedule';
 import { DEFAULT_SETTINGS, type Settings } from './settings';
 import { applyDiffs, timelineId } from './timeline';
 import type { AccountData, PendingSafety, State, Timeline, Verification } from './types';
@@ -27,6 +29,11 @@ export function mediaKey(media: MediaRef, size: MediaSize): string {
   return size.type === 'Original'
     ? `${media}|original`
     : `${media}|${size.data.width}x${size.data.height}`;
+}
+
+/** An edited message's key in `AccountData.edits`. */
+export function editsKey(roomId: string, eventId: string): string {
+  return `${roomId}|${eventId}`;
 }
 
 /** A link card's key in `State.linkPreviews`: previews are fetched per account. */
@@ -96,6 +103,9 @@ function newAccount(summary: AccountSummary): AccountData {
     widgets: {},
     pins: {},
     saved: null,
+    packs: {},
+    scheduled: null,
+    edits: {},
     sidebar: EMPTY_LAYOUT,
     searchUsage: { rooms: {}, people: {} },
     sidebarLoaded: false,
@@ -744,6 +754,37 @@ export function apply(state: State, event: EngineEvent, now: number = Date.now()
         ...a,
         searchUsage: event.data.usage,
       }));
+    case 'ImagePacks':
+      return updateAccount(state, event.data.account, (a) => ({
+        ...a,
+        packs: { ...a.packs, [event.data.room_id ?? '']: event.data.packs },
+      }));
+    case 'ScheduledMessages': {
+      const before = state.accounts.find((a) => a.summary.id === event.data.account)?.scheduled;
+      const failed = newlyFailed(before, event.data.messages);
+
+      const next = updateAccount(state, event.data.account, (a) => ({
+        ...a,
+        scheduled: event.data.messages,
+      }));
+
+      return failed === null
+        ? next
+        : addNotice(
+            next,
+            t('mobile.composer.scheduled_lost', { error: failureReason(failed) }),
+            event.data.account,
+          );
+    }
+
+    case 'EditHistory':
+      return updateAccount(state, event.data.account, (a) => ({
+        ...a,
+        edits: {
+          ...a.edits,
+          [editsKey(event.data.room_id, event.data.event_id)]: event.data.versions,
+        },
+      }));
     // Answers to one request: the store hands them to whoever sent it (requests.ts).
     case 'Finished':
     case 'HomeserverDiscovered':
@@ -751,6 +792,8 @@ export function apply(state: State, event: EngineEvent, now: number = Date.now()
     case 'ContactCodeSent':
     case 'MessagesFound':
     case 'PeopleFound':
+    case 'PlacesFound':
+    case 'MessageLocated':
     case 'EventSource':
     // Answers the composer's own read (`state/actions/drafts.ts`).
     case 'DraftLoaded':

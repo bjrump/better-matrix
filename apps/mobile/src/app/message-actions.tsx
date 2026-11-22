@@ -13,7 +13,7 @@ import { deleteMessage, react } from '../state/actions/timeline';
 import { startEdit, startReply } from '../state/composer';
 import {
   attachmentRows,
-  editText,
+  editDraftOf,
   findMessage,
   messageActions,
   messageText,
@@ -200,7 +200,8 @@ export default function MessageActionsScreen() {
             chevron={false}
             testID="message-actions-edit"
             onPress={() => {
-              startEdit(store, account, key, message, editText(message));
+              const { draft, pills } = editDraftOf(message);
+              startEdit(store, account, key, message, draft, pills);
               close();
             }}
           />

@@ -11,6 +11,7 @@ import type { LoginRequest } from "./LoginRequest";
 import type { MediaRef } from "./MediaRef";
 import type { MediaSize } from "./MediaSize";
 import type { MediaToggle } from "./MediaToggle";
+import type { Mentions } from "./Mentions";
 import type { Moderation } from "./Moderation";
 import type { NewRoom } from "./NewRoom";
 import type { NotificationMode } from "./NotificationMode";
@@ -25,6 +26,7 @@ import type { RequestId } from "./RequestId";
 import type { RoomPriority } from "./RoomPriority";
 import type { RoomSetting } from "./RoomSetting";
 import type { SafetyChange } from "./SafetyChange";
+import type { ScheduledAction } from "./ScheduledAction";
 import type { SidebarLayout } from "./SidebarLayout";
 import type { SpaceChange } from "./SpaceChange";
 import type { Status } from "./Status";
@@ -131,7 +133,87 @@ body: string,
 /**
  * Its formatting as Matrix HTML, if any.
  */
-html: string | null, } } | { "type": "Redact", "data": { 
+html: string | null, 
+/**
+ * Who the new text mentions on purpose.
+ */
+mentions: Mentions, } } | { "type": "ListEdits", "data": { 
+/**
+ * Whose room.
+ */
+account: AccountId, 
+/**
+ * The room.
+ */
+room_id: string, 
+/**
+ * The message's event ID.
+ */
+event_id: string, } } | { "type": "LocateMessage", "data": { 
+/**
+ * Whose room.
+ */
+account: AccountId, 
+/**
+ * The room.
+ */
+room_id: string, 
+/**
+ * The message's event ID.
+ */
+event_id: string, } } | { "type": "Schedule", "data": { 
+/**
+ * The sending account.
+ */
+account: AccountId, 
+/**
+ * Where it goes.
+ */
+key: TimelineKey, 
+/**
+ * The event ID of the message it answers, for a reply.
+ */
+reply_to: string | null, 
+/**
+ * What to send.
+ */
+message: Outgoing, 
+/**
+ * How long to wait, in milliseconds (at most 30 days; a server may allow less).
+ */
+delay_ms: number, } } | { "type": "ListScheduled", "data": { 
+/**
+ * Whose.
+ */
+account: AccountId, } } | { "type": "UpdateScheduled", "data": { 
+/**
+ * Whose.
+ */
+account: AccountId, 
+/**
+ * Which ([`ScheduledMessage::delay_id`](crate::ScheduledMessage::delay_id)).
+ */
+delay_id: string, 
+/**
+ * What to do.
+ */
+action: ScheduledAction, } } | { "type": "ListImagePacks", "data": { 
+/**
+ * Whose.
+ */
+account: AccountId, 
+/**
+ * The room the packs are for, adding its own packs to the user's.
+ */
+room_id: string | null, } } | { "type": "SearchPlaces", "data": { 
+/**
+ * What to look for.
+ */
+query: string, 
+/**
+ * The app's language (a BCP 47 tag), for the places' names.
+ */
+language: string | null, } } | { "type": "Redact", "data": { 
 /**
  * The account that sent it.
  */

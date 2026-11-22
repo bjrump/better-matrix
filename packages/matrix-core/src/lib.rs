@@ -17,6 +17,9 @@ pub mod admin;
 pub mod calls;
 pub mod discovery;
 pub mod engine;
+pub mod geo;
+pub mod html;
+pub mod math;
 pub mod model;
 pub mod people;
 pub mod permalinks;
@@ -36,10 +39,14 @@ pub mod store;
 
 mod convert;
 mod drafts;
+mod edits;
 mod history;
 mod offline_device;
+mod outgoing;
+mod packs;
 mod polls;
 mod saved;
+mod scheduled;
 mod session;
 mod source;
 #[cfg(test)]
@@ -64,11 +71,12 @@ pub use engine::{
     StoreSharing,
 };
 pub use model::{
-    AccountId, AccountSummary, Attachment, AttachmentKind, AudioDetails, CallCard, EntryKind, HiddenEvent,
-    HistoryVisibility, Invitation, LoginMethods, MediaRef, MediaSize, Message, MessageContent, Notification,
-    NotificationMode, Outgoing, Password, Person, Poll, PollAnswer, PublicRoom, PushContent, PushTarget, Pusher, Quote,
-    Reaction, ReadReceipt, RoomChange, RoomEvent, RoomKind, RoomList, RoomPriority, RoomSummary, SignInMethod,
-    SpaceSummary, Successor, ThreadSummary, TimelineDiff, TimelineEntry, TimelineKey, Upload,
+    AccountId, AccountSummary, Attachment, AttachmentKind, AudioDetails, CallCard, EditVersion, EntryKind, HiddenEvent,
+    HistoryVisibility, ImagePack, Invitation, Location, LoginMethods, MediaRef, MediaSize, Mentions, Message,
+    MessageContent, Notification, NotificationMode, Outgoing, PackImage, Password, Person, Place, Poll, PollAnswer,
+    PublicRoom, PushContent, PushTarget, Pusher, Quote, Reaction, ReadReceipt, RoomChange, RoomEvent, RoomKind,
+    RoomList, RoomPriority, RoomSummary, ScheduledAction, ScheduledMessage, SignInMethod, SpaceSummary, Successor,
+    ThreadSummary, TimelineDiff, TimelineEntry, TimelineKey, Upload,
 };
 
 /// How many messages a timeline page holds: what a room shows when it opens, and what each
@@ -85,6 +93,7 @@ pub use registration::{Policy, RegisterRequest, RegistrationStep};
 pub use rooms::{DirectoryKind, JoinRule, RoomPreview};
 pub use safety::{ReportTarget, Safety, SafetyChange, ShowMedia};
 pub use saved::SavedMessage;
+pub use scheduled::NOT_POSTED;
 pub use search::{MessageHit, SearchUsage};
 pub use secrets::{FileSecrets, MemorySecrets, SecretError, SecretStore};
 pub use security::{Identity, KeyImport, OfflineDevice, RecoveryStatus, SasEmoji, Security, Session, VerificationStep};
@@ -112,6 +121,9 @@ pub enum Error {
     /// A Matrix identifier did not parse.
     #[error("invalid Matrix identifier: {0}")]
     Id(#[from] matrix_sdk::IdParseError),
+    /// The homeserver doesn't offer what was asked of it.
+    #[error("your homeserver doesn't support {0}")]
+    Unsupported(&'static str),
     /// A widget's address isn't a web page (`http` or `https`).
     #[error("a widget needs a web address")]
     InvalidWidgetUrl,

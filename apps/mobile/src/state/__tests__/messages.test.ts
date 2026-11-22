@@ -8,6 +8,7 @@ import {
   cardLink,
   messageActions,
   forwardSections,
+  marksMention,
   messageText,
   nextVote,
   playTime,
@@ -18,6 +19,7 @@ import {
   previewSize,
   editText,
 } from '../messages';
+import { translationUrl } from '../actions/message-actions';
 import { ADA, GRACE, message, roomSummary, withContent } from '../../test/fixtures';
 
 const text = (body: string, html: string | null = null) =>
@@ -58,6 +60,39 @@ describe('prepare', () => {
     expect(prepare(text('https://media.tenor.com/x/kiwi.gif')).gif?.rest).toBeNull();
   });
 
+  it('should card no link of a message holding a spoiler', () => {
+    const spoiled = text(
+      'the end: https://example.org/ending',
+      'the end: <span data-mx-spoiler>https://example.org/ending</span>',
+    );
+
+    expect(prepare(spoiled).link).toBeNull();
+  });
+
+  it('should play no GIF of a message holding a spoiler', () => {
+    const spoiled = text(
+      'https://media.tenor.com/x/kiwi.gif',
+      '<span data-mx-spoiler="gross">a kiwi</span>',
+    );
+
+    expect(prepare(spoiled).gif).toBeNull();
+  });
+
+  it('should still card a link of a message whose formatting holds no spoiler', () => {
+    const plain = text('see https://matrix.org/blog', 'see <em>https://matrix.org/blog</em>');
+
+    expect(prepare(plain).link).toBe('https://matrix.org/blog');
+  });
+
+  it('should not take words about spoilers for a spoiler', () => {
+    const about = text(
+      'write data-mx-spoiler: https://spec.matrix.org',
+      'write <code>data-mx-spoiler</code>: https://spec.matrix.org',
+    );
+
+    expect(prepare(about).link).toBe('https://spec.matrix.org');
+  });
+
   it('should card a GIF link while GIFs do not play', () => {
     expect(cardLink(prepare(text('https://media.tenor.com/x/kiwi.gif')), false)).toBe(
       'https://media.tenor.com/x/kiwi.gif',
@@ -72,6 +107,35 @@ describe('prepare', () => {
 describe('messageText', () => {
   it('should copy formatted text as it reads', () => {
     expect(messageText(text('**hi**', '<b>hi</b>'))).toBe('hi');
+  });
+
+  it('should copy a spoiler as [Spoiler], never its words', () => {
+    expect(
+      messageText(text('the end: [Spoiler]', 'the end: <span data-mx-spoiler>he dies</span>')),
+    ).toBe('the end: [Spoiler]');
+  });
+
+  it('should copy a spoiler as [Spoiler] when the plain body holds its words', () => {
+    expect(
+      messageText(text('the end: he dies', 'the end: <span data-mx-spoiler>he dies</span>')),
+    ).toBe('the end: [Spoiler]');
+  });
+
+  it('should translate a spoiler as [Spoiler], never its words', () => {
+    const spoiled = text('[Spoiler]', '<span data-mx-spoiler>the butler did it</span>');
+    const url = translationUrl(messageText(spoiled) ?? '', 'en');
+
+    expect(url).toContain(encodeURIComponent('[Spoiler]'));
+    expect(url).not.toContain('butler');
+  });
+
+  it('should copy a spoiler in a formatted emote as [Spoiler]', () => {
+    const emote = withContent('$m', {
+      type: 'Emote',
+      data: { body: 'hides [Spoiler]', html: 'hides <span data-mx-spoiler>it</span>' },
+    });
+
+    expect(messageText(emote)).toBe('* Grace hides [Spoiler]');
   });
 
   it('should have nothing to copy of a deleted message', () => {
@@ -396,4 +460,47 @@ it('should hide an empty forwarding section after searching', () => {
   const room = roomSummary('!r:x', 'general');
   const direct = roomSummary('!dm:x', 'Grace', 'Direct');
   expect(forwardSections([room, direct], 'gr')).toEqual([{ kind: 'Direct', data: [direct] }]);
+});
+
+describe('emotes and places', () => {
+  it('should draw an emote as the sender’s name before the action', () => {
+    const emote = withContent('$e', { type: 'Emote', data: { body: 'waves', html: null } });
+    expect(prepare(emote).blocks).toEqual([
+      {
+        type: 'paragraph',
+        inlines: [
+          { type: 'text', text: '* Grace ', marks: { italic: true } },
+          { type: 'text', text: 'waves', marks: {} },
+        ],
+      },
+    ]);
+  });
+
+  it('should copy an emote with its sender', () => {
+    const emote = withContent('$e', { type: 'Emote', data: { body: 'waves', html: null } });
+    expect(messageText(emote)).toBe('* Grace waves');
+  });
+
+  it('should copy a place by its name', () => {
+    const place = withContent('$p', {
+      type: 'Location',
+      data: { geo_uri: 'geo:1,2', description: 'Home', map: null },
+    });
+
+    expect(messageText(place)).toBe('Home');
+  });
+});
+
+describe('marksMention', () => {
+  it('should mark someone else’s message that mentions the user', () => {
+    expect(marksMention({ ...message('$a'), highlighted: true }, ADA)).toBe(true);
+  });
+
+  it('should not mark the user’s own message, even highlighted', () => {
+    expect(marksMention({ ...message('$a'), sender_id: ADA, highlighted: true }, ADA)).toBe(false);
+  });
+
+  it('should not mark a message that doesn’t mention the user', () => {
+    expect(marksMention(message('$a'), ADA)).toBe(false);
+  });
 });

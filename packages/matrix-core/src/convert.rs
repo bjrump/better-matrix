@@ -274,13 +274,25 @@ pub(crate) async fn notification(
         room_name: display_name(room).await,
         event_id: event.event_id.to_string(),
         sender_name: sender_name(room, &event.sender).await,
-        body: content(&event.content.msgtype).plain().to_owned(),
+        body: content(&event.content.msgtype).plain().into_owned(),
     })
 }
 
 impl MediaRef {
     pub(crate) fn of(source: &MediaSource) -> Option<Self> {
         serde_json::to_string(source).ok().map(Self)
+    }
+
+    /// The handle for unencrypted media at an `mxc://` URI, as messages' HTML names it (a
+    /// custom emoji's image); `None` for anything else.
+    ///
+    /// ```
+    /// assert!(matrix_core::MediaRef::from_mxc("mxc://example.org/cat").is_some());
+    /// assert!(matrix_core::MediaRef::from_mxc("https://example.org/cat.png").is_none());
+    /// ```
+    pub fn from_mxc(url: &str) -> Option<Self> {
+        let url = matrix_sdk::ruma::OwnedMxcUri::from(url);
+        url.is_valid().then(|| avatar(url)).flatten()
     }
 }
 
@@ -359,7 +371,25 @@ pub(crate) fn content(msgtype: &MessageType) -> MessageContent {
     let attachment = match msgtype {
         MessageType::Text(c) => return text(&c.body, &c.formatted),
         MessageType::Notice(c) => return text(&c.body, &c.formatted),
-        MessageType::Emote(c) => return text(&format!("* {}", c.body), &None),
+        MessageType::Emote(c) => {
+            return MessageContent::Emote {
+                body: c.body.clone(),
+                html: c.formatted.as_ref().filter(|f| f.format == MessageFormat::Html).map(|f| f.body.clone()),
+            };
+        }
+        MessageType::Location(c) => {
+            let description = c.body.trim();
+            // A body that only repeats the coordinates says nothing more.
+            let description = (!description.is_empty()
+                && !description.starts_with("geo:")
+                && !description.contains(c.geo_uri.trim_start_matches("geo:").split(';').next().unwrap_or_default()))
+            .then(|| description.to_owned());
+            return MessageContent::Location(crate::model::Location {
+                geo_uri: c.geo_uri.clone(),
+                description,
+                map: crate::geo::map(&c.geo_uri),
+            });
+        }
         MessageType::Image(c) => {
             let info = c.info.as_deref();
             Attachment {
@@ -410,6 +440,41 @@ mod tests {
     use matrix_sdk::ruma::{OwnedMxcUri, uint};
 
     use super::*;
+
+    /// A message as the timeline gives it: its HTML sanitised as matrix-sdk-ui does.
+    fn as_the_timeline_reads(content: serde_json::Value) -> MessageContent {
+        use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+        use matrix_sdk::ruma::html::{HtmlSanitizerMode, RemoveReplyFallback};
+        let mut message: RoomMessageEventContent = serde_json::from_value(content).expect("a message");
+        message.msgtype.sanitize(HtmlSanitizerMode::Compat, RemoveReplyFallback::Yes);
+        super::content(&message.msgtype)
+    }
+
+    #[test]
+    fn a_received_custom_emoji_should_reach_the_app_as_a_pill() {
+        let content = as_the_timeline_reads(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "Shipped :party:",
+            "format": "org.matrix.custom.html",
+            "formatted_body": "Shipped <img data-mx-emoticon src=\"mxc://x.org/party\" alt=\":party:\" height=\"32\">"
+        }));
+        let MessageContent::Text { html: Some(html), .. } = content else { panic!("formatted text") };
+        let pills = crate::html::to_pills(&html, crate::html::Pills::Display);
+        assert!(pills.contains("<span data-pill=\"emote:mxc://x.org/party\">:party:</span>"), "{pills}");
+    }
+
+    #[test]
+    fn a_received_spoiler_and_formula_should_reach_the_app_as_pills() {
+        let content = as_the_timeline_reads(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "x",
+            "format": "org.matrix.custom.html",
+            "formatted_body": "<span data-mx-spoiler>hidden</span> <span data-mx-maths=\"x^2\"><code>x^2</code></span>"
+        }));
+        let MessageContent::Text { html: Some(html), .. } = content else { panic!("formatted text") };
+        let pills = crate::html::to_pills(&html, crate::html::Pills::Display);
+        assert!(pills.contains("data-pill=\"spoiler\"") && pills.contains("data-pill=\"math:x^2\""), "{pills}");
+    }
 
     #[test]
     fn invite_knock_and_restricted_join_rules_should_count_as_private() {

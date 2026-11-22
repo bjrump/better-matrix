@@ -140,6 +140,73 @@ pub enum Command {
         body: String,
         /// Its formatting as Matrix HTML, if any.
         html: Option<String>,
+        /// Who the new text mentions on purpose.
+        #[cfg_attr(feature = "ffi", serde(default))]
+        mentions: crate::Mentions,
+    },
+    /// Every version of an edited message, oldest first; answered by [`Event::EditHistory`].
+    ListEdits {
+        /// Whose room.
+        account: AccountId,
+        /// The room.
+        room_id: String,
+        /// The message's event ID.
+        event_id: String,
+    },
+    /// Find which timeline shows a message: the room's, or the thread it is in; answered by
+    /// [`Event::MessageLocated`], for opening a link to it.
+    LocateMessage {
+        /// Whose room.
+        account: AccountId,
+        /// The room.
+        room_id: String,
+        /// The message's event ID.
+        event_id: String,
+    },
+    /// Ask the server to send a message later (MSC4140), encrypted where the room is; an
+    /// updated [`Event::ScheduledMessages`] follows. Uploads can't be scheduled.
+    Schedule {
+        /// The sending account.
+        account: AccountId,
+        /// Where it goes.
+        key: TimelineKey,
+        /// The event ID of the message it answers, for a reply.
+        reply_to: Option<String>,
+        /// What to send.
+        message: Outgoing,
+        /// How long to wait, in milliseconds (at most 30 days; a server may allow less).
+        delay_ms: u64,
+    },
+    /// List the account's scheduled messages; answered by [`Event::ScheduledMessages`].
+    ListScheduled {
+        /// Whose.
+        account: AccountId,
+    },
+    /// Cancel a scheduled message or send it now; an updated [`Event::ScheduledMessages`]
+    /// follows.
+    UpdateScheduled {
+        /// Whose.
+        account: AccountId,
+        /// Which ([`ScheduledMessage::delay_id`](crate::ScheduledMessage::delay_id)).
+        delay_id: String,
+        /// What to do.
+        action: crate::ScheduledAction,
+    },
+    /// The custom emoji and sticker packs usable in a room (or anywhere); answered by
+    /// [`Event::ImagePacks`].
+    ListImagePacks {
+        /// Whose.
+        account: AccountId,
+        /// The room the packs are for, adding its own packs to the user's.
+        room_id: Option<String>,
+    },
+    /// Find places by name on OpenStreetMap, for sharing a location; answered by
+    /// [`Event::PlacesFound`]. Send it when the user asks, never as they type.
+    SearchPlaces {
+        /// What to look for.
+        query: String,
+        /// The app's language (a BCP 47 tag), for the places' names.
+        language: Option<String>,
     },
     /// Delete a message the account sent, for everyone.
     Redact {
@@ -1443,6 +1510,51 @@ pub enum Event {
         /// What to show.
         content: crate::model::PushContent,
     },
+    /// The versions of an edited message, for [`Command::ListEdits`].
+    EditHistory {
+        /// Whose room.
+        account: AccountId,
+        /// The room.
+        room_id: String,
+        /// The message.
+        event_id: String,
+        /// Its versions, the original first.
+        versions: Vec<crate::EditVersion>,
+    },
+    /// Where a message shows, for [`Command::LocateMessage`].
+    MessageLocated {
+        /// The command it answers.
+        request: RequestId,
+        /// Whose room.
+        account: AccountId,
+        /// The room's timeline, or the message's thread.
+        key: TimelineKey,
+        /// The message: the one an edit edits, when asked for an edit.
+        event_id: String,
+    },
+    /// The account's scheduled messages, soonest first.
+    ScheduledMessages {
+        /// Whose.
+        account: AccountId,
+        /// What the server holds.
+        messages: Vec<crate::ScheduledMessage>,
+    },
+    /// Custom emoji and sticker packs, for [`Command::ListImagePacks`].
+    ImagePacks {
+        /// Whose.
+        account: AccountId,
+        /// The room they were listed for.
+        room_id: Option<String>,
+        /// The packs: the user's own first.
+        packs: Vec<crate::ImagePack>,
+    },
+    /// Places found for [`Command::SearchPlaces`].
+    PlacesFound {
+        /// The search it answers.
+        request: RequestId,
+        /// Best first.
+        places: Vec<crate::Place>,
+    },
 }
 
 /// Receives the engine's events. Called from the engine's threads, so it must hand them to the
@@ -2366,14 +2478,91 @@ impl State {
                     Ok(Outcome::Done)
                 })
             }
-            Command::Edit { account, key, event_id, body, html } => {
+            Command::Edit { account, key, event_id, body, html, mentions } => {
                 let timeline = self.open_timeline(&account, &key);
                 Box::pin(async move {
                     let item = matrix_sdk_ui::timeline::TimelineEventItemId::EventId(matrix_sdk::ruma::EventId::parse(
                         &event_id,
                     )?);
-                    let content = text_content(&body, html.as_deref());
+                    let content = crate::outgoing::text(&body, html.as_deref(), &mentions);
                     timeline?.edit(&item, matrix_sdk::room::edit::EditedContent::RoomMessage(content)).await?;
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::ListEdits { account: id, room_id, event_id } => {
+                let account = self.account(&id);
+                Box::pin(async move {
+                    let versions = account?.edit_history(&room_id, &event_id).await?;
+                    sink.emit(Event::EditHistory { account: id, room_id, event_id, versions });
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::LocateMessage { account: id, room_id, event_id } => {
+                let account = self.account(&id);
+                Box::pin(async move {
+                    let (key, event_id) = account?.locate_message(&room_id, &event_id).await?;
+                    sink.emit(Event::MessageLocated { request, account: id, key, event_id });
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::Schedule { account: id, key, reply_to, message, delay_ms } => {
+                let account = self.account(&id);
+                Box::pin(async move {
+                    let account = account?;
+                    let delay = std::time::Duration::from_millis(delay_ms);
+                    account.schedule(&key, reply_to.as_deref(), &message, delay).await?;
+                    // A server that sends nothing back for the list still scheduled it: what this
+                    // device knows goes instead.
+                    let _order = account.listing_scheduled.lock().await;
+                    let (Ok(messages) | Err((_, messages))) = account.scheduled_or_known().await;
+                    sink.emit(Event::ScheduledMessages { account: id, messages });
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::ListScheduled { account: id } => {
+                let account = self.account(&id);
+                Box::pin(async move {
+                    let account = account?;
+                    // In the order asked: an older list never covers a newer.
+                    let _order = account.listing_scheduled.lock().await;
+                    // Unlisted, what this device knows shows, and the failure says why.
+                    match account.scheduled_or_known().await {
+                        Ok(messages) => {
+                            sink.emit(Event::ScheduledMessages { account: id, messages });
+                            Ok(Outcome::Done)
+                        }
+                        Err((error, messages)) => {
+                            sink.emit(Event::ScheduledMessages { account: id, messages });
+                            Err(error)
+                        }
+                    }
+                })
+            }
+            Command::UpdateScheduled { account: id, delay_id, action } => {
+                let account = self.account(&id);
+                Box::pin(async move {
+                    let account = account?;
+                    account.update_scheduled(&delay_id, action).await?;
+                    let _order = account.listing_scheduled.lock().await;
+                    let (Ok(messages) | Err((_, messages))) = account.scheduled_or_known().await;
+                    sink.emit(Event::ScheduledMessages { account: id, messages });
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::ListImagePacks { account: id, room_id } => {
+                let account = self.account(&id);
+                Box::pin(async move {
+                    let packs = account?.image_packs(room_id.as_deref()).await?;
+                    sink.emit(Event::ImagePacks { account: id, room_id, packs });
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::SearchPlaces { query, language } => {
+                let http = self.http.clone();
+                Box::pin(async move {
+                    let http = http.map_err(|reason| Error::Link { url: String::new(), reason })?;
+                    let places = crate::geo::search_places(&http, &query, language.as_deref()).await?;
+                    sink.emit(Event::PlacesFound { request, places });
                     Ok(Outcome::Done)
                 })
             }
@@ -3195,7 +3384,7 @@ impl State {
                     match timeline {
                         // Through the timeline: replies and thread relations come out right, and
                         // the message shows at once as pending.
-                        Ok(timeline) => send_in(&timeline, reply_to, &message).await?,
+                        Ok(timeline) => send_in(&timeline, key.thread.as_deref(), reply_to, &message).await?,
                         Err(_) if key.thread.is_none() && reply_to.is_none() => {
                             account.send(&key.room_id, &message).await?;
                         }
@@ -3204,6 +3393,17 @@ impl State {
                     if let Some(usage) = usage {
                         usage.room(&account, &key.room_id, 3, replied_to);
                     }
+                    Ok(Outcome::Done)
+                })
+            }
+            Command::FetchMedia { account, media, size } if crate::geo::is_map(&media) => {
+                // Maps come from OpenStreetMap, drawn to the size asked for: no account needed.
+                let (http, tiles) = (self.http.clone(), self.layout.map_tiles());
+                let _ = account;
+                Box::pin(async move {
+                    let http = http.map_err(|reason| Error::Link { url: String::new(), reason })?;
+                    let bytes = crate::geo::draw_map(&http, &tiles, &media, size).await?;
+                    sink.emit(Event::MediaLoaded { request, media, size, bytes: bytes.into() });
                     Ok(Outcome::Done)
                 })
             }
@@ -4582,41 +4782,62 @@ async fn typing_people(room: &matrix_sdk::Room, users: Vec<matrix_sdk::ruma::Own
     people
 }
 
-/// A text message's content: formatted when it has HTML.
-fn text_content(
-    body: &str,
-    html: Option<&str>,
-) -> matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation {
-    use matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation as Content;
-    match html {
-        Some(html) => Content::text_html(body, html),
-        None => Content::text_plain(body),
+/// `content` in `thread` and answering `reply_to`, as the SDK relates the room messages it
+/// sends: it relates no other kind (stickers, polls) itself. In a thread without a reply,
+/// `latest` (the thread's latest message) is what clients without threads see it answer.
+fn related(
+    content: matrix_sdk::ruma::events::AnyMessageLikeEventContent,
+    thread: Option<&str>,
+    reply_to: Option<&str>,
+    latest: Option<&str>,
+) -> Result<matrix_sdk::ruma::events::AnyMessageLikeEventContent, Error> {
+    use matrix_sdk::ruma::events::{AnyMessageLikeEventContent, EventContentFromType, MessageLikeEventContent};
+    if thread.is_none() && reply_to.is_none() {
+        return Ok(content);
     }
+    let event_type = content.event_type().to_string();
+    let mut json = serde_json::to_value(&content).map_err(|e| Error::Storage(e.into()))?;
+    crate::scheduled::relate(&mut json, thread, reply_to);
+    if let (Some(_), None, Some(latest)) = (thread, reply_to, latest) {
+        json["m.relates_to"]["m.in_reply_to"]["event_id"] = latest.into();
+    }
+    let raw = serde_json::value::to_raw_value(&json).map_err(|e| Error::Storage(e.into()))?;
+    AnyMessageLikeEventContent::from_parts(&event_type, &raw).map_err(|e| Error::Storage(e.into()))
 }
 
 /// Sends through an open timeline: as a reply when `reply_to` is set, into the thread when the
-/// timeline is one.
+/// timeline is `thread`'s.
 async fn send_in(
     timeline: &matrix_sdk_ui::timeline::Timeline,
+    thread: Option<&str>,
     reply_to: Option<String>,
     message: &Outgoing,
 ) -> Result<(), Error> {
-    match message {
-        Outgoing::Text { body, html } => {
-            let content = text_content(body, html.as_deref());
-            match reply_to {
-                Some(event_id) => {
-                    timeline.send_reply(content, matrix_sdk::ruma::EventId::parse(&event_id)?).await?;
-                }
-                None => {
-                    let content: matrix_sdk::ruma::events::room::message::RoomMessageEventContent = content.into();
-                    timeline.send(content.into()).await?;
-                }
+    if let Some(content) = crate::outgoing::room_message(message) {
+        match reply_to {
+            Some(event_id) => {
+                timeline.send_reply(content, matrix_sdk::ruma::EventId::parse(&event_id)?).await?;
+            }
+            None => {
+                let content: matrix_sdk::ruma::events::room::message::RoomMessageEventContent = content.into();
+                timeline.send(content.into()).await?;
             }
         }
-        Outgoing::Poll { question, answers, disclosed } => {
-            timeline.send(crate::polls::start(question, answers, *disclosed)?).await?;
+        return Ok(());
+    }
+    match message {
+        Outgoing::Poll { .. } | Outgoing::Sticker(_) => {
+            if let Some(content) = crate::outgoing::event(message)? {
+                // In a thread without a reply, the fallback for clients without threads answers
+                // the thread's latest message, as the SDK's own thread messages do.
+                let latest = match (thread, &reply_to) {
+                    (Some(_), None) => timeline.latest_event_id().await.map(|id| id.to_string()),
+                    _ => None,
+                };
+                timeline.send(related(content, thread, reply_to.as_deref(), latest.as_deref())?).await?;
+            }
         }
+        Outgoing::Text { .. } | Outgoing::Emote { .. } | Outgoing::Location { .. } => {}
         Outgoing::File(upload) | Outgoing::Voice { upload, .. } => {
             use matrix_sdk_ui::timeline::AttachmentSource;
             let source = match upload {
@@ -4722,6 +4943,38 @@ mod tests {
             ..Default::default()
         };
         assert!(summary_may_change(&update));
+    }
+
+    fn sticker_json(thread: Option<&str>, reply_to: Option<&str>) -> serde_json::Value {
+        let image = crate::PackImage {
+            shortcode: "wave".into(),
+            body: "wave".into(),
+            url: "mxc://x.org/wave".into(),
+            media: crate::MediaRef::opaque("mxc://x.org/wave"),
+            emoticon: false,
+            sticker: true,
+            dimensions: Some((256, 256)),
+            mimetype: Some("image/png".into()),
+        };
+        let content = crate::outgoing::event(&Outgoing::Sticker(image)).expect("content").expect("a sticker");
+        serde_json::to_value(related(content, thread, reply_to, Some("$latest")).expect("related")).expect("json")
+    }
+
+    #[test]
+    fn a_sticker_sent_as_a_reply_should_answer_its_message() {
+        let json = sticker_json(None, Some("$q"));
+        assert_eq!(json["m.relates_to"]["m.in_reply_to"]["event_id"], "$q");
+        assert_eq!(json["url"], "mxc://x.org/wave");
+    }
+
+    #[test]
+    fn a_sticker_sent_in_a_thread_should_join_it() {
+        let json = sticker_json(Some("$root"), None);
+        assert_eq!(json["m.relates_to"]["rel_type"], "m.thread");
+        assert_eq!(json["m.relates_to"]["event_id"], "$root");
+        // Clients without threads see it answer the thread's latest message.
+        assert_eq!(json["m.relates_to"]["is_falling_back"], true);
+        assert_eq!(json["m.relates_to"]["m.in_reply_to"]["event_id"], "$latest");
     }
 
     fn mirror(items: &[u32]) -> BoundaryMirror<u32, impl Fn(&u32) -> bool> {

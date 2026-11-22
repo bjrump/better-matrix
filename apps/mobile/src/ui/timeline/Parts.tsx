@@ -165,7 +165,7 @@ const CARD_IMAGE: MediaSize = { type: 'Thumbnail', data: { width: 192, height: 1
 export function LinkCard({ url, message }: { url: string; message: Message }) {
   const palette = usePalette();
   const store = useAppStore();
-  const { account, openActions } = useTimelineContext();
+  const { account, openActions, shown } = useTimelineContext();
   const preview = useStore((s) => s.linkPreviews[previewKey(account, url)]);
   useEffect(() => wantLinkPreview(store, account, url), [store, account, url]);
   // The page's picture waits for Show where the account keeps media back (ADR 0011).
@@ -187,7 +187,7 @@ export function LinkCard({ url, message }: { url: string; message: Message }) {
       ]}
     >
       <Pressable
-        onPress={() => openLink(store, url, account)}
+        onPress={() => openLink(store, url, account, shown)}
         onLongPress={() => openActions(message)}
         delayLongPress={350}
         accessibilityRole="link"

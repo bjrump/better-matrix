@@ -1,7 +1,8 @@
 // What the search under a tab's title finds, in the tab's place while something is typed, as the
 // desktop's top bar lists it: a typed link or address to open (a pasted invitation,
 // `#room:server`), the account's rooms, direct chats and spaces by name, then people from the
-// user directory. Picking one empties the search (`onPicked`).
+// user directory. Picking one empties the search (`onPicked`); a link is opened by the screen
+// hosting the search (`onLink`), whose jump outlives this list.
 
 import type { MessageHit, Person } from '@better-matrix/matrix-native/types';
 import { router } from 'expo-router';
@@ -14,7 +15,7 @@ import { setScope } from '../../state/actions/core';
 import { openDirectChat } from '../../state/actions/people';
 import { foundAny, listTime, searchResults } from '../../state/lists';
 import { busy } from '../../state/people';
-import { type Permalink, permalinkUri } from '../../state/permalinks';
+import type { Permalink } from '../../state/permalinks';
 import { shallow, useAppStore, useStore } from '../../state/react';
 import { lastMessage } from '../../state/sections';
 import { roomListOf } from '../../state/selectors';
@@ -22,7 +23,6 @@ import type { AccountData } from '../../state/types';
 import { font } from '../../theme/palette';
 import { Avatar } from '../Avatar';
 import { EmptyState, ListRow } from '../components';
-import { openPermalink } from '../links/open';
 import { usePeopleSearch } from '../people/usePeopleSearch';
 import { usePalette } from '../theme';
 import { RoomRow } from './RoomRow';
@@ -47,11 +47,17 @@ export function SearchResults({
   account,
   term,
   onPicked,
+  onLink,
 }: {
   account: AccountData;
   term: string;
   /** A result was picked: the search empties. */
   onPicked: () => void;
+  /**
+   * The link result was picked: the screen hosting the search opens it and empties the search,
+   * guarding the jump by its own focus, since this list goes away with the search.
+   */
+  onLink: (link: Permalink) => void;
 }) {
   const store = useAppStore();
   const palette = usePalette();
@@ -126,10 +132,7 @@ export function SearchResults({
             testID="search-link"
             icon="link"
             title={t('search.open_link', { target: item.link.id })}
-            onPress={() => {
-              onPicked();
-              openPermalink(store, permalinkUri(item.link), id);
-            }}
+            onPress={() => onLink(item.link)}
           />
         );
       case 'room':
@@ -186,8 +189,8 @@ export function SearchResults({
               onPicked();
 
               if (hit.thread)
-                router.push(routes.thread(id, hit.room_id, hit.thread, hit.event_id, true));
-              else router.push(routes.room(id, hit.room_id, hit.event_id, true));
+                router.push(routes.thread(id, hit.room_id, hit.thread, hit.event_id, 'local'));
+              else router.push(routes.room(id, hit.room_id, hit.event_id, 'local'));
             }}
           />
         );

@@ -3,14 +3,17 @@
 // what it answers, its content, a linked GIF or a link's card, reactions, its thread and who has
 // read up to it. Chat bubbles: other people's messages at the left beside their face, the user's
 // own at the right, with reactions and the thread under the bubble. A long press opens its
-// actions.
+// actions. A message that mentions the user stands out with a warm tint and bar, as Slack's do;
+// its "(edited)" opens the edit history.
 
 import type { Message } from '@better-matrix/matrix-native/types';
+import { router } from 'expo-router';
 import { memo } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { t } from '../../i18n';
-import { cardLink, prepare } from '../../state/messages';
+import { cardLink, isLocal, marksMention, prepare } from '../../state/messages';
+import { routes } from '../../routes';
 import { useStore } from '../../state/react';
 import { Icon } from '../icons';
 import { clockTime } from '../../state/timelineText';
@@ -19,6 +22,7 @@ import { Avatar } from '../Avatar';
 import { InBubble, usePalette } from '../theme';
 import { AttachmentView } from './Attachments';
 import { CallCardView } from './CallCard';
+import { LocationCard } from './LocationCard';
 import { MessageSideContext, usePinned, useTimelineContext } from './context';
 import { LinkCard, LinkedGif, QuoteBlock, Reactions, ThreadLink } from './Parts';
 import { PollCard } from './PollCard';
@@ -92,7 +96,11 @@ function ClassicRow({ message, continues, latestCall, highlighted }: MessageRowP
   const { account, openActions } = useTimelineContext();
   const pinned = usePinned(message.event_id);
   const shown = useShown(message);
-  const status = statusOf(message);
+
+  const statusLine =
+    message.edited || message.pending ? (
+      <StatusLine message={message} color={palette.textMuted} />
+    ) : null;
 
   return (
     // The row is no control of its own for screen readers, so the links, Show and other controls
@@ -115,6 +123,14 @@ function ClassicRow({ message, continues, latestCall, highlighted }: MessageRowP
               borderLeftColor: palette.accent,
               paddingLeft: 13,
               backgroundColor: `${palette.accent}0F`,
+            }
+          : null,
+        marksMention(message, account)
+          ? {
+              borderLeftWidth: 3,
+              borderLeftColor: palette.warning,
+              paddingLeft: 13,
+              backgroundColor: `${palette.warning}1A`,
             }
           : null,
         highlighted ? { backgroundColor: `${palette.accent}26` } : null,
@@ -149,21 +165,12 @@ function ClassicRow({ message, continues, latestCall, highlighted }: MessageRowP
             <Text style={[font.meta, { color: palette.textMuted }]}>
               {clockTime(message.timestamp_ms)}
             </Text>
-            {status ? (
-              <Text
-                style={[font.meta, styles.status, { color: palette.textMuted }]}
-                numberOfLines={1}
-              >
-                {status}
-              </Text>
-            ) : null}
+            {statusLine}
           </View>
         )}
         <Said message={message} latestCall={latestCall} shown={shown} />
         <Hanging message={message} />
-        {continues && status ? (
-          <Text style={[font.meta, { color: palette.textMuted }]}>{status}</Text>
-        ) : null}
+        {continues ? statusLine : null}
         <ReadLine message={message} />
       </View>
       <ReadersCell message={message} />
@@ -201,7 +208,9 @@ function Said({
       {message.reply_to ? <QuoteBlock quote={message.reply_to} /> : null}
       {gif ? (
         <>
-          {gif.rest ? <RichText blocks={gif.rest} /> : null}
+          {gif.rest ? (
+            <RichText blocks={gif.rest} owner={message.event_id} media={message} />
+          ) : null}
           <LinkedGif key={gif.url} url={gif.url} message={message} />
         </>
       ) : (
@@ -256,14 +265,36 @@ function ReadersCell({ message }: { message: Message }) {
   ) : null;
 }
 
-/** What a message's text says, with "edited" and "sending" when either applies. */
-function statusOf(message: Message): string {
-  return [
-    message.edited ? t('message.edited') : null,
-    message.pending ? t('message.sending') : null,
-  ]
-    .filter((s): s is string => s !== null)
-    .join(' · ');
+/**
+ * "(edited)", which opens the message's edit history, and "sending", when either applies; then
+ * `time` when given (a bubble's).
+ */
+function StatusLine({ message, color, time }: { message: Message; color: string; time?: string }) {
+  const { account, timelineKey } = useTimelineContext();
+  const status = message.edited || message.pending;
+
+  return (
+    <Text style={[font.meta, styles.status, { color }]} numberOfLines={1}>
+      {message.edited ? (
+        <Text
+          accessibilityRole="button"
+          accessibilityHint={t('mobile.conversation.edit_history_hint')}
+          onPress={
+            isLocal(message)
+              ? undefined
+              : () =>
+                  router.push(routes.editHistory(account, timelineKey.room_id, message.event_id))
+          }
+          testID="message-edited"
+        >
+          {t('message.edited')}
+        </Text>
+      ) : null}
+      {message.edited && message.pending ? ' · ' : null}
+      {message.pending ? t('message.sending') : null}
+      {time ? `${status ? ' · ' : ''}${time}` : null}
+    </Text>
+  );
 }
 
 function BubbleRow({ message, continues, latestCall, highlighted }: MessageRowProps) {
@@ -273,18 +304,16 @@ function BubbleRow({ message, continues, latestCall, highlighted }: MessageRowPr
   const shown = useShown(message);
   const own = message.sender_id === account;
   const named = !own && !continues && !unnamed.has(message.sender_id);
+  // Someone else's message that mentions the user keeps a warm mark, as a classic row does: a
+  // tint on the row and, on a bubble of words, a warm outline.
+  const mentions = marksMention(message, account);
   // Words get a bubble; media and cards bring their own frames.
   const bubbled = shown.gif === null && BUBBLED.has(message.content.type);
-  const status = statusOf(message);
   // What a bubble leaves its words, for what sizes itself to them (a link's card): a share of
   // its column, which the user's own rows widen by the picture's gutter they leave out.
   const contentWidth = useContentWidth();
   const column = contentWidth + (own ? AVATAR + ROW_GAP : 0);
   const bubbleWidth = Math.floor(column * BUBBLE_SHARE) - 2 * BUBBLE_PAD_X;
-
-  const time = status
-    ? `${status} · ${clockTime(message.timestamp_ms)}`
-    : clockTime(message.timestamp_ms);
 
   // What the message says: in a bubble, its muted words take the bubble's shade.
   const said = <Said message={message} latestCall={latestCall} shown={shown} />;
@@ -301,6 +330,7 @@ function BubbleRow({ message, continues, latestCall, highlighted }: MessageRowPr
       style={[
         styles.row,
         { paddingTop: continues ? 2 : 10, opacity: message.pending ? 0.6 : 1 },
+        mentions ? { backgroundColor: `${palette.warning}1A` } : null,
         highlighted ? { backgroundColor: `${palette.accent}26` } : null,
       ]}
     >
@@ -330,7 +360,11 @@ function BubbleRow({ message, continues, latestCall, highlighted }: MessageRowPr
             style={[
               styles.bubble,
               bubbled
-                ? [styles.filled, { backgroundColor: own ? palette.bubbleOwn : palette.bubble }]
+                ? [
+                    styles.filled,
+                    { backgroundColor: own ? palette.bubbleOwn : palette.bubble },
+                    mentions ? [styles.mentioned, { borderColor: palette.warning }] : null,
+                  ]
                 : // Cards and media take the width a classic row gives them, which they are sized
                   // for: a poll fills it, a picture keeps its size on the message's side.
                   // No wider than a classic row's content, though own rows leave out the picture.
@@ -359,12 +393,11 @@ function BubbleRow({ message, continues, latestCall, highlighted }: MessageRowPr
             )}
             {/* A view, not the text, carries the control: iOS doesn't activate a text's. */}
             <View style={bubbled ? styles.time : null} {...actionsControl(message, openActions)}>
-              <Text
-                style={[font.meta, { color: bubbled ? palette.bubbleMeta : palette.textMuted }]}
-                numberOfLines={1}
-              >
-                {time}
-              </Text>
+              <StatusLine
+                message={message}
+                color={bubbled ? palette.bubbleMeta : palette.textMuted}
+                time={clockTime(message.timestamp_ms)}
+              />
             </View>
           </View>
           <Hanging message={message} />
@@ -381,11 +414,15 @@ function Body({ message, latestCall }: { message: Message; latestCall: boolean }
   const content = message.content;
 
   switch (content.type) {
-    case 'Text': {
+    case 'Text':
+    case 'Emote': {
       const blocks = prepare(message).blocks;
 
-      return blocks ? <RichText blocks={blocks} /> : null;
+      return blocks ? <RichText blocks={blocks} owner={message.event_id} media={message} /> : null;
     }
+
+    case 'Location':
+      return <LocationCard message={message} location={content.data} />;
 
     case 'Attachment':
       // Keyed by message: a recycled row starts its file's state afresh.
@@ -427,6 +464,12 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     paddingHorizontal: BUBBLE_PAD_X,
     paddingVertical: 7,
+  },
+  // A bubble mentioning the user: a warm outline, inside its padding so its words don't move.
+  mentioned: {
+    borderWidth: 1.5,
+    paddingHorizontal: BUBBLE_PAD_X - 1.5,
+    paddingVertical: 7 - 1.5,
   },
   // As wide as a classic row's content, which media are sized for.
   unfilled: { width: '100%' },

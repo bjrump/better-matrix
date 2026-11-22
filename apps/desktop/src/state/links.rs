@@ -76,11 +76,15 @@ impl State {
             return;
         };
         self.popover = None;
-        if let LinkTarget::Room { room, .. } = &permalink.target
+        if let LinkTarget::Room { room, event } = &permalink.target
             && let Some(joined) = self.joined_account(room, &account)
         {
             self.modal = None;
             self.open_linked(&joined, room, false);
+            // A link to a message goes on to it, wherever it shows (the room, or a thread).
+            if let Some(event) = event {
+                self.jump_to_message(&joined, room, event);
+            }
             return;
         }
         self.modal =
@@ -198,6 +202,7 @@ impl State {
             return;
         }
         let account = dialog.account.clone();
+        let event = linked_event(&dialog.link);
         let opens = if preview.joined {
             Some(account)
         } else if dialog.chosen {
@@ -208,6 +213,9 @@ impl State {
         if let Some(account) = opens {
             self.modal = None;
             self.open_linked(&account, &preview.room_id, preview.space);
+            if let Some(event) = event {
+                self.jump_to_message(&account, &preview.room_id, &event);
+            }
             return;
         }
         if let Some(Modal::Link(dialog)) = &mut self.modal {
@@ -232,7 +240,8 @@ impl State {
         self.request_avatars();
     }
 
-    /// The room or space joined: it opens, if the dialog still waits for it.
+    /// The room or space joined: it opens, if the dialog still waits for it, at the linked
+    /// message if the link names one.
     pub(super) fn link_joined(&mut self, request: RequestId, room_id: &str) {
         let Some(Modal::Link(dialog)) = &self.modal else { return };
         let LinkStep::Joining { request: waiting, preview } = &dialog.step else { return };
@@ -240,9 +249,12 @@ impl State {
             return;
         }
         let space = preview.as_ref().is_some_and(|preview| preview.space);
-        let account = dialog.account.clone();
+        let (account, event) = (dialog.account.clone(), linked_event(&dialog.link));
         self.modal = None;
         self.open_linked(&account, room_id, space);
+        if let Some(event) = event {
+            self.jump_to_message(&account, room_id, &event);
+        }
     }
 
     /// A lookup or join of the dialog failed: a preview that couldn't load still offers to join;
@@ -281,6 +293,14 @@ impl State {
                 .and_then(|preview| preview.avatar.clone()),
         }?;
         Some((dialog.account.clone(), picture))
+    }
+}
+
+/// The message a link names in its room, if it names one.
+fn linked_event(link: &Permalink) -> Option<String> {
+    match &link.target {
+        LinkTarget::Room { event, .. } => event.clone(),
+        LinkTarget::User(_) => None,
     }
 }
 

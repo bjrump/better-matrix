@@ -20,12 +20,16 @@ mod composer;
 mod developer;
 pub use developer::SourceView;
 mod drafts;
+mod edit_history;
 mod gifs;
+mod jump;
 mod link_previews;
 mod links;
+mod location;
 mod media;
 mod message_actions;
 mod navigation;
+mod packs;
 mod panes;
 mod poll;
 mod preview;
@@ -36,11 +40,14 @@ mod receipts;
 mod retry;
 mod room_discovery;
 mod safety;
+mod scheduled;
 mod search;
 mod sections;
 mod settings;
 mod sign_in;
+mod slash;
 mod status_message;
+mod suggest;
 mod typing;
 mod updates;
 
@@ -70,11 +77,14 @@ pub use attachments::{AttachmentAction, can_open_attachment};
 pub use call::Call;
 pub use call_layout::{CallLayout, CallTile};
 pub use composer::{Composer, EditTarget, Format, ReplyTarget, VoiceMemo};
+pub use edit_history::EditHistory;
 pub use gifs::GifCache;
 pub use link_previews::LinkPreviews;
 pub use links::{LinkDialog, LinkStep};
+pub use location::{LocationForm, MAP_PIXELS, MAP_SIZE};
 pub use media::MediaCache;
 pub use navigation::{navigate, navigate_now};
+pub use packs::PACK_IMAGE_SIZE;
 pub use panes::{Pane, PaneLayout, PaneSize, PaneWidths};
 pub use poll::{MAX_ANSWERS, PollForm};
 pub use preview::{
@@ -84,6 +94,7 @@ pub use profile::{ContactStep, ProfileForm};
 pub use qr_login::QrLogin;
 pub use readers::{READER_FACES, ReaderMenu};
 pub use room_discovery::Directory;
+pub use scheduled::{When, failure_reason, local_offset};
 pub use search::{PeopleSearch, SEARCH_PAUSE, SearchFilter, SearchStatus, matches};
 pub use sections::{
     DIRECT, FAVOURITES, INVITATIONS, LOW_PRIORITY, ROOMS, SectionView, is_builtin, ordered_spaces, sections,
@@ -91,10 +102,14 @@ pub use sections::{
 pub use settings::{Appearance, MessageLayout, PlaybackSpeed, Settings, SettingsSection, Zoom};
 pub use sign_in::{Asked, SignInForm, SignInStep};
 pub use status_message::{leading_emoji, suggestions as status_suggestions};
+pub use suggest::{Suggestion, Trigger};
 pub use updates::Update;
 
 use crate::i18n::{Language, t, tf};
 use crate::platform::{Shell, Toast};
+
+/// What the link ids a spoiler's words carry start with ([`State::open_link`] reveals them).
+pub const SPOILER_LINK: &str = "better-matrix:spoiler/";
 
 /// Which screen the window shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +171,12 @@ pub enum Popover {
     CallLayout,
     /// The options of a select in settings.
     Select(SelectFor),
+    /// The stickers of the room's image packs, for a composer.
+    Stickers(ComposerTarget),
+    /// When to send a composer's message later, from beside its send button.
+    Schedule(ComposerTarget),
+    /// The room's scheduled messages, from the bar above its composer.
+    Scheduled,
 }
 
 /// Which setting a select chooses.
@@ -415,6 +436,10 @@ pub enum Modal {
     SignIn,
     /// Writing a poll (`State::poll_form`).
     Poll,
+    /// Sharing a place (`State::location`).
+    Location,
+    /// The versions an edited message went through.
+    EditHistory(Box<EditHistory>),
     /// "Are you sure?" before something that can't be undone.
     Confirm(Confirm),
     /// Verifying this session with another of the user's sessions, or another person (`with`).
@@ -661,6 +686,25 @@ enum Purpose {
     Delete,
     /// Message utilities whose failures become a notice.
     MessageAction,
+    /// A slash command's own action (a topic, a display name); a failure becomes a notice.
+    Command,
+    /// Listing a room's image packs; a failure leaves the pickers without them.
+    Packs,
+    /// Searching places for the location dialog; a failure shows in it.
+    Places,
+    /// Finding where a linked or quoted message shows.
+    Locate,
+    /// Listing the account's scheduled messages; a server without them lists none.
+    ListScheduled,
+    /// Sending or cancelling a scheduled message.
+    Schedule,
+    /// Scheduling a message; refused, what its composer held comes back.
+    Scheduling {
+        owner: drafts::Owner,
+        draft: Box<composer::Draft>,
+    },
+    /// Reading a message's versions for the edit history dialog.
+    EditHistory,
     /// Listing the messages an account saved; a failure shows in the list.
     Saved(AccountId),
     /// Reading the draft the store keeps for a timeline; a failure lets the next visit ask again.
@@ -860,6 +904,22 @@ pub struct State {
     /// The top bar's search.
     pub search: PeopleSearch,
     pub message_jump: Option<search::MessageJump>,
+    /// The message just jumped to, lit a moment.
+    pub flash: Option<jump::Flash>,
+    /// The latest jump waiting for the engine to find its message, and its account and room:
+    /// only its answer goes.
+    locating: Option<(RequestId, AccountId, String)>,
+    /// Rooms' custom emoji and sticker packs.
+    pub packs: packs::Packs,
+    /// The location dialog, while [`Modal::Location`] shows.
+    pub location: LocationForm,
+    /// Each account's scheduled messages.
+    pub scheduled: scheduled::Scheduled,
+    /// Scheduled drafts the server refused while their composer held something else, by timeline:
+    /// each comes back once its composer is free.
+    refused: Vec<(drafts::Owner, composer::Draft)>,
+    /// Spoilers the user revealed, by the link id their words carry in a message.
+    pub revealed: HashSet<String>,
     /// The invite dialog's search.
     pub invite_search: PeopleSearch,
     /// The new-chat search.
@@ -1010,6 +1070,13 @@ impl State {
             preview: None,
             search: PeopleSearch::default(),
             message_jump: None,
+            flash: None,
+            locating: None,
+            packs: packs::Packs::default(),
+            location: LocationForm::default(),
+            scheduled: scheduled::Scheduled::default(),
+            revealed: HashSet::new(),
+            refused: Vec::new(),
             invite_search: PeopleSearch::default(),
             chat_search: PeopleSearch::default(),
             audio: None,
@@ -1284,6 +1351,8 @@ impl State {
             }
             Event::AccountRemoved(id) => {
                 self.directories.retain(|(account, _), _| *account != id);
+                self.packs.forget(&id);
+                self.scheduled.forget(&id);
                 // A suspended account stays listed in `suspended`: removing it is what suspending
                 // does here.
                 self.accounts.remove(&id);
@@ -1720,6 +1789,23 @@ impl State {
             Event::EventSource { request, source } => self.source_loaded(request, source),
             // Pushes are for phones: the desktop syncs while it runs and never registers a pusher.
             Event::PushContent { .. } => {}
+            Event::EditHistory { event_id, versions, .. } => self.edit_history_listed(&event_id, versions),
+            Event::MessageLocated { request, account, key, event_id } => {
+                self.message_located(request, &account, &key, &event_id);
+            }
+            Event::ScheduledMessages { account, messages } => {
+                if let Some(reason) = self.scheduled.listed(account, messages) {
+                    self.notice = Some(tf!("schedule.failed_notice", reason = scheduled::failure_reason(&reason)));
+                }
+            }
+            Event::ImagePacks { account, room_id, packs } => {
+                if let Some(room_id) = room_id {
+                    self.packs.listed(account, room_id, packs);
+                }
+                self.request_pack_images();
+                self.request_timeline_media();
+            }
+            Event::PlacesFound { request, places } => self.places_found(request, places),
         }
         self.remember_account();
         if !location.is_current(self) {
@@ -1994,6 +2080,25 @@ impl State {
                 self.resume_edits();
             }
             Purpose::MessageAction => self.notice = Some(tf!("notice.message_action", error = error)),
+            Purpose::Command => self.notice = Some(tf!("notice.command", error = error)),
+            Purpose::Packs | Purpose::ListScheduled => {}
+            Purpose::Places => self.places_failed(request, error),
+            // Only the latest jump says it found nothing, and only while its room shows.
+            Purpose::Locate if self.locating.as_ref().is_some_and(|(asked, _, _)| *asked == request) => {
+                if let Some((_, account, room)) = self.locating.take()
+                    && self.nav.account.as_ref() == Some(&account)
+                    && self.active_room_id() == Some(room.as_str())
+                {
+                    self.notice = Some(t!("search.message_unavailable").to_owned());
+                }
+            }
+            Purpose::Locate => {}
+            Purpose::Schedule => self.notice = Some(tf!("notice.schedule", error = error)),
+            Purpose::Scheduling { owner, draft } => {
+                self.notice = Some(tf!("notice.schedule", error = error));
+                self.scheduling_failed(owner, *draft);
+            }
+            Purpose::EditHistory => self.edit_history_failed(error),
             Purpose::Saved(account) => self.accounts.saved_failed(&account, error),
             Purpose::Draft(owner) => {
                 self.drafts_asked.remove(&owner);
@@ -2340,6 +2445,17 @@ impl State {
         self.retry_due(now, tx);
         changed |= self.search_people(now);
         changed |= self.position_message(tx);
+        changed |= self.expire_flash(now, tx);
+        self.resume_refused();
+        // Whatever stripped a pill into a code block since the last frame is taken back.
+        changed |= self.composer.keep_pills() | self.thread_composer.keep_pills();
+        self.load_for_suggestions();
+        if self.screen() == Screen::Chat
+            && let Some(account) = self.nav.account.clone()
+            && self.accounts.get(&account).is_some_and(|data| !data.rooms.is_empty())
+        {
+            self.want_scheduled(&account, tx);
+        }
         // Searches go out for the active account; with none, nothing waits.
         if let Some(wait) = [&self.search, &self.invite_search, &self.chat_search]
             .iter()
@@ -2675,6 +2791,14 @@ impl State {
             }
             for media in entry.avatars() {
                 wanted.push((account.clone(), media.clone(), AVATAR_SIZE, Some(AVATAR_PIXELS)));
+            }
+            // Custom emoji in its text (not while its media is kept back: they read as their
+            // short codes), and the map of a place it shares.
+            for media in entry.emotes().iter().filter(|_| !held) {
+                wanted.push((account.clone(), media.clone(), PACK_IMAGE_SIZE, Some((128, 128))));
+            }
+            if let Some(map) = entry.location_map().filter(|_| self.settings.show_maps) {
+                wanted.push((account.clone(), map.clone(), MAP_SIZE, Some(MAP_PIXELS)));
             }
             // A link card's image.
             if self.settings.show_link_previews
@@ -5122,14 +5246,30 @@ impl State {
                     self.composer_mut(other).cancel_edit();
                 }
                 let composer::EditTarget { account, key, event_id } = edit.target.clone();
-                let (body, html) = (edit.body.clone(), edit.html.clone());
-                self.dispatch(Command::Edit { account, key, event_id, body, html }, Purpose::Edit(Box::new(edit)));
+                let (body, html, mentions) = (edit.body.clone(), edit.html.clone(), edit.mentions.clone());
+                self.dispatch(
+                    Command::Edit { account, key, event_id, body, html, mentions },
+                    Purpose::Edit(Box::new(edit)),
+                );
             }
             self.resume_edits();
             return;
         }
-        let (reply_to, messages) = self.composer_mut(target).take_outgoing();
+        let Some((reply_to, messages)) = self.take_messages(target) else { return };
         self.send_from(target, reply_to, messages, tx);
+    }
+
+    /// What a composer sends and the message it answers, its text run as a slash command when
+    /// it is one; `None` when a command did all there was to do or stopped with a notice (the
+    /// reply then stays).
+    fn take_messages(&mut self, target: ComposerTarget) -> Option<(Option<ReplyTarget>, Vec<matrix_core::Outgoing>)> {
+        // A pill stripped into a code block since the last frame comes back before anything goes.
+        self.composer_mut(target).keep_pills();
+        match self.run_command(target) {
+            None => Some(self.composer_mut(target).take_outgoing()),
+            Some(messages) if messages.is_empty() => None,
+            Some(messages) => Some((self.composer_mut(target).reply_to.take(), messages)),
+        }
     }
 
     /// Sends messages from a composer's room or thread; the first answers `reply_to`, if any.
@@ -5271,6 +5411,16 @@ impl State {
     /// link (true); anything else is left to the editor to paste (false).
     pub fn paste_into_composer(&mut self, target: ComposerTarget, content: &rune::clipboard::ClipboardContent) -> bool {
         let composer = self.composer_mut(target);
+        // A paste over a selection joining a pill onto a code block does nothing, as typing.
+        if composer.replacing_selection_strips_pills() {
+            return true;
+        }
+        // A code block pastes plain text: a copied spoiler would go there as its words.
+        if composer.pastes_into_code() && content.html().is_some_and(holds_spoiler) {
+            self.notice = Some(t!("composer.spoiler_in_code").to_owned());
+            return true;
+        }
+        let composer = self.composer_mut(target);
         // An edit changes the text only: nothing attaches to it.
         if composer.editing.is_none() {
             if let Some(image) = content.image() {
@@ -5282,8 +5432,10 @@ impl State {
                 return true;
             }
         }
-        // In a code block links can't be, so the address pastes as text.
-        if matrix_core::links::is_link(content.text()) && composer.edit.active_block() != rune::Block::Code {
+        // In a code block links can't be, so the address pastes as text; nor is a copied pill
+        // (a spoiler holding only an address) made a link: the field restores it as it was.
+        let pills = content.html().is_some_and(|html| html.contains("data-pill"));
+        if matrix_core::links::is_link(content.text()) && !pills && composer.edit.active_block() != rune::Block::Code {
             composer.paste_link(content.text().trim());
             return true;
         }
@@ -5306,6 +5458,11 @@ impl State {
 
     /// Opens a link: a permalink in the app, anything else in the browser.
     pub fn open_link(&mut self, url: &str, tx: &mut Tx) {
+        // A spoiler's words carry a link of the app's own: pressing them reveals them.
+        if url.starts_with(SPOILER_LINK) {
+            self.revealed.insert(url.to_owned());
+            return;
+        }
         if matrix_core::Permalink::is_permalink(url) {
             navigation::navigate_now(self, tx, |s| s.open_permalink(url));
         } else if let Err(error) = tx.open_url(url) {
@@ -5318,6 +5475,13 @@ impl State {
         self.settings.show_link_previews = show;
         self.shell.save_settings(self.settings.clone());
         self.fetch_link_previews(std::time::Instant::now());
+        self.request_timeline_media();
+    }
+
+    /// Shows shared places' maps, or not.
+    pub fn set_show_maps(&mut self, show: bool) {
+        self.settings.show_maps = show;
+        self.shell.save_settings(self.settings.clone());
         self.request_timeline_media();
     }
 
@@ -5369,6 +5533,11 @@ pub fn call_title(card: &matrix_core::CallCard) -> &'static str {
 mod tests;
 
 /// The element key of a composer's text field.
+/// Whether copied HTML holds a spoiler: the field's own pill, or a message's.
+fn holds_spoiler(html: &str) -> bool {
+    html.contains("data-pill=\"spoiler\"") || html.contains("data-mx-spoiler")
+}
+
 pub fn composer_field(target: ComposerTarget) -> &'static str {
     match target {
         ComposerTarget::Room => "composer",

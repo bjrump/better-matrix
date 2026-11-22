@@ -11,10 +11,12 @@ mod components;
 mod composer;
 mod confirm;
 mod developer;
+mod edit_history;
 mod emoji;
 mod icons;
 mod info;
 mod link;
+mod location;
 mod members;
 mod message_actions;
 mod message_text;
@@ -31,11 +33,14 @@ mod room_discovery;
 mod room_menu;
 mod safety;
 mod saved;
+mod schedule;
 mod search;
 mod security;
 mod settings;
 mod sidebar;
 mod sign_in;
+mod stickers;
+mod suggestions;
 mod theme;
 mod thread;
 mod timeline;
@@ -138,6 +143,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             };
             vec![emoji::picker(s, chosen_for, anchor, &p)]
         }
+        (Some(Popover::Stickers(target)), _) => vec![stickers::picker(s, *target, &p)],
+        (Some(Popover::Schedule(target)), _) => vec![schedule::menu(*target, &p)],
+        (Some(Popover::Scheduled), _) if !s.scheduled_here().is_empty() => vec![schedule::list(s, &p)],
         _ => Vec::new(),
     };
     // A select's list belongs to the settings modal, so it goes over the modal, below.
@@ -145,6 +153,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         Some(Popover::Select(of)) => Some(settings::select_options(s, of, &p)),
         _ => None,
     };
+    // What a composer suggests for the word being typed sits over it; the field keeps the keys.
+    root = root.children(suggestions::lists(s, &p));
     if !panels.is_empty() {
         let backdrop = if s.popover == Some(Popover::Search) {
             // Keep the field and its removable filter chip clickable above the backdrop.
@@ -171,6 +181,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         Some(Modal::Forward { .. } | Modal::Translate(_)) => message_actions::dialog(s, &p),
         Some(Modal::Saved(id)) => s.accounts.get(id).map(|account| saved::saved(s, account, &p)),
         Some(Modal::Poll) => Some(poll::form(s, &p)),
+        Some(Modal::Location) => Some(location::dialog_for(s, &p)),
+        Some(Modal::EditHistory(history)) => Some(edit_history::dialog_for(s, history, &p)),
         Some(Modal::Link(dialog)) => Some(link::link_dialog(s, dialog, &p)),
         Some(Modal::Invite { room_id, invited, .. }) => {
             account.map(|account| people::invite_dialog(s, account, room_id, invited, &p))

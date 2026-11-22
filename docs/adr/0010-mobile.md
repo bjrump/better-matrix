@@ -152,14 +152,116 @@ Date: 2026-11-16
 - **The composer is one row:** + then the text field then the mic (send once there is something
   to send). The field grows with its text to about six lines, then scrolls, as the desktop's
   does. + opens every other option in the keyboard's place (photos and videos, camera, files,
-  poll, formatting, emoji); formatting, once picked, puts the toolbar above the row until it is
-  closed.
+  poll, location, sticker, formatting, emoji), four to a row; formatting, once picked, puts the
+  toolbar above the row until it is closed. A long press on Send schedules the message (below).
 - **The composer writes formatting as markers.** The native text field holds plain text;
   `Format`s insert and remove markdown-style markers (`**bold**`, `_italic_`, `~~strike~~`,
   `` `code` ``, `[text](url)`, `- `/`1. ` lists, `> ` quotes, ``` fences), and lists and quotes
-  continue on a line break. On send, `state/format.ts` turns the text into the body and the
-  Matrix HTML the desktop's rich field sends (as Rune's `to_html` writes it), HTML only when
-  formatted; `draftOf` writes a message's HTML back as markers for an edit. Sends are planned as
+  continue on a line break. Two markers the toolbar doesn't offer are Matrix's own:
+  `||spoiler||` (`<span data-mx-spoiler>`, `[Spoiler]` in the body) and `$$latex$$`
+  (`data-mx-maths`, its LaTeX the fallback). On send, `state/format.ts` turns the text into the
+  body and the Matrix HTML the desktop's rich field sends (as Rune's `to_html` writes it), HTML
+  only when formatted; `editDraft` writes a message's HTML back as markers and pills for an
+  edit. Markers are read a line at a time, except a spoiler: a `||` pair over several lines is
+  closed and opened again on each line it covers, after the line's prefix, blank lines
+  included, never into a code block, and only when a later line closes it; the body gives the
+  whole a single `[Spoiler]`. An edited message's spoilers don't come back as markers, which
+  can't carry any words (a `||`, a fence or a backtick inside would end or break the spoiler and
+  show the rest): each is a spoiler pill (below), its words only, as the engine's `to_pills`
+  makes it for the desktop. A link or mention around a spoiler comes back as its content; a
+  span marked both spoiler and formula is a spoiler.
+- **Mentions and custom emoji are pills beside the text** (`state/pills.ts`, the engine's
+  `html.rs` pill ids: `user:@…`, `room:!…`/`room:#…`, `everyone`, `emote:mxc://…`). A picked
+  suggestion inserts its label into the draft (`@Grace Hopper`, `#design`, `@room`,
+  `:party:`) and adds the pill to `ComposerState.pills` bound to where it was put
+  (`DraftPill.start`), not to its label: the same words typed elsewhere stay text, and two
+  people with one name keep their own IDs. Each change of the draft moves the pills after it
+  (`trackPills`: the edit is what lies between the old and new text's common start and end,
+  the caret settling where that is ambiguous in repeated text; a suggestion, an emoji or an
+  edit's own text place theirs directly). A change the app makes at known places (the
+  toolbar's markers and prefixes, a list continued, a link) carries its exact `Splice`s and
+  moves the pills by them (`spliceDraft`), since a diff would see `**` put either side of a
+  pill as one change across it. A pill whose label was edited, or that now sits inside a
+  longer word (letters and digits; `_`, italic's marker, doesn't join), is dropped (Slack's
+  behaviour: a broken mention is text). A refused
+  edit comes back with its pills and the message's own. A spoiler pill (`spoiler`, made only by
+  `editDraft`) is a range instead: words typed or deleted inside it stay hidden, words typed at
+  either end stay outside, a cut across one end keeps the rest, and only deleting all of it
+  ends it; it stands even inside a longer word. The field draws it on the muted colour. It goes
+  as `<span data-mx-spoiler>` (line breaks as `<br />`) and `[Spoiler]` in the body; inside code
+  or a formula, which would show its words, those end around it and it goes as its own spoiler
+  (in a code block it stays in the block, which readers then draw as text, below).
+  On send each placed label becomes one private-use character while the markers are parsed, so
+  markers around it format it and nothing in a name reads as a marker (only characters the
+  draft doesn't hold are used, so one typed or pasted stays text; editing a message's HTML back
+  into a draft does the same). They come from the BMP's private use area, then planes 15 and
+  16, over 137,000 in all; a draft holding so many that a pill gets none (more than a Matrix
+  event carries) is not sent, edited or scheduled at all, since its spoilers' words would go out
+  as plain text: the draft stays as it is and a notice says why. A pill then goes as the
+  engine's HTML (`<a href="https://matrix.to/#/@…">Name</a>`, the ID one percent-encoded segment
+  but for `@`, `#`, `!` and `:` as the engine's `mention_link` writes it, `permalinks.ts`
+  `mentionLink`, so a `/` in it can't cut it short; `<img data-mx-emoticon …>`,
+  `@room` as plain text) and its people as `Outgoing::Text.mentions` (`m.mentions`, always
+  sent, empty when nobody), edits included. `m.mentions` comes from the parsed runs, not the
+  draft's pills: only a pill sent as a live mention counts (a person's matrix.to link, spoiler
+  or not; `@room` as words a reader sees), so one in code, a code block or a formula (sent as
+  its label) mentions nobody, nor does `@room` hidden in a spoiler (`/spoiler` alike). The field draws placed pills in the accent
+  (`TextInput` children, no `value`).
+- **Suggestions** (`state/suggestions.ts`, pure, from the word before the caret,
+  `triggerAt`): `@` people in the room from its whole member list (fetched when first asked) and
+  `@room` in a group; `#` joined rooms; `:` and two letters the room's custom emoji
+  (`ListImagePacks`, user pack first) then standard emoji; `/` at the start the commands. They
+  list above the field, as Slack's do; the field reports the caret only while the draft holds
+  one of the signs, so plain typing still redraws once a keystroke.
+- **Slash commands** (`state/slash.ts`): `/me` (an emote), `/shrug`, `/tableflip`, `/unflip`,
+  `/lenny` (the face before the text), `/plain` (no formatting), `/spoiler` (the text as
+  written in one `<span data-mx-spoiler>`, line breaks as `<br />`, never through markers, so
+  nothing in it can end the spoiler early; `[Spoiler]` the whole body), `/invite`, `/join`
+  (opens the room once joined; the argument is a picked pill or read as a typed link,
+  `parseTyped`, so a room ID without a server, as room version 12 writes them, or a pasted
+  matrix.to link with its `via` servers works), `/leave` (asks first with the room menu's confirmation, `ui/askToLeave`, deleting a direct chat as it does; the composer empties either way, as the desktop's; back to Home once left), `/topic` (`ChangeRoom` with `RoomSetting::Topic`), `/nick`
+  (`SetDisplayName`). A command acts in the draft's place; the reply and attachments wait for
+  the next send. An unknown command or one missing its argument keeps the draft and says so;
+  `//text` sends `/text`. Each failure says what failed (`notice.invite`, `notice.join`, …).
+- **Stickers and custom emoji** come from MSC2545 packs (`ListImagePacks`, kept per room in
+  `AccountData.packs`): the sticker sheet (`app/stickers.tsx`) sends `Outgoing::Sticker`; the
+  emoji picker, writing (not reacting), offers the custom emoji first as pills. Received
+  stickers arrive as images (the engine's conversion). Custom emoji in messages are drawn
+  inline from their `mxc://` URI, as a media handle written the engine's way
+  (`mxcMedia`: `MediaSource::Plain` as JSON), the one handle the app writes itself. Any `<img>`
+  from `mxc://` is one (label: `alt`, else `title`), marked `data-mx-emoticon` or not, as the
+  engine's `to_pills` reads it: the SDK's sanitiser drops that attribute. Other images show
+  their `alt`.
+- **Locations:** the sheet (`app/location.tsx`) takes the phone's position (expo-location,
+  when-in-use permission only, configured in `app.json`), looked up only once the user presses
+  "Use my location", or a place found by name (`SearchPlaces`, only on submit: Nominatim's
+  policy forbids searching as one types), previews it on its map and sends
+  `Outgoing::Location`. A sticker or a place answers what that timeline's composer answers (a
+  thread's goes into the thread) and ends the reply, as sending text does and as the desktop's
+  `send_from` does. The timeline's card (`LocationCard`) draws the map the engine renders
+  from OpenStreetMap (`osm:<lat>,<lon>,15`, which the app also writes for the phone's own
+  position, `state/geo.ts` mirroring `geo.rs`), the description, the coordinates and
+  "© OpenStreetMap contributors" on every map; tapping opens openstreetmap.org. The device
+  fetches those maps, so OpenStreetMap sees its address and the area shown: Preferences' "Maps
+  from OpenStreetMap" (`Settings.showMaps`, on by default) turns them off, and `MapView` then
+  draws a pin and fetches nothing, in cards and in the sheet alike.
+- **Scheduled messages** (MSC4140): a long press on Send (text, or a command that makes a
+  message: `/me`, `/plain`, `/spoiler`, the faces; not an edit, not with attachments, which
+  upload at once; anything else says why and keeps the draft, `scheduleProblem`, checked again
+  when the time is picked) opens the schedule sheet (`app/schedule.tsx`: in 30
+  minutes, in an hour, tomorrow at 9:00, next Monday at 9:00 with when each is, or a custom
+  date and time through `@expo/ui`'s date-time picker, at most 30 days ahead), which sends
+  `Schedule` with the delay worked out in local time (`state/schedule.ts`). The composer shows
+  "N scheduled messages" above itself for its room, kept current while the conversation is
+  open (`ui/composer/useScheduledRefresh`, timed by `state/schedule.ts`: `ListScheduled` when
+  it opens, when the app returns to the foreground, and when the soonest message's send time
+  passes, once a due time, then every 30 s while the server still lists it, so a sent one
+  leaves the bar; a timer is capped at what JavaScript's can hold); the bar opens the list (`app/scheduled.tsx`) to send each now or cancel it
+  (`UpdateScheduled`). A refused schedule gives the composer back: text, pills and the message
+  it answered. Should the composer hold something else by then (new text, a reply, files, an
+  edit), the draft waits in `ComposerState.refused` and comes back once that timeline's
+  composer is empty again (`withRefusedBack`, applied on every composer change), as refused
+  edits wait in `kept`; like those it lives for the run only. Sends are planned as
   data (`state/outgoing.ts`): text with the reply first, then each attachment as
   `Upload::Path`; voice memos are AAC `.m4a` from expo-audio, sent with a 100-point waveform
   from the recorder's metering (read 20 times a second, `waveformFromLevels`, on the desktop's
@@ -312,6 +414,58 @@ Date: 2026-11-16
 - **Message HTML** is parsed by a small tokenizer of our own (`state/html.ts`) into a safe node
   tree: only the desktop's allowed tags become formatting, links keep `http(s)`, `mailto` and
   `ftp`, reply fallbacks and scripts are dropped, nesting is capped. Nothing renders raw HTML.
+  Matrix's inline objects become inlines of their own, as `html.rs` reads them: mention pills
+  (the user's own in the mention colour), spoilers hidden behind a block of the muted colour
+  until tapped (while hidden its words are not in the drawn text at all, since a screen reader
+  reads a paragraph's text whatever its colours: it draws a blank cover as wide, each character
+  a figure space, its spaces and line breaks kept so it wraps alike (`spoilerCover`), and its
+  paragraph reads each hidden spoiler as "Spoiler, tap to show" (`hiddenReading`); a spoiler is
+  only its plain words, custom emoji as their descriptions, hidden or shown: nothing inside shows its colour or picture or takes a tap; a link or mention
+  around a spoiler is neither, its content drawn as it is, so its label or look can't give the
+  spoiler away; the engine reads them the same; a span marked both spoiler and formula is a
+  spoiler; a code block holding a spoiler is drawn as its lines of text without its code, the
+  spoiler hidden in it, as the engine reads it; a tapped spoiler stays shown while its screen
+  is mounted, kept by the screen, not the view, by its message, its place in the message and
+  its words (`state/spoilers.ts`), so a row the list recycles for another message, or an edit
+  putting other words where it stood, shows it hidden; a message whose HTML holds a spoiler
+  gets no link card and plays no GIF, since both are taken from the plain body, which may name
+  what the spoiler hides, `state/messages.ts`), formulas as Unicode (`state/math.ts`, a
+  line-for-line port of `math.rs` run against its `math.json` vectors, bounded as it is: past
+  2000 bytes, 32 nested groups or commands, or 8000 bytes of output, a formula shows as its
+  LaTeX; a `<div>` formula gets its own line) and custom emoji as pictures in the line.
+- **Message kinds:** emotes read "* Name action" (`prepare` puts the name before the first
+  paragraph); places are `LocationCard`s; a message the push rules say mentions the user
+  (`Message.highlighted`) has a warm tint and bar (`palette.warning`), as Slack marks mentions.
+  The "(edited)" label opens the edit history (`app/edit-history.tsx`, `ListEdits`, kept in
+  `AccountData.edits`, newest first, the original marked).
+- **Jumping to a message:** a quote's tap scrolls to the quoted message, and when it isn't
+  loaded pages back as a link's target does (`Timeline`'s `jump`); still not found, the engine
+  says where it lives (`LocateMessage`, `openElsewhere`) and it opens there when that is another
+  timeline (a reply in a thread, a room message quoted in one); when it is this timeline, the
+  search looks for the message the engine located (a quoted edit's original, `MessageLocated`'s
+  `event_id`), scrolling there at once when loaded, else paging on past its budget until it
+  finds it or history starts (`seekStep`, `quoteHere` in `state/seek.ts`), stopping quietly once a later jump began or its screen left; the app
+  says it isn't found when history starts without it or the engine can't find it; the message
+  flashes highlighted. How far a search pages is its `Reach`: `near` (a few pages), `local` (a
+  search hit in local history: to the start, then it ends quietly) or `located` (the engine
+  placed it in this timeline: to the start, then "missing"). A timeline the engine's answer
+  opened (`messageRoute`, from a quote or a permalink) carries `located` in its route's `reach`
+  parameter, so the confirmation survives navigation: its target search pages to the start of
+  history under a jump the screen begins as it opens at the target, stopping quietly once a
+  later jump began or the screen left. A permalink to a message in a joined room asks the engine
+  where it is (`LocateMessage`) and opens its thread when it is a reply in one, else the room at
+  it (`openJoined`, the room when the engine can't tell). Either answer navigates only while
+  its jump is the latest one begun and the screen that asked is still on show (`ui/links/jumps.ts`;
+  the link sheet stays up while it waits and goes as the message opens): an answer that comes
+  after the user went elsewhere or began another jump opens nothing, and says nothing. A jump
+  begins at the tap: a quote's (`beginJump`) before it pages back, so a link tapped meanwhile
+  is the newer one, and its paging stops quietly once a later jump began or its screen left; a
+  link or room pill tapped in a message carries its timeline's screen guard
+  (`TimelineContext.shown`); a link opened from a tab's search carries the guard of the screen
+  hosting the search (`openSearchLink`), not the results list's, which goes as the pick empties
+  the search. Read marking waits for the opening only (`state/seek.ts`): a
+  timeline opened at a link's message is positioned once it got there, gave up looking, or the
+  reader tapped a quote; a quote's own search never holds it back.
 - **QR codes** (ADR 0004): one scanner (`ui/qr/QrScanner.tsx`, `expo-camera`) serves
   verification, signing in with a QR code and linking a device. Matrix's codes are binary and
   the camera's barcode result is lossy text, so a sighted QR code (or a 2.5 s timer) only
@@ -329,7 +483,12 @@ Date: 2026-11-16
   `call-shares`, `call-focus`, `call-chat`, `call-voice-chat`, `call-bar`, `ringing`; the
   layout menu is native and can't be opened by a scene. `preview-gallery` and `preview-audio`
   open a batch Grace posts into #design (two images, a video the demo has no file for, an
-  audio clip).
+  audio clip). #releases holds every message kind the composer sends (`message-kinds`); the
+  composer scenes are `mention`, `mention-pill`, `commands`, `emoji-suggestions`,
+  `emoji-custom`, `stickers`, `location`, `schedule`, `scheduled-bar`, `scheduled` and
+  `edit-history`. The demo engine answers packs, place search, edit history, `LocateMessage`
+  and scheduled messages, and serves one stand-in map (`assets/demo/map.png`) for every place
+  and the demo pack's images from `assets/demo`.
 - **The attachment preview** (`app/preview.tsx`) shows one attachment full screen on black: an
   image to pinch, pan and double-tap to zoom, a video in expo-video's player with the
   platform's controls, or an audio clip in a player of ours (`ui/preview/AudioPreview.tsx`:
@@ -355,6 +514,13 @@ Date: 2026-11-16
     video or clip before it.
 - **File actions:** message sheets offer Copy image only for images with media, plus Open,
   Share and Download; they never offer Copy message for an attachment filename or empty text.
+  Copy Text and Translate take the message's plain text with each spoiler as `[Spoiler]`
+  (`messageText`, `blocksText(…, 'hidden')`), the same literal in every language as the body a
+  sender writes for one, so what a spoiler hides never leaves the message (nor reaches the
+  translation service) before, or after, it is tapped. Other plain text taken from a message
+  (a room list's preview line, a reply's excerpt above the composer) is its plain body unless
+  its HTML holds a spoiler, whose words a sender may leave in the body: then the HTML's text
+  with each spoiler `[Spoiler]` (`spoilerSafeText`).
   Attachment surfaces forward long presses to the message sheet, including image/video
   previews and audio controls. The full-screen preview opens a file-only fitted sheet from
   More or a long press on an image or audio clip (`attachment-actions`), preserving the
@@ -470,5 +636,11 @@ Date: 2026-11-16
   failed may still show a generic notification on iOS until it is removed. iOS may kill a suspended app that holds SQLite locks in the shared container
   (`0xdead10cc`). An extension can't drop a push, so one that turns out to be nothing still
   shows the generic text. Pushes don't update the badge. Calls still don't ring through push.
+- Composer extras, still open: a room mention is made by room ID (`RoomSummary` carries no
+  canonical alias, so `#` suggestions link `!id` without `via`); custom emoji in received HTML
+  need their media handle written by the app (`mxcMedia`), which ties it to the engine's
+  `MediaRef` encoding until the engine hands handles for them; reactions don't offer custom
+  emoji; formulas are only sent inline (`$$…$$`), never as blocks; the phone's position is
+  read once, with no live location sharing.
 - Watch: a new boundary type needs the `ffi` derives (the build fails without them); a new event
   needs a case in the reducer (the type check fails without it).
