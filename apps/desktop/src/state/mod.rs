@@ -66,8 +66,8 @@ use rune::{TextEdit, Tx};
 pub use account_actions::{KeyFile, KeyFileStep, KeyTransfer, PasswordForm, RecoveryKeyFor};
 pub use accounts::READ_MARKER_FADE;
 pub use accounts::{
-    AccountData, Accounts, EntryView, Landing, RoomTimeline, Scope, TimelineItem, continues_group, now_ms, rich_body,
-    visual, wants_attention,
+    AccountData, Accounts, EntryView, Landing, PlacedCode, RichText, RoomTimeline, Scope, TimelineItem,
+    continues_group, now_ms, place_code, rich_body, visual, wants_attention,
 };
 pub use admin::{
     PRESET_LEVELS, RoomFields, RoomFormField, RoomSettingsDialog, RoomSettingsSection, SettingsConfirm, SettingsField,
@@ -5440,6 +5440,12 @@ impl State {
                 composer.attach(content.files().iter().cloned());
                 return true;
             }
+        }
+        // In a Markdown code fence everything pastes as plain text, as in a code block: a copied
+        // code block or formatting would carry on past the fence's closing line.
+        if composer.in_code_fence() {
+            composer.edit.insert(content.text());
+            return true;
         }
         // In a code block links can't be, so the address pastes as text; nor is a copied pill
         // (a spoiler holding only an address) made a link: the field restores it as it was.
