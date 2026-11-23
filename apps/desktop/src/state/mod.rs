@@ -2448,7 +2448,7 @@ impl State {
         }
         changed |= self.call.as_mut().is_some_and(Call::measure_videos);
         self.retry_due(now, tx);
-        changed |= self.search_people(now);
+        self.search_people(now);
         changed |= self.position_message(tx);
         changed |= self.expire_flash(now, tx);
         self.resume_refused();
@@ -3272,11 +3272,10 @@ impl State {
     // ----- people ----------------------------------------------------------------------------
 
     /// Sends the user-directory searches (the top bar's, the invite dialog's, the new chat's)
-    /// whose text has rested by `now`. True when that changed what shows: the top bar's
-    /// results opened or closed.
-    pub fn search_people(&mut self, now: std::time::Instant) -> bool {
-        let Some(account) = self.nav.account.clone() else { return false };
-        let changed = self.search_destinations(now, &account);
+    /// whose text has rested by `now`.
+    pub fn search_people(&mut self, now: std::time::Instant) {
+        let Some(account) = self.nav.account.clone() else { return };
+        self.search_destinations(now, &account);
         if let Some(term) = self.invite_search.due(now) {
             let request = self.dispatch(Command::SearchPeople { account: account.clone(), term }, Purpose::People);
             self.invite_search.request = Some(request);
@@ -3285,7 +3284,6 @@ impl State {
             let request = self.dispatch(Command::SearchPeople { account, term }, Purpose::People);
             self.chat_search.request = Some(request);
         }
-        changed
     }
 
     /// Opens the invite dialog for the open room.

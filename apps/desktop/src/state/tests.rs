@@ -7407,3 +7407,15 @@ fn raising_a_member_to_the_users_own_level_should_ask_first() {
     assert!(matches!(s.modal, Some(Modal::Confirm(Confirm::Moderate { .. }))));
     assert!(all_commands(&mut commands).is_empty());
 }
+
+#[test]
+fn a_permalink_opened_during_a_search_should_leave_search_closed() {
+    let (mut s, _) = state();
+    let id = AccountId::new("@a:example.org");
+    with_rooms(&mut s, &id, &["!one:x", "!two:x"], Vec::new());
+    s.select_room("!one:x");
+    s.open_search();
+    s.open_permalink("https://matrix.to/#/!two:x");
+    s.search_people(std::time::Instant::now());
+    assert_eq!(s.popover, None);
+}

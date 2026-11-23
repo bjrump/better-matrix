@@ -19,6 +19,9 @@ use state::{Appearance, Popover, Scope, SettingsSection, State};
 
 /// Reverse-DNS app ID: data folders, keychain service, notification identity.
 pub const APP_ID: &str = "chat.bettermatrix.desktop";
+/// The executable's icon resource on Windows; `build.rs` embeds the icon under this ID.
+#[cfg(target_os = "windows")]
+const APP_ICON: u16 = 1;
 
 /// The app's public home page, sent to OAuth servers when the app registers with them. Servers
 /// show it on the consent screen and require `https`. Placeholder until the project has a site.
@@ -862,6 +865,10 @@ fn main() {
     // The window reports this id (Wayland `app_id`, X11 `WM_CLASS`), so the desktop matches it
     // to the installed entry and its icon.
     rune::set_app_id(APP_ID);
+    // Windows: each window takes the executable's own icon (build.rs) for its caption, the
+    // taskbar and Alt+Tab, loaded at the size it shows.
+    #[cfg(target_os = "windows")]
+    rune::set_app_icon_resource(APP_ICON);
     let app = App::new(spec())
         .on_focus(|s, focused, _| s.focus_changed(focused))
         // Permalinks the system opens with the app: every link on macOS, `scheme://` ones from a
@@ -875,8 +882,6 @@ fn main() {
             });
             false
         });
-    #[cfg(target_os = "windows")]
-    let app = app.on_window(platform::window_icon::set);
     // Renders, scripts and traces run on the detached demo state: no engine, no keychain, and
     // nothing they change reaches the user's saved settings.
     if rune::is_headless() {

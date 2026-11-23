@@ -3740,3 +3740,48 @@ fn a_press_on_a_dialogs_empty_space_should_keep_it_open() {
     rt.frame(1.0 / 60.0);
     assert!(rt.state.modal.is_some());
 }
+
+/// The demo's messages of every kind, tall enough that all of them show.
+fn message_features_runtime() -> Runtime<State> {
+    message_features_runtime_with(|_| {})
+}
+
+fn message_features_runtime_with(change: impl FnOnce(&mut State)) -> Runtime<State> {
+    let mut state = State::detached();
+    demo::message_features(&mut state);
+    change(&mut state);
+    let mut rt = Runtime::new(state, super::view, (1000.0, 1500.0), Env::new(true, 1.0));
+    rt.poll = crate::spec().poll;
+    for _ in 0..60 {
+        rt.frame(1.0 / 60.0);
+    }
+    rt
+}
+
+#[test]
+fn a_custom_emoji_should_draw_its_picture_in_place_of_its_short_code() {
+    let width = |rt: &Runtime<State>| element_rect(rt, "rich-$emoji-0")[2];
+    let drawn = width(&message_features_runtime());
+    let unloaded = message_features_runtime_with(|s| {
+        s.media.forget(&matrix_core::MediaRef::from_mxc(demo::DEMO_EMOJI).unwrap());
+    });
+    // Unloaded, the short code shows as words, wider than the 21 pt picture.
+    assert!(drawn < width(&unloaded) - 10.0, "{drawn} vs {}", width(&unloaded));
+}
+
+#[test]
+fn a_custom_emoji_should_copy_as_its_short_code() {
+    let mut rt = message_features_runtime();
+    let key = "rich-$emoji-0";
+    assert!(rt.find(key).is_some(), "the message with the emoji shows");
+    rt.update(|_, tx| tx.select_all_text(key));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.selected_text().as_deref(), Some("Shipped :party: nice work"));
+}
+
+#[test]
+fn a_custom_emoji_should_keep_its_line_as_tall_as_text() {
+    let rt = message_features_runtime();
+    let height = |key: &str| element_rect(&rt, key)[3];
+    assert_eq!(height("rich-$emoji-0"), height("rich-$mention-0"));
+}
