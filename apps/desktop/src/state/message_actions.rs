@@ -5,6 +5,39 @@ use rune::TextEdit;
 
 use super::{Modal, Purpose, State};
 
+/// A message in one timeline: the room's, or a thread's.
+pub type MessageAt = (TimelineKey, String);
+
+/// Which message's hover toolbar holds the pointer. A toolbar rises out of its row over the
+/// message above, so the pointer can be over two messages at once: a shown toolbar the pointer
+/// is on stays shown, and hides the toolbar (and hover) of the row it lies over.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageHover {
+    toolbar: Option<MessageAt>,
+}
+
+impl MessageHover {
+    /// The pointer entered or left `message`'s toolbar, which hears it only while shown.
+    pub fn toolbar(&mut self, message: &MessageAt, inside: bool) {
+        if inside {
+            self.toolbar = Some(message.clone());
+        } else if self.toolbar.as_ref() == Some(message) {
+            self.toolbar = None;
+        }
+    }
+
+    /// Whether the pointer holds `message`'s toolbar.
+    pub fn holds(&self, message: &MessageAt) -> bool {
+        self.toolbar.as_ref() == Some(message)
+    }
+
+    /// The message whose toolbar holds the pointer, when it's another in `message`'s timeline:
+    /// where that toolbar lies over `message`'s row, the row shows no hover and no toolbar.
+    pub fn other_held(&self, message: &MessageAt) -> Option<&str> {
+        self.toolbar.as_ref().filter(|held| held.0 == message.0 && held.1 != message.1).map(|held| held.1.as_str())
+    }
+}
+
 impl State {
     pub fn set_message_pinned(&mut self, key: &TimelineKey, event_id: &str, pinned: bool) {
         self.popover = None;

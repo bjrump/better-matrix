@@ -189,17 +189,19 @@ enum ReadBoundary {
     Loaded(String),
 }
 
-/// The divider keeps its row until its opacity has finished fading.
+/// The divider keeps its row until its opacity has finished fading, and after, its space, until
+/// that space is out of view: closing it on screen would move the messages around it.
 #[derive(Debug)]
 enum ReadMarkerFade {
     Pending(ReadMarker),
     Running { marker: ReadMarker, until: f64 },
+    Faded(ReadMarker),
 }
 
 impl ReadMarkerFade {
     fn marker(&self) -> &ReadMarker {
         match self {
-            Self::Pending(marker) | Self::Running { marker, .. } => marker,
+            Self::Pending(marker) | Self::Running { marker, .. } | Self::Faded(marker) => marker,
         }
     }
 }
@@ -293,7 +295,8 @@ impl RoomTimeline {
     }
 
     pub fn read_marker_opacity(&self, id: &str) -> f32 {
-        if matches!(&self.read_marker_fade, Some(ReadMarkerFade::Running { marker, .. }) if marker.id == id) {
+        if matches!(&self.read_marker_fade, Some(ReadMarkerFade::Running { marker, .. } | ReadMarkerFade::Faded(marker)) if marker.id == id)
+        {
             0.0
         } else {
             1.0
@@ -321,10 +324,19 @@ impl RoomTimeline {
                 (marker, tx.clock() + duration)
             }
             ReadMarkerFade::Running { marker, until } => (marker, until),
+            faded @ ReadMarkerFade::Faded(_) => {
+                self.read_marker_fade = Some(faded);
+                return false;
+            }
         };
         if tx.clock() >= until {
-            self.revision = next_revision();
-            return true;
+            // Scrolled away while it faded: nothing on screen moves as its space closes.
+            if self.visible_read_marker.as_deref() != Some(marker.id.as_str()) {
+                self.revision = next_revision();
+                return true;
+            }
+            self.read_marker_fade = Some(ReadMarkerFade::Faded(marker));
+            return started;
         }
         self.read_marker_fade = Some(ReadMarkerFade::Running { marker, until });
         tx.wake_at(until);
@@ -401,6 +413,22 @@ impl RoomTimeline {
         if let Some(id) = id {
             self.see_read_marker(&id);
         }
+    }
+
+    /// Whether `diffs` only change entries already shown (a reaction, an edit), other than in
+    /// who has read them: the message changes at once, its row taking its new height, rather
+    /// than easing open and uncovering what it gained bit by bit. Receipts alone keep to the
+    /// readers' column, and land nothing else that arrives with them.
+    pub fn changes_in_place(&self, diffs: &[TimelineDiff]) -> bool {
+        let only_read =
+            |index: usize, entry: &TimelineEntry| match (self.entries.get(index).map(|e| &e.kind), &entry.kind) {
+                (Some(EntryView::Message(old)), EntryKind::Message(new)) => {
+                    old.message == Message { read_receipts: old.message.read_receipts.clone(), ..(**new).clone() }
+                }
+                _ => false,
+            };
+        diffs.iter().all(|diff| matches!(diff, TimelineDiff::Set { .. }))
+            && diffs.iter().any(|diff| matches!(diff, TimelineDiff::Set { index, entry } if !only_read(*index, entry)))
     }
 
     /// Whether `diffs` bring history rather than news: a message or room event above all the
@@ -1665,6 +1693,19 @@ impl Accounts {
         }
     }
 
+    /// Closes the space a faded "New" divider kept, once it isn't `visible` (the divider row in
+    /// the viewport, if any): out of view, the messages around it don't move on screen.
+    pub fn close_faded_read_marker(&mut self, id: &AccountId, key: &TimelineKey, visible: Option<&str>) -> bool {
+        let Some(timeline) = self.get_mut(id).and_then(|account| account.timelines.get_mut(key)) else { return false };
+        if !matches!(&timeline.read_marker_fade, Some(ReadMarkerFade::Faded(marker)) if visible != Some(marker.id.as_str()))
+        {
+            return false;
+        }
+        timeline.read_marker_fade = None;
+        timeline.revision = next_revision();
+        true
+    }
+
     pub fn dismiss_read_marker(&mut self, id: &AccountId, key: &TimelineKey, marker: &str) -> bool {
         let Some(timeline) = self.get_mut(id).and_then(|account| account.timelines.get_mut(key)) else { return false };
         if timeline.read_marker_seen(marker) || !timeline.see_read_marker(marker) {
@@ -2053,6 +2094,40 @@ mod tests {
 
     fn entry(id: &str) -> TimelineEntry {
         TimelineEntry { id: id.into(), kind: EntryKind::Message(Box::new(message(&format!("${id}")))) }
+    }
+
+    /// A timeline of one message, `a`, and that message changed by `change`.
+    fn changed_in_place(change: impl FnOnce(&mut Message)) -> (RoomTimeline, Vec<TimelineDiff>) {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::Reset(vec![entry("a")])]);
+        let mut changed = message("$a");
+        change(&mut changed);
+        let entry = TimelineEntry { id: "a".into(), kind: EntryKind::Message(Box::new(changed)) };
+        (timeline, vec![TimelineDiff::Set { index: 0, entry }])
+    }
+
+    #[test]
+    fn a_reaction_should_change_its_message_in_place() {
+        let (timeline, diffs) = changed_in_place(|message| {
+            message.reactions = vec![matrix_core::Reaction { key: "👍".into(), count: 1, mine: true }];
+        });
+        assert!(timeline.changes_in_place(&diffs));
+    }
+
+    #[test]
+    fn a_receipt_alone_should_not_land_as_a_change_in_place() {
+        let (timeline, diffs) = changed_in_place(|message| {
+            message.read_receipts =
+                vec![matrix_core::ReadReceipt { user_id: "@b:example.org".into(), timestamp_ms: None }];
+        });
+        assert!(!timeline.changes_in_place(&diffs));
+    }
+
+    #[test]
+    fn news_should_not_land_as_a_change_in_place() {
+        let mut timeline = RoomTimeline::default();
+        timeline.apply(vec![TimelineDiff::Reset(vec![entry("a")])]);
+        assert!(!timeline.changes_in_place(&[TimelineDiff::PushBack(entry("b"))]));
     }
 
     fn entry_ids(timeline: &RoomTimeline) -> Vec<&str> {

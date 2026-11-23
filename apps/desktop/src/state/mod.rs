@@ -83,6 +83,7 @@ pub use link_previews::LinkPreviews;
 pub use links::{LinkDialog, LinkStep};
 pub use location::{LocationForm, MAP_PIXELS, MAP_SIZE};
 pub use media::MediaCache;
+pub use message_actions::{MessageAt, MessageHover};
 pub use navigation::{navigate, navigate_now};
 pub use packs::PACK_IMAGE_SIZE;
 pub use panes::{Pane, PaneLayout, PaneSize, PaneWidths};
@@ -985,6 +986,8 @@ pub struct State {
     /// the app restarts.
     pub revealed_media: HashSet<(AccountId, String)>,
     pub popover: Option<Popover>,
+    /// Which message's hover toolbar the pointer is with.
+    pub message_hover: MessageHover,
     pub modal: Option<Modal>,
     /// What the emoji picker searches for.
     pub emoji_search: TextEdit,
@@ -1109,6 +1112,7 @@ impl State {
             link_previews: LinkPreviews::default(),
             revealed_media: HashSet::new(),
             popover: None,
+            message_hover: MessageHover::default(),
             modal: None,
             emoji_search: TextEdit::default(),
             status_draft: None,
@@ -1508,7 +1512,7 @@ impl State {
                     }
                 }
                 if let Some(timeline) = self.accounts.timeline_mut(&account, &key) {
-                    if reset || timeline.adds_history(&diffs) {
+                    if reset || timeline.adds_history(&diffs) || timeline.changes_in_place(&diffs) {
                         timeline.landing = Landing::Due;
                     }
                     timeline.apply(diffs);
@@ -2642,7 +2646,8 @@ impl State {
 
     pub fn read_marker_visible(&mut self, account: &AccountId, key: &TimelineKey, marker: Option<String>) -> bool {
         self.accounts.set_visible_read_marker(account, key, marker.clone());
-        marker.is_some_and(|id| self.read_marker_reached(account, key, &id))
+        let closed = self.accounts.close_faded_read_marker(account, key, marker.as_deref());
+        marker.is_some_and(|id| self.read_marker_reached(account, key, &id)) || closed
     }
 
     fn mark_timeline_read(&mut self, account: AccountId, key: TimelineKey) {
