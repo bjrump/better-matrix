@@ -98,8 +98,10 @@ see who is typing there.
   reply and thread relations and shows a pending message at once. The room's send queue
   persists it, retries offline and resumes after a restart.
 - **Editing and deleting:** the user's own text messages can be edited (`Command::Edit`, through the
-  timeline's `edit`) and any of their messages deleted (`Command::Redact`), from the menu under the
-  hover toolbar's ⋮ or right-click menu (`Popover::MessageMenu`), available on every sent message; deleting asks
+  timeline's `edit`) and any of their messages deleted (`Command::Redact`). Edit is a button on the
+  hover toolbar (More's menu leaves it out while the toolbar shows it, and offers it where a narrow
+  timeline's toolbar keeps only More) and an item in the right-click menu; delete is in the menu
+  under the toolbar's ⋮ or right-click (`Popover::MessageMenu`), available on every sent message; deleting asks
   first (`Confirm::DeleteMessage`). Up in an empty composer edits the user's newest plain text
   message there (`Message::editable`: the user's own `m.text`; emotes, notices and files keep what
   they are). The composer then holds the message (`Composer::editing`: the account, timeline and
@@ -125,7 +127,9 @@ see who is typing there.
   with the shared file actions (copy image for images, download and open in the default app);
   they offer no copy-text action for their filename. Empty text has no copy action either.
   Phones use the same content rules in their message sheet, with the system share action too.
-  The message menu establishes a modal input boundary, so rows behind it cannot hover or
+  Under More the menu opens below it, or above it where only that side has room; taller than
+  both, it takes the larger and scrolls (Rune's `anchored_fit`) instead of running off the
+  window's bottom. The message menu establishes a modal input boundary, so rows behind it cannot hover or
   reveal their toolbars. Under other popovers (the emoji picker, a menu, search) the timelines
   go inert, and under a composer's suggestions its own timeline (`State::timeline_covered`):
   Rune hovers by rectangle, not by the topmost hit, so their rows lit up and showed their
@@ -196,19 +200,18 @@ see who is typing there.
   - The time (with "edited" or "sending") closes the bubble in `bubble_meta`, which keeps 4.5:1
     on either bubble, as do muted words inside it (a quote, a notice; phones: `InBubble`); reactions and the thread hang below it, on its side. The readers' column,
     menu and press-to-open-thread are the classic row's.
-  - The hover toolbar is one component in both layouts, placed by the words (`ToolbarAt`), so
-    the pointer barely travels. It floats on the top edge of what the message says, reaching
-    `TOOLBAR_OVERLAP` (10 points) down over it. In a classic row it starts `TOOLBAR_INSET` after
-    the row's first line as laid out the frame before: the sender's name and time heading a
-    run, or a plain message's words continuing one. A pin's label, a quote, media or formatted
-    text first take the content's top right, as does a line leaving the toolbar no room. On
+  - The hover toolbar is one component in both layouts (`ToolbarAt`). It floats on the top edge
+    of what the message says, reaching `TOOLBAR_OVERLAP` (10 points) down over it. In a classic
+    row it always takes the content's top right, `TOOLBAR_INSET` in, so it keeps one place from
+    row to row; following each row's first line (the sender's name and time, or a continuing
+    message's words) made it jump between rows as the pointer moved down the timeline. On
     someone else's bubble (and on media and cards, which fill the column they're given) it sits
     at the top right, `TOOLBAR_INSET` in, as Teams places its own; on something narrower than
     the toolbar it starts at the message's own edge and reaches into the open side. Beside the
     user's own bubble it sits on the bubble's left, `TOOLBAR_BESIDE` away and level with its
     top, as before the Teams placement; where the timeline leaves no room there, over the
     bubble's top left corner. It never reaches into the readers' column. It holds React, Reply,
-    Thread, a rule, then More; content narrower than the whole toolbar keeps only More, whose
+    Thread, Edit on the user's own editable text, a rule, then More; content narrower than the whole toolbar keeps only More, whose
     menu offers the rest (Add reaction then anchors the picker at More). Rising out of its row, the toolbar can lie over the message above, so the
     pointer can be over two messages at once. The toolbar shows through its row's hover group;
     a shown toolbar the pointer is on holds it (`MessageHover`, from the toolbar's

@@ -2578,6 +2578,31 @@ fn choosing_where_media_shows_should_select_it() {
 }
 
 #[test]
+fn the_menu_from_more_near_the_windows_bottom_should_stay_inside_the_window() {
+    let mut rt = runtime(|s| short_room(s, 1));
+    let height = 480.0;
+    rt.set_viewport((1200.0, height), 1.0);
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    let row = element_rect(&rt, "msg-short-0");
+    rt.pointer_move(row[0] + 200.0, row[1] + row[3] / 2.0);
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    press(&mut rt, "more-$short-0");
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    let menu = element_rect(&rt, "message-menu");
+    let more = element_rect(&rt, "more-$short-0");
+    // Taller than the room under More and over it, the menu takes the larger room and scrolls.
+    assert!(menu[1] >= 8.0 - 0.5, "the menu {menu:?} runs off the window's top");
+    assert!(menu[1] + menu[3] <= height - 8.0 + 0.5, "the menu {menu:?} runs off the window's bottom");
+    assert!(menu[1] + menu[3] <= more[1], "the menu {menu:?} should open over More {more:?}, where there's room");
+}
+
+#[test]
 fn someone_elses_message_should_offer_a_report_that_opens_the_dialog() {
     let mut rt = runtime(|s| {
         demo::attachment_message(s);
@@ -3067,7 +3092,10 @@ fn assert_on_top_edge(actions: [f32; 4], said: [f32; 4]) {
 
 /// The toolbar of each of a message's actions, in [`bubble_room`] or classic rows.
 fn toolbar_buttons(rt: &Runtime<State>, event_id: &str) -> Vec<&'static str> {
-    ["react", "reply", "thread", "more"].into_iter().filter(|b| rt.find(&format!("{b}-{event_id}")).is_some()).collect()
+    ["react", "reply", "thread", "edit", "more"]
+        .into_iter()
+        .filter(|b| rt.find(&format!("{b}-{event_id}")).is_some())
+        .collect()
 }
 
 #[test]
@@ -3153,7 +3181,7 @@ fn in_bubbles_the_toolbar_of_a_long_message_should_sit_at_its_bubbles_top_right(
 }
 
 #[test]
-fn in_classic_rows_the_toolbar_should_sit_on_the_top_edge_just_after_the_senders_name_and_time() {
+fn in_classic_rows_the_toolbar_should_sit_on_the_top_edge_at_the_contents_top_right() {
     let rt = runtime(|s| short_room(s, 1));
     let actions = element_rect(&rt, "actions-$short-0");
     let name = element_rect(&rt, "msg-short-0-sender-name");
@@ -3161,26 +3189,23 @@ fn in_classic_rows_the_toolbar_should_sit_on_the_top_edge_just_after_the_senders
     // The name sits a little below the top of its line.
     let overlap = actions[1] + actions[3] - name[1];
     assert!((overlap - super::timeline::TOOLBAR_OVERLAP).abs() < 2.0, "{actions:?} reaches {overlap} over {name:?}");
-    assert!(
-        line[2] > name[2] && line[0] + line[2] < actions[0],
-        "the line {line:?} holds the time, before {actions:?}"
-    );
+    // Far past the name and time, not just after them.
     let gap = actions[0] - (line[0] + line[2]);
-    assert!((gap - super::timeline::TOOLBAR_INSET).abs() < 1.0, "{gap} after the line {line:?}");
+    assert!(gap > 4.0 * super::timeline::TOOLBAR_INSET, "{actions:?} starts {gap} after the line {line:?}");
 }
 
 #[test]
-fn in_classic_rows_the_toolbar_of_a_continuing_message_should_sit_just_after_its_words() {
+fn in_classic_rows_every_toolbar_should_keep_one_place_whatever_its_first_line() {
     let rt = runtime(continued_room);
-    let actions = element_rect(&rt, "actions-$short-1");
-    let text = element_rect(&rt, "text-$short-1");
-    let words_end = text[0] + text[2] - super::message_text::REACH;
-    let gap = actions[0] - words_end;
-    assert!((gap - super::timeline::TOOLBAR_INSET).abs() < 1.0, "{actions:?} starts {gap} after the words {text:?}");
+    // A run's first message heads it with the name and time; the second shows only its words.
+    let heading = element_rect(&rt, "actions-$short-0");
+    let continuing = element_rect(&rt, "actions-$short-1");
+    assert_eq!(heading[0], continuing[0], "{heading:?} and {continuing:?} should line up");
+    assert_eq!(heading[2], continuing[2]);
 }
 
 #[test]
-fn in_classic_rows_the_toolbar_of_a_line_too_long_to_follow_should_sit_at_the_contents_top_right() {
+fn in_classic_rows_the_toolbar_of_a_long_message_should_sit_at_the_contents_top_right() {
     let mut rt = runtime(continued_room);
     rt.update(|s, tx| {
         let mut entry = short_message("short-1", 0);
@@ -3205,6 +3230,85 @@ fn in_classic_rows_the_toolbar_of_a_line_too_long_to_follow_should_sit_at_the_co
     let words_end = text[0] + text[2] - super::message_text::REACH;
     let inset = words_end - (actions[0] + actions[2]);
     assert!((inset - super::timeline::TOOLBAR_INSET).abs() < 2.0, "{actions:?} ends {inset} before {text:?}");
+}
+
+/// [`short_room`]'s message from Grace followed by an editable one of Ada's own, in classic rows.
+fn own_editable_room(s: &mut State) {
+    s.select_room(demo::DEMO_THREAD.0);
+    let mut own = short_message("own", 1);
+    if let EntryKind::Message(message) = &mut own.kind {
+        message.sender_id = demo::ADA.into();
+        message.sender_name = "Ada Lovelace".into();
+        message.editable = true;
+    }
+    s.apply(
+        Event::TimelineChanged {
+            account: AccountId::new(demo::ADA),
+            key: TimelineKey::room(demo::DEMO_THREAD.0),
+            diffs: vec![TimelineDiff::Reset(vec![short_message("short-0", 0), own])],
+        },
+        &mut rune::Tx::default(),
+    );
+}
+
+#[test]
+fn the_toolbar_of_the_users_own_editable_message_should_offer_edit() {
+    let rt = runtime(own_editable_room);
+    assert!(rt.find("edit-$own").is_some());
+    assert!(rt.find("edit-$short-0").is_none(), "someone else's message offers Edit");
+}
+
+#[test]
+fn pressing_edit_in_a_toolbar_should_start_editing_its_message() {
+    let mut rt = runtime(own_editable_room);
+    let row = element_rect(&rt, "msg-own");
+    rt.pointer_move(row[0] + 200.0, row[1] + row[3] / 2.0);
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    press(&mut rt, "edit-$own");
+    let editing = rt.state.composer.editing.as_ref().expect("an edit under way");
+    assert_eq!(editing.target.event_id, "$own");
+}
+
+#[test]
+fn more_should_leave_edit_to_its_toolbar() {
+    let mut rt = runtime(own_editable_room);
+    let row = element_rect(&rt, "msg-own");
+    rt.pointer_move(row[0] + 200.0, row[1] + row[3] / 2.0);
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    press(&mut rt, "more-$own");
+    assert!(rt.find("message-menu").is_some());
+    assert!(rt.find("message-edit").is_none());
+}
+
+#[test]
+fn right_clicking_the_users_own_editable_message_should_still_offer_edit() {
+    let mut rt = runtime(own_editable_room);
+    let (x, y) = rt.find("text-$own").expect("the message's words");
+    rt.secondary_down(x, y);
+    rt.secondary_up(x, y);
+    rt.frame(0.1);
+    assert!(rt.find("message-edit").is_some());
+}
+
+#[test]
+fn more_should_offer_edit_where_the_toolbar_has_no_room_for_it() {
+    let mut rt = runtime(own_editable_room);
+    rt.set_viewport((420.0, 760.0), 1.0);
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    assert!(rt.find("edit-$own").is_none(), "the narrow toolbar keeps Edit");
+    let row = element_rect(&rt, "msg-own");
+    rt.pointer_move(row[0] + row[2] / 2.0, row[1] + row[3] / 2.0);
+    for _ in 0..30 {
+        rt.frame(1.0 / 60.0);
+    }
+    press(&mut rt, "more-$own");
+    assert!(rt.find("message-edit").is_some());
 }
 
 #[test]

@@ -20,6 +20,7 @@ pub fn menu(
     key: &TimelineKey,
     event_id: &str,
     at: Option<(i32, i32)>,
+    skip_edit: bool,
     window: [f32; 2],
     p: &Palette,
 ) -> Vec<El> {
@@ -77,7 +78,7 @@ pub fn menu(
                     .on_press(move |s: &mut State| s.start_forward(key.clone(), id.clone())),
             );
         }
-        if message.editable && message.sender_id == account.summary.id.as_str() {
+        if super::timeline::editable(message, account.summary.id.as_str()) && !skip_edit {
             let edited = message.clone();
             panel = panel.child(
                 action(&icons::PENCIL, t!("actions.edit"), "message-edit")
@@ -170,15 +171,20 @@ pub fn menu(
             );
         }
     }
+    // The panel shrinks to the room `anchored_fit` leaves it and scrolls the rest.
+    let panel = panel.max_h((window[1] - 16.0).max(100.0)).shrink().min_h(0.0);
     let menu = col()
         .key("message-menu-layer")
         .role("menu")
         .focus_group()
         .modal(true, State::close_popover)
-        .child(panel.max_h((window[1] - 16.0).max(100.0)).scroll(rune::ScrollSpec { stick_bottom: false }));
+        .min_h(0.0)
+        .child(panel.scroll(rune::ScrollSpec { stick_bottom: false }));
     match at {
         Some(at) => at_point(menu, "message-menu", at, MENU_WIDTH, window).into(),
-        None => vec![menu.anchored(
+        // Under More, or over it where the window has more room there; a menu taller than both
+        // takes the larger and scrolls, rather than running off the window's bottom.
+        None => vec![menu.anchored_fit(
             format!("{}more-{event_id}", if key.thread.is_some() { "thread-" } else { "" }),
             rune::Side::Bottom,
             rune::Align::End,
