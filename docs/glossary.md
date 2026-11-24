@@ -169,9 +169,9 @@ messages show as a `MessagePreview` outside their timeline.
 keeping its current content and formatting and removing its reply, thread and edit relations.
 
 **Hover toolbar**
-: React, reply, reply-in-thread and, behind a rule, More, shown while a message is hovered. It
-floats on the top edge of what the message says, by its words: in a classic row just after its
-first line (the sender's name and time), on someone else's bubble at its top right, and beside
+: React, reply, reply-in-thread, edit on the user's own text and, behind a rule, More, shown while
+a message is hovered. It floats on the top edge of what the message says: in a classic row at the
+content's top right, the same on every row, on someone else's bubble at its top right, and beside
 the user's own bubble on its left. A timeline too narrow for it keeps only More. Rising over the
 message above, the toolbar the pointer is on wins over the row under it.
 

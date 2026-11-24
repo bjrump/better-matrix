@@ -963,8 +963,7 @@ fn classic_row(
             .color(p.text)
             .shrink()
             .truncate();
-        // As wide as its words, so the toolbar can sit just after them, and no wider than the
-        // content, so a long name is cut short.
+        // As wide as its words, and no wider than the content, so a long name is cut short.
         let mut meta = row()
             .key(format!("{key}-meta"))
             .self_start()
@@ -984,12 +983,9 @@ fn classic_row(
     let content =
         if pinned { col().grow(1.0).min_w(0.0).gap(3.0).child(pinned_label(p)).child(content) } else { content };
     let actions = interactive && !message.pending;
+    // At the content's top right on every row, so it keeps its place from one row to the next.
     let content = if actions {
-        let at = match classic_line(key, message, continues, pinned) {
-            Some(line) => ToolbarAt::AfterLine { line },
-            None => ToolbarAt::TopEnd { said: cx.content_width },
-        };
-        content.child(toolbar(cx, key, message, at, p))
+        content.child(toolbar(cx, key, message, ToolbarAt::TopEnd { said: cx.content_width }, p))
     } else {
         content
     };
@@ -1190,8 +1186,7 @@ const TOOLBAR_RULE_MARGIN: f32 = 3.0;
 const TOOLBAR_HEIGHT: f32 = TOOL + 2.0 * TOOLBAR_PAD;
 /// How far the toolbar reaches down over the top edge of what its message says.
 pub(super) const TOOLBAR_OVERLAP: f32 = 10.0;
-/// The toolbar's distance from the end of what its message says, and from the end of a classic
-/// row's first line.
+/// The toolbar's distance from the end of what its message says.
 pub(super) const TOOLBAR_INSET: f32 = 8.0;
 /// The gap between the user's own bubble and the toolbar beside it.
 pub(super) const TOOLBAR_BESIDE: f32 = 6.0;
@@ -1206,36 +1201,13 @@ pub(super) fn toolbar_width(buttons: usize) -> f32 {
 
 /// Where a message's toolbar sits, against what the message says.
 enum ToolbarAt {
-    /// On the top edge of what the message says (`said` wide: a bubble, or the column media and
-    /// cards stand in), at its top right, as Teams places its own.
+    /// On the top edge of what the message says (`said` wide: a bubble, a classic row's
+    /// content, or the column media and cards stand in), at its top right, as Teams places its
+    /// own.
     TopEnd { said: f32 },
-    /// On the top edge of a classic row, just after its first line ends (`line` into the
-    /// content): by the sender's name and time, rather than across the timeline from them.
-    AfterLine { line: f32 },
     /// Beside the user's own bubble (`said` wide), on its left and level with its top, where the
     /// timeline has room; else over its top left corner.
     OwnBubble { said: f32 },
-}
-
-/// A classic row's first line's width, for its toolbar to follow, once laid out: the sender's
-/// name and time heading a run, or the words of a plain message continuing one. `None` where the
-/// first line is something else (a pin's label, a quote, a picture, a card) or formatted text,
-/// whose lines fill the column: the toolbar takes the column's top right.
-fn classic_line(key: &str, message: &Message, continues: bool, pinned: bool) -> Option<f32> {
-    if pinned {
-        return None;
-    }
-    if !continues {
-        return rune::memo::layout_with(&format!("{key}-meta"), |meta| meta[2]);
-    }
-    if message.reply_to.is_some() {
-        return None;
-    }
-    // The words' box reaches past them on both sides, for presses, from `REACH` left of the
-    // content (`message_text::reach`).
-    rune::memo::layout_with(&format!("{key}/text-{}", message.event_id), |words| {
-        words[2] - 2.0 * super::message_text::REACH
-    })
 }
 
 /// The toolbar's `(left, top, right)` pins inside what its message says, `width` wide, for `at`.
@@ -1246,10 +1218,6 @@ fn toolbar_pins(cx: &Context<'_>, message: &Message, at: ToolbarAt, width: f32) 
     let fits = |said: f32| said >= width + 2.0 * TOOLBAR_INSET;
     let narrow = if cx.on_right(message) { (None, top, Some(0.0)) } else { (Some(0.0), top, None) };
     match at {
-        ToolbarAt::AfterLine { line } if line + TOOLBAR_INSET + width <= cx.content_width => {
-            (Some(line + TOOLBAR_INSET), top, None)
-        }
-        ToolbarAt::AfterLine { .. } => toolbar_pins(cx, message, ToolbarAt::TopEnd { said: cx.content_width }, width),
         ToolbarAt::TopEnd { said } if fits(said) => (None, top, Some(TOOLBAR_INSET)),
         // The user's own rows leave out the picture, so their bubbles have its room as well.
         ToolbarAt::OwnBubble { said } if cx.content_width + AVATAR + MESSAGE_GAP - said >= width + TOOLBAR_BESIDE => {
@@ -1260,17 +1228,24 @@ fn toolbar_pins(cx: &Context<'_>, message: &Message, at: ToolbarAt, width: f32) 
     }
 }
 
-/// React, Reply, Thread, then More behind a rule, while the message is hovered (or its reaction
-/// picker or menu is open), placed `at` what the message says, close to its words rather than at
-/// the far side of the timeline. A timeline too narrow for the whole toolbar keeps only More,
-/// whose menu offers the rest.
+/// Whether `message` is the user's own text and can be edited (`State::start_edit`): its toolbar
+/// offers Edit (`toolbar`), and More's menu then leaves it out (`message_actions::menu`).
+pub(super) fn editable(message: &Message, own: &str) -> bool {
+    message.editable && message.sender_id == own && matches!(message.content, MessageContent::Text { .. })
+}
+
+/// React, Reply, Thread, Edit on the user's own messages, then More behind a rule, while the
+/// message is hovered (or its reaction picker or menu is open), placed `at` what the message
+/// says. A timeline too narrow for the whole toolbar keeps only More, whose menu offers the
+/// rest.
 fn toolbar(cx: &Context<'_>, key: &str, message: &Message, at: ToolbarAt, p: &Palette) -> El {
     let event_id = message.event_id.clone();
     // A call's card keeps no reactions, and a thread has no threads.
     let (react, thread) = (!matches!(message.content, MessageContent::Call(_)), !cx.in_thread());
-    let roomy = toolbar_width(2 + usize::from(react) + usize::from(thread)) <= cx.content_width;
-    let (react, reply, thread) = (roomy && react, roomy, roomy && thread);
-    let buttons = 1 + usize::from(react) + usize::from(reply) + usize::from(thread);
+    let edit = editable(message, cx.account.as_str());
+    let roomy = toolbar_width(2 + usize::from(react) + usize::from(thread) + usize::from(edit)) <= cx.content_width;
+    let (react, reply, thread, edit) = (roomy && react, roomy, roomy && thread, roomy && edit);
+    let buttons = 1 + usize::from(react) + usize::from(reply) + usize::from(thread) + usize::from(edit);
     let width = toolbar_width(buttons);
     let (left, top, right) = toolbar_pins(cx, message, at, width);
     let open = cx.picking == Some(event_id.as_str());
@@ -1333,6 +1308,13 @@ fn toolbar(cx: &Context<'_>, key: &str, message: &Message, at: ToolbarAt, p: &Pa
         let root = event_id.clone();
         bar = bar.child(
             button(&icons::THREAD, t!("actions.thread"), "thread").on_press(move |s: &mut State| s.open_thread(&root)),
+        );
+    }
+    if edit {
+        let edited = message.clone();
+        bar = bar.child(
+            button(&icons::PENCIL, t!("actions.edit"), "edit")
+                .on_press_tx(move |s: &mut State, tx| s.start_edit(target, &edited, tx)),
         );
     }
     if buttons > 1 {
