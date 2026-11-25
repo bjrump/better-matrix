@@ -12,8 +12,10 @@ use super::theme::{Palette, font};
 use crate::i18n::{t, tf};
 use crate::state::{AccountData, MediaCache, State};
 
-/// The search field's key, which its results anchor to.
+/// The search field's key.
 const SEARCH: &str = "top-search";
+/// The search field's frame, which its results anchor to when there is no banner.
+pub(super) const SEARCH_ANCHOR: &str = "search-anchor";
 /// The members button's key, which the member list anchors to.
 pub const MEMBERS: &str = "room-members";
 /// The info button's key, which the room's info anchors to.
@@ -66,7 +68,7 @@ pub fn top_bar(s: &State, account: &AccountData, p: &Palette, chrome: ChromeInse
             .on_press(State::open_search)
     };
     let search = row()
-        .key("search-anchor")
+        .key(SEARCH_ANCHOR)
         .on_press(State::open_search)
         .grow(1.0)
         .min_w(0.0)
