@@ -94,11 +94,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
 
     let unverified = s.screen() == Screen::Chat
         && account.and_then(|a| a.security).is_some_and(|security| !security.session_verified);
+    if let (Screen::Chat, Some(account)) = (s.screen(), account) {
+        base = base.child(people::top_bar(s, account, &p, cx.chrome_insets()));
+    }
     if unverified {
         base = base.child(unverified_bar(&p));
-    }
-    if let (Screen::Chat, Some(account)) = (s.screen(), account) {
-        base = base.child(people::top_bar(s, account, &p));
     }
     let mut root = el().key("root").w_full().h_full().child(base.child(body.child(content)));
     let panels = match (&s.popover, account) {
@@ -165,8 +165,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     root = root.children(suggestions::lists(s, &p));
     if !panels.is_empty() {
         let backdrop = if s.popover == Some(Popover::Search) {
-            // Keep the top bar (the field, its removable filter chip, saved messages) clickable
-            // above the backdrop, below the unverified-session banner when it shows.
+            // Keep the top bar and the unverified-session banner clickable above the backdrop.
             let height = cx.layout_size("root").unwrap_or([1200.0, 760.0])[1];
             let banner = if unverified { cx.layout_size("unverified-bar").map_or(0.0, |size| size[1]) } else { 0.0 };
             let top = banner + people::TOP_BAR_HEIGHT;

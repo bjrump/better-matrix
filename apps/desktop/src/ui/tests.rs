@@ -1952,7 +1952,7 @@ fn the_top_bar_should_open_saved_messages() {
 }
 
 #[test]
-fn saved_messages_should_open_at_once_while_searching_under_the_unverified_banner() {
+fn saved_messages_should_open_at_once_while_searching_with_an_unverified_session() {
     let mut rt = runtime(|s| {
         s.select_account(&AccountId::new("@ada:hobby.chat"));
         s.open_search();

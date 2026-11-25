@@ -2,7 +2,7 @@
 //! info, and the invite dialog.
 
 use matrix_core::{Person, RoomSummary};
-use rune::{Color, El, ScrollSpec, col, el, icon, row, text, text_input};
+use rune::{ChromeInsets, Color, El, ScrollSpec, col, el, icon, row, text, text_input};
 
 use super::components::{ButtonKind, button, dialog, media_avatar};
 use super::icons;
@@ -28,7 +28,7 @@ const SAVED_SPAN: f32 = 30.0 + 8.0;
 
 /// The bar across the top of the window, with the search in its middle and the account's saved
 /// messages beside it.
-pub fn top_bar(s: &State, account: &AccountData, p: &Palette) -> El {
+pub fn top_bar(s: &State, account: &AccountData, p: &Palette, chrome: ChromeInsets) -> El {
     let placeholder = tf!("search.placeholder", account = account.summary.display_name);
     let field = if s.popover == Some(crate::state::Popover::Search) {
         text_input(&s.search.field, font::BODY)
@@ -82,11 +82,13 @@ pub fn top_bar(s: &State, account: &AccountData, p: &Palette) -> El {
         .children(super::search::active_filter(s, p))
         .child(field)
         .child(text(rune::Keybind::new("mod+k").label()).font(font::META).color(p.sidebar_text_muted));
+    // Keep search centered. The spacer already clears part of the left inset.
+    let padding = 16.0 + (chrome.leading - SAVED_SPAN).max(chrome.trailing);
     row()
         .key("top-bar")
         .w_full()
         .h(TOP_BAR_HEIGHT)
-        .px(16.0)
+        .px(padding)
         .center()
         .fill(p.rail_bg)
         .border_sides([0.0, 0.0, 1.0, 0.0], p.sidebar_divider)
